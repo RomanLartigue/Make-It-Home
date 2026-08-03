@@ -116,6 +116,7 @@ export default function HomeScreen() {
   const sessionIdRef = useRef<string | null>(null);
   const lastLocationUpdateRef = useRef(0);
   const isRecordingRef = useRef(false);
+  const goLiveFallbackRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Check-in state
   const [checkInActive, setCheckInActive] = useState(false);
@@ -242,7 +243,7 @@ export default function HomeScreen() {
   }, []);
 
   // ── Backend calls (identical behavior to the original SafetyScreen) ────────
-  const startSession = async (loc: Location.LocationObjectCoords) => {
+  const startSession = async (loc: Location.LocationObjectCoords | null) => {
     const phones = await getSafetyCirclePhones();
     if (phones.length === 0) {
       Alert.alert('No safety circle', 'Add contacts to your Safety Circle so they can be notified.');
@@ -259,8 +260,10 @@ export default function HomeScreen() {
           sessionId,
           phones,
           name,
-          latitude: loc.latitude,
-          longitude: loc.longitude,
+          // May be null when we alert before a GPS fix — the live page shows
+          // "Location pending…" and updates as fixes arrive.
+          latitude: loc?.latitude ?? null,
+          longitude: loc?.longitude ?? null,
         }),
       });
       setNotifyStatus(res.ok ? 'notified' : 'error');
@@ -454,35 +457,63 @@ export default function HomeScreen() {
     notifiedRef.current = false;
     setNotifyStatus('idle');
 
+    // Start the session exactly once, with whatever location we have — possibly
+    // null. A panic button must never silently no-op: if a GPS fix never arrives
+    // (indoors, tunnel, GPS off), we still alert the circle with "location
+    // pending" rather than sitting forever on "Acquiring GPS…".
+    const beginSessionOnce = async (coords: Location.LocationObjectCoords | null) => {
+      if (notifiedRef.current) return;
+      notifiedRef.current = true;
+      if (goLiveFallbackRef.current) {
+        clearTimeout(goLiveFallbackRef.current);
+        goLiveFallbackRef.current = null;
+      }
+      const sessionId = randomId('session');
+      sessionIdRef.current = sessionId;
+      await AsyncStorage.setItem(ACTIVE_SESSION_KEY, sessionId);
+      await startSession(coords);
+      if (bgGranted) {
+        Location.startLocationUpdatesAsync(BACKGROUND_LOCATION_TASK, {
+          accuracy: Location.Accuracy.Balanced,
+          timeInterval: 30_000,
+          distanceInterval: 20,
+          showsBackgroundLocationIndicator: true,
+          foregroundService: {
+            notificationTitle: 'Make It Home is active',
+            notificationBody: 'Your safety circle can track your location.',
+            notificationColor: '#ff6a4d',
+          },
+        }).catch(err => console.warn('[BG Location] Start failed:', err.message));
+      }
+    };
+
+    // 1) Seed immediately from the last known fix, if the OS has one cached.
+    const lastKnown = await Location.getLastKnownPositionAsync().catch(() => null);
+    if (lastKnown) {
+      setCoords(lastKnown.coords);
+      beginSessionOnce(lastKnown.coords);
+    }
+
+    // 2) Watch live fixes — the first fix starts the session (if not already
+    //    started); later fixes silently refresh the shared position.
     locationSub.current = await Location.watchPositionAsync(
       { accuracy: Location.Accuracy.High, timeInterval: 5000, distanceInterval: 10 },
       async loc => {
         setCoords(loc.coords);
         if (!notifiedRef.current) {
-          notifiedRef.current = true;
-          const sessionId = randomId('session');
-          sessionIdRef.current = sessionId;
-          await AsyncStorage.setItem(ACTIVE_SESSION_KEY, sessionId);
-          await startSession(loc.coords);
-          if (bgGranted) {
-            Location.startLocationUpdatesAsync(BACKGROUND_LOCATION_TASK, {
-              accuracy: Location.Accuracy.Balanced,
-              timeInterval: 30_000,
-              distanceInterval: 20,
-              showsBackgroundLocationIndicator: true,
-              foregroundService: {
-                notificationTitle: 'Make It Home is active',
-                notificationBody: 'Your safety circle can track your location.',
-                notificationColor: '#ff6a4d',
-              },
-            }).catch(err => console.warn('[BG Location] Start failed:', err.message));
-          }
+          await beginSessionOnce(loc.coords);
         } else if (Date.now() - lastLocationUpdateRef.current >= 60_000) {
           lastLocationUpdateRef.current = Date.now();
           updateLocation(loc.coords);
         }
       },
     );
+
+    // 3) Fallback: if nothing has fired within 8s, alert anyway with no coords.
+    goLiveFallbackRef.current = setTimeout(() => {
+      if (!notifiedRef.current) beginSessionOnce(null);
+    }, 8000);
+
     Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
     setShowCamera(true);
   };
@@ -512,6 +543,10 @@ export default function HomeScreen() {
 
   const handleEnd = () => {
     const endedSessionId = sessionIdRef.current;
+    if (goLiveFallbackRef.current) {
+      clearTimeout(goLiveFallbackRef.current);
+      goLiveFallbackRef.current = null;
+    }
     cameraRef.current?.stopRecording();
     locationSub.current?.remove();
     locationSub.current = null;
