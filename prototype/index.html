@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Make It Home</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<nav class="navpanel">
+  <h1>Make It <span>Home</span></h1>
+  <p class="np">Prototype navigator — click any screen to jump to it. Hidden on mobile widths.</p>
+  <div class="grp">Onboarding</div>
+  <a data-s="name"><span class="d g"></span>Name</a>
+  <a data-s="terms"><span class="d g"></span>Terms &amp; privacy</a>
+  <a data-s="location"><span class="d g"></span>Location</a>
+  <div class="grp">Main</div>
+  <a data-s="home"><span class="d g"></span>Home / beacon</a>
+  <a data-s="circle"><span class="d g"></span>Safety circle</a>
+  <a data-s="guide"><span class="d g"></span>Guide</a>
+  <a data-s="settings"><span class="d g"></span>Settings</a>
+  <div class="grp">Alert states</div>
+  <a data-s="live"><span class="d r"></span>Live session</a>
+  <a data-s="pin"><span class="d r"></span>PIN to cancel</a>
+  <div class="grp">Circle &amp; escalation</div>
+  <a data-s="escalation"><span class="d b"></span>Escalation ladder</a>
+  <div class="grp">Responder</div>
+  <a data-s="responder"><span class="d b"></span>What your circle sees</a>
+  <a data-s="intro"><span class="d b"></span>Contact welcome intro</a>
+  <div class="grp">Discreet &amp; duress</div>
+  <a data-s="discreet"><span class="d b"></span>Trigger methods</a>
+  <a data-s="decoy"><span class="d r"></span>Duress decoy</a>
+  <a data-s="fakecall"><span class="d b"></span>Fake call</a>
+  <div class="grp">Resilience</div>
+  <a data-s="coverage"><span class="d b"></span>Coverage health</a>
+  <a data-s="routines"><span class="d b"></span>Safety routines</a>
+</nav>
+
+<div class="phone"><div class="screen">
+  <div class="notch"></div>
+  <div class="statusbar"><span>9:41</span><span>5G ▪ 84%</span></div>
+
+  <div class="stage">
+    <!-- 1. NAME -->
+    <div class="view on" id="v-name">
+      <div class="ob">
+        <div class="dots"><i class="on"></i><i></i><i></i></div>
+        <h2>What should I call you?</h2>
+        <p>Your circle sees this if you ever need them — a name or a nickname is perfect.</p>
+        <div class="field"><input class="nameinput" id="nameInput" placeholder="First name or nickname" autocomplete="off" spellcheck="false"></div>
+        <button class="cta dim" id="nameContinue">Continue</button>
+      </div>
+    </div>
+
+    <!-- 2. TERMS -->
+    <div class="view" id="v-terms">
+      <div class="ob">
+        <div class="dots"><i></i><i class="on"></i><i></i></div>
+        <h2>How Make It Home works</h2>
+        <p>Please read this — it's important. By continuing you agree to our terms.</p>
+        <div class="legalbox"><b>The essentials</b>Make It Home is <b style="display:inline;text-transform:none;font-size:12.5px">not a substitute for 911</b>. We only alert your circle when you trigger it, delivery isn't guaranteed, and your data is kept briefly and auto-deleted.</div>
+        <div class="legallinks"><button data-legal="terms">Full Terms of Service</button><span>·</span><button data-legal="privacy">Privacy Policy</button></div>
+        <button class="cta" id="agreeBtn">Agree &amp; continue</button>
+      </div>
+    </div>
+
+    <!-- 3. LOCATION -->
+    <div class="view" id="v-location">
+      <div class="ob">
+        <div class="dots"><i></i><i></i><i class="on"></i></div>
+        <h2>Turn on location</h2>
+        <p>Make It Home shares where you are with your circle in an emergency — it's the core of keeping you safe, so we ask up front.</p>
+        <div class="locstat" id="locStatus">Location is off</div>
+        <button class="cta" id="allowLoc">Allow location</button>
+        <button class="linkbtn" id="locSkip">Not now</button>
+      </div>
+    </div>
+
+    <!-- HOME -->
+    <div class="view" id="v-home">
+      <div class="hbar">
+        <div class="mark">Make It <span>Home</span></div>
+        <button class="iconbtn" data-go="settings"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.6-2-3.4-2.3.9a7 7 0 0 0-1.7-1l-.3-2.4h-4l-.3 2.4a7 7 0 0 0-1.7 1L4 5l-2 3.4L4 10a7 7 0 0 0 0 2l-2 1.6 2 3.4 2.3-.9a7 7 0 0 0 1.7 1l.3 2.4h4l.3-2.4a7 7 0 0 0 1.7-1l2.3.9 2-3.4-2-1.6a7 7 0 0 0 .1-1Z"/></svg></button>
+      </div>
+      <div class="cover"><div class="pip" id="coverPip"></div><div><div class="ct" id="coverName">You're covered</div><div class="cs" id="coverSub">Add someone to your circle</div></div></div>
+      <div class="map"><div class="road"></div><div class="road2"></div><div class="pin"></div><div class="tag" id="mapTag"><b>●</b> Live location on · Elm St</div></div>
+      <div class="beaconwrap" id="arena">
+        <div class="opt left" data-k="left">15<span style="font-size:9px">m</span></div>
+        <div class="opt up" data-k="up">30<span style="font-size:9px">m</span></div>
+        <div class="opt right" data-k="right">45<span style="font-size:9px">m</span></div>
+        <div class="opt down" data-k="down">60<span style="font-size:9px">m</span></div>
+        <button class="beacon idle" id="beacon">Hold<small id="bsub">&amp; swipe</small></button>
+      </div>
+      <div class="undertext" style="margin:0 auto 14px">Hold, then release in the center to go live — or swipe to a timer (15 / 30 / 45 / 60)</div>
+    </div>
+
+    <!-- CIRCLE -->
+    <div class="view" id="v-circle">
+      <div class="h2">Safety circle</div>
+      <p class="sub">These people are alerted with your location when you signal.</p>
+      <div id="circleList"></div>
+      <div class="empty" id="circleEmpty"><svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.2"/><path d="M3.5 20a5.5 5.5 0 0 1 11 0"/><path d="M17 8v6M14 11h6"/></svg><div>No one yet — add the people who'd come for you.</div></div>
+      <button class="pbtn ghost" style="margin:10px 0 0" data-go="escalation">⚡ Escalation ladder</button>
+      <button class="addrow" id="addContact">＋ Add someone</button>
+    </div>
+
+    <!-- GUIDE -->
+    <div class="view" id="v-guide">
+      <div class="h2">Guide</div>
+      <p class="sub">How Make It Home keeps you covered — always here if you forget.</p>
+      <div class="step"><div class="n">1</div><div><div class="st">Hold the beacon</div><div class="sd">Hold, then release in the center to go live instantly.</div></div></div>
+      <div class="step"><div class="n">2</div><div><div class="st">Or swipe to a timer</div><div class="sd">While holding, drag toward 15, 30, 45, or 60 minutes for a check-in.</div></div></div>
+      <div class="step"><div class="n">3</div><div><div class="st">You're covered</div><div class="sd">Your circle gets your live location and a recording.</div></div></div>
+      <div class="step"><div class="n">4</div><div><div class="st">“Made it home”</div><div class="sd">Arrive safely and the app checks you out automatically.</div></div></div>
+      <button class="support" data-go="responder"><svg viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>See what your circle sees</button>
+      <button class="support" data-go="intro"><svg viewBox="0 0 24 24"><path d="M20 8v6a2 2 0 0 1-2 2H8l-4 3V6a2 2 0 0 1 2-2h6"/><circle cx="18" cy="6" r="3"/></svg>Preview a contact's welcome</button>
+      <button class="support" id="supportBtn"><svg viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2Z"/></svg>Contact support</button>
+    </div>
+
+    <!-- SETTINGS -->
+    <div class="view" id="v-settings">
+      <div class="h2">Settings</div>
+      <div class="seclbl">Account</div>
+      <div class="srow"><span>Name</span><span class="val" id="setName">—</span></div>
+      <div class="srow"><span>Location</span><span class="val" id="setLoc">Off</span></div>
+      <div class="seclbl">Safety</div>
+      <div class="srow tap" data-go="discreet"><span>Discreet &amp; duress triggers</span><span class="val">4 on ›</span></div>
+      <div class="srow tap" data-go="escalation"><span>Escalation ladder</span><span class="val">3 people ›</span></div>
+      <div class="srow tap" data-go="coverage"><span>Coverage health</span><span class="val warnc">1 warning ›</span></div>
+      <div class="srow tap" data-go="routines"><span>Safety routines</span><span class="val">2 active ›</span></div>
+      <div class="seclbl">Check-in</div>
+      <div class="srow tap" id="notesToggle"><span>Custom check-in notes</span><span class="tgl" id="notesTgl"></span></div>
+      <div class="srow tap" id="warnToggle"><span>Warn me before alerting</span><span class="tgl" id="warnTgl"></span></div>
+      <div class="srow tap" id="warnMinRow"><span>Warn time</span><span class="val" id="warnMinVal">5 min</span></div>
+      <div class="seclbl">About</div>
+      <div class="srow tap" data-legal="terms"><span>Terms of Service</span><span class="val">›</span></div>
+      <div class="srow tap" data-legal="privacy"><span>Privacy Policy</span><span class="val">›</span></div>
+      <div class="srow tap" id="supportBtn2"><span>Contact support</span><span class="val">›</span></div>
+      <div class="srow danger" id="deleteBtn"><span>Delete my data</span></div>
+    </div>
+
+    <!-- ESCALATION LADDER -->
+    <div class="view" id="v-escalation">
+      <div class="detailhead"><div class="bk" data-go="circle">‹</div><div class="ti">Escalation ladder</div></div>
+      <p class="subttl">We climb the ladder until someone responds. Hold &amp; drag a name to reorder who's alerted first.</p>
+      <div class="listcard" id="escList"></div>
+      <div class="seclbl">Rules</div>
+      <div class="srow tap" id="waitRow"><span>Wait between people</span><span class="val" id="waitVal">3 min ›</span></div>
+      <div class="srow"><span>“On my way” stops the ladder</span><span class="tgl on" data-toggle></span></div>
+      <div class="srow"><span>No response in 15 min</span><span class="val">Alert everyone at once</span></div>
+      <div class="callout">Responders see each other — “Alex is on the way” — so no one double-panics and help isn't duplicated.</div>
+    </div>
+
+    <!-- RESPONDER VIEW -->
+    <div class="view" id="v-responder">
+      <div class="detailhead"><div class="bk" data-go="guide">‹</div><div class="ti">What your circle sees</div></div>
+      <p class="subttl" style="margin:8px 0">Preview — the page a contact opens from your alert.</p>
+      <div class="urlpill">🔒 mkhm.link/r/8f2a · opens in any browser</div>
+      <div class="warnnote"><b id="respName">You</b> may need help.<br>9:41 PM · “Walking home, feeling followed.”</div>
+      <div class="rmap"><div class="rt"></div><div class="rp"></div></div>
+      <div class="listcard">
+        <div class="srow"><span>Battery</span><span class="val warnc">18% · dropping</span></div>
+        <div class="srow"><span>Heading</span><span class="val">N on Damen Ave</span></div>
+        <div class="srow"><span>Recording</span><span class="val" style="color:#60a5fa">▶ Listen live</span></div>
+      </div>
+      <button class="pbtn primary" style="margin-top:10px" data-go="guide" data-toast="✓ The circle was told: you're on the way">✓ I'm on my way</button>
+      <button class="pbtn dark" style="margin-top:9px">Call <span id="respName2">them</span></button>
+      <div class="devnote">The responder never needs the app or an account.</div>
+    </div>
+
+    <!-- DISCREET & DURESS -->
+    <div class="view" id="v-discreet">
+      <div class="detailhead"><div class="bk" data-go="settings">‹</div><div class="ti">Discreet &amp; duress</div></div>
+      <p class="subttl">In a real moment you may not be able to open the app. Turn on what fits you.</p>
+      <div class="seclbl">Hands / hardware</div>
+      <div class="srow"><span>Triple-press side button</span><span class="tgl on" data-toggle></span></div>
+      <div class="srow"><span>Squeeze volume buttons</span><span class="tgl on" data-toggle></span></div>
+      <div class="srow"><span>Apple Watch double-tap</span><span class="tgl" data-toggle></span></div>
+      <div class="seclbl">Voice</div>
+      <div class="srow"><span>“Hey Siri, make it home”</span><span class="tgl on" data-toggle></span></div>
+      <div class="seclbl">Duress</div>
+      <div class="srow" data-go="decoy"><span>Duress check-in <span style="color:var(--faint);font-size:11px">— fake “safe” that silently alerts</span></span><span class="val" style="color:#ff8a6e">On ›</span></div>
+      <div class="srow" data-go="fakecall"><span>Fake call</span><span class="val">Preview ›</span></div>
+      <div class="callout">Silent triggers give haptic-only feedback — no sound, no bright screen — so no one around you knows.</div>
+    </div>
+
+    <!-- DURESS DECOY -->
+    <div class="view" id="v-decoy">
+      <div class="detailhead"><div class="bk" data-go="discreet">‹</div><div class="ti">Duress check-in</div></div>
+      <p class="subttl">Forced to “prove” you're fine? Tap the decoy. It looks like a normal check-in but silently alerts your circle with a duress flag.</p>
+      <div class="warnnote">In real use these two buttons look <b>identical</b> — labels shown for the demo only.</div>
+      <div class="listcard" style="text-align:center;padding:22px 16px">
+        <div style="font-weight:800;font-size:17px;margin-bottom:16px">Check in — you safe?</div>
+        <button class="pbtn primary" style="margin-bottom:12px" data-go="home" data-toast="✓ Checked in safe — circle notified">I'm safe <span style="opacity:.6;font-weight:500">(real)</span></button>
+        <button class="pbtn primary" data-go="home" data-toast="⚠ Silent duress alert sent — you appear ‘safe’">I'm safe <span style="opacity:.6;font-weight:500">(decoy)</span></button>
+      </div>
+    </div>
+
+    <!-- COVERAGE HEALTH -->
+    <div class="view" id="v-coverage">
+      <div class="detailhead"><div class="bk" data-go="settings">‹</div><div class="ti">Coverage health</div></div>
+      <div class="cover" style="margin-top:12px"><div class="pip" id="covPip"></div><div style="flex:1"><div class="ct" id="covTitle">Not covered yet</div><div class="cs" id="covSub">No one is in your circle — an alert would reach nobody.</div></div></div>
+      <div class="listcard">
+        <div class="srow"><span>Location · Always</span><span class="val on">Good</span></div>
+        <div class="srow tap" data-go="circle"><span>People in your circle</span><span class="val" id="covContacts">None yet ›</span></div>
+        <div class="srow"><span>Battery</span><span class="val warnc">18% — risky</span></div>
+        <div class="srow"><span>Notifications</span><span class="val on">On</span></div>
+      </div>
+      <div class="warnnote"><b>Low-battery safeguard.</b> At 15% we send your circle a heads-up and your last known location, so a dead phone doesn't mean silence.</div>
+      <div class="srow"><span>Auto-share location if phone dies</span><span class="tgl on" data-toggle></span></div>
+      <div class="srow"><span>Warn circle at 15% battery</span><span class="tgl on" data-toggle></span></div>
+      <div class="srow"><span>Works offline (SMS fallback)</span><span class="tgl on" data-toggle></span></div>
+    </div>
+
+    <!-- SAFETY ROUTINES -->
+    <div class="view" id="v-routines">
+      <div class="detailhead"><div class="bk" data-go="settings">‹</div><div class="ti">Safety routines</div></div>
+      <p class="subttl">For trips you take all the time — commutes, runs, night shifts. It arms itself.</p>
+      <div class="cover"><div class="pip" style="background:var(--beacon);box-shadow:none"></div><div style="flex:1"><div class="ct">Night shift walk</div><div class="cs">Mon–Fri · 11:30 PM · 20-min check-in</div></div><span class="tgl on" data-toggle></span></div>
+      <div class="cover"><div class="pip" style="background:var(--beacon);box-shadow:none"></div><div style="flex:1"><div class="ct">Morning run</div><div class="cs">Sat–Sun · 6:30 AM · auto-clears at home</div></div><span class="tgl on" data-toggle></span></div>
+      <div class="cover"><div class="pip" style="background:var(--faint);box-shadow:none"></div><div style="flex:1"><div class="ct">Date mode</div><div class="cs">Manual · shares plan + who you're meeting</div></div><span class="tgl" data-toggle></span></div>
+      <button class="pbtn primary" style="margin-top:14px">+ New routine</button>
+    </div>
+
+    <!-- FAKE CALL -->
+    <div class="view" id="v-fakecall" style="padding:0;background:linear-gradient(180deg,#0a0f18,#05070c);align-items:center;justify-content:flex-start">
+      <div style="width:100%;flex:1;display:flex;flex-direction:column;align-items:center;padding:64px 24px 40px;text-align:center">
+        <div style="color:var(--muted);font-size:13px">mobile</div>
+        <div class="callav" id="callAv">M</div>
+        <div style="font-weight:800;font-size:26px" id="callNm">Mom</div>
+        <div style="color:var(--muted);margin-top:5px;font-size:14px">calling…</div>
+        <div style="margin-top:auto;display:flex;justify-content:space-between;width:100%;max-width:230px">
+          <div style="text-align:center"><div class="callc dec" data-go="discreet">✕</div><div style="font-size:11px;color:var(--muted);margin-top:8px">Decline</div></div>
+          <div style="text-align:center"><div class="callc acc" data-go="discreet">📞</div><div style="font-size:11px;color:var(--muted);margin-top:8px">Accept</div></div>
+        </div>
+        <div class="devnote" style="margin-top:20px">A believable incoming call — schedule or trigger it silently — to give you a reason to leave.</div>
+      </div>
+    </div>
+
+    <!-- RESPONDER FIRST-TOUCH INTRO -->
+    <div class="view" id="v-intro">
+      <div class="detailhead"><div class="bk" data-go="guide">‹</div><div class="ti">A contact's first touch</div></div>
+      <p class="subttl" style="margin:8px 0">Preview — the calm intro someone gets the moment you add them, before any emergency.</p>
+      <div class="urlpill">🔒 mkhm.link/welcome</div>
+      <div class="listcard" style="text-align:center;padding:22px 16px">
+        <div class="callav" id="introAv" style="margin:0 auto 14px;width:64px;height:64px;font-size:26px;background:linear-gradient(135deg,#ff7a5a,var(--beacon))">R</div>
+        <div style="font-weight:800;font-size:18px"><span id="introName">Roman</span> added you to their safety circle</div>
+        <p style="color:var(--muted);font-size:13px;line-height:1.55;margin:12px 0 0">You're now one of the people <span id="introName2">Roman</span> trusts to reach if they ever feel unsafe.</p>
+      </div>
+      <div class="callout">If <span id="introName3">Roman</span> ever signals, you'll get a text with a live map — no app or account needed. You can tap “I'm on my way,” and their other contacts see it too.</div>
+      <div style="margin-top:8px;color:var(--faint);font-size:12px;line-height:1.5">You'll only hear from us if <span id="introName4">Roman</span> triggers it themselves. That's the only time.</div>
+      <button class="pbtn primary" style="margin-top:14px" data-go="guide" data-toast="✓ Thanks — you'll be ready if they need you">Got it — I'll be there</button>
+      <div class="devnote">Sent when you add someone, so the scary red alert link never lands cold.</div>
+    </div>
+
+  </div>
+
+  <nav class="nav hide" id="nav">
+    <button data-go="home" class="on"><svg viewBox="0 0 24 24"><path d="M3 11l9-8 9 8"/><path d="M5 10v10h14V10"/></svg>Home</button>
+    <button data-go="circle"><svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3"/><circle cx="17" cy="9" r="2.4"/><path d="M3 20c0-3.3 2.7-6 6-6s6 2.7 6 6"/><path d="M15.5 14.2A5 5 0 0 1 21 20"/></svg>Circle</button>
+    <button data-go="guide"><svg viewBox="0 0 24 24"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v15H6.5A2.5 2.5 0 0 0 4 20.5Z"/><path d="M4 20.5A2.5 2.5 0 0 1 6.5 18H20"/></svg>Guide</button>
+    <button data-go="settings"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.6-2-3.4-2.3.9a7 7 0 0 0-1.7-1l-.3-2.4h-4l-.3 2.4a7 7 0 0 0-1.7 1L4 5l-2 3.4L4 10a7 7 0 0 0 0 2l-2 1.6 2 3.4 2.3-.9a7 7 0 0 0 1.7 1l.3 2.4h4l.3-2.4a7 7 0 0 0 1.7-1l2.3.9 2-3.4-2-1.6a7 7 0 0 0 .1-1Z"/></svg>Settings</button>
+  </nav>
+
+  <div class="live" id="live">
+    <div class="livedot"></div>
+    <div class="lt" id="livet">You're live</div>
+    <div class="timer" id="livetimer" style="display:none">30:00</div>
+    <div class="ls" id="lives">Sharing your live location and recording with your circle.</div>
+    <button class="end" id="end">End session</button>
+  </div>
+
+  <div class="sheet" id="sheet"><div class="sheetcard">
+    <h3 id="addTitle">Add someone</h3>
+    <p class="sheetsub">They'll be alerted with your location when you signal.</p>
+    <input class="inp" id="cName" placeholder="Name" autocomplete="off">
+    <input class="inp" id="cPhone" placeholder="Phone number" inputmode="tel" autocomplete="off">
+    <div class="sheetbtns"><button class="cancel" id="cCancel">Cancel</button><button class="save" id="cSave">Add</button></div>
+  </div></div>
+
+  <div class="sheet" id="csheet"><div class="sheetcard">
+    <h3 id="csName">Contact</h3>
+    <p class="sheetsub" id="csPhone"></p>
+    <button class="fullbtn" id="csFakeCall" style="margin-bottom:10px">📞 Receive a fake call from them</button>
+    <div class="sheetbtns"><button class="cancel" id="csEdit">Edit</button><button class="cancel" id="csRemove" style="color:#ff8a6e">Remove</button></div>
+    <button class="linkbtn" id="csCancel" style="width:100%;margin-top:4px">Cancel</button>
+  </div></div>
+
+  <div class="sheet" id="msgsheet"><div class="sheetcard">
+    <h3 id="msgTitle">Check-in · 15 min</h3>
+    <p class="sheetsub" id="msgHint">Starting in <b id="msgCount">4</b>s — type a note, or just wait.</p>
+    <textarea class="inp" id="msgText" rows="3" placeholder="Add a note for your circle (optional)"></textarea>
+    <button class="fullbtn" id="msgStart">Start check-in now</button>
+  </div></div>
+
+  <div class="legalview" id="legalview">
+    <div class="legalhead"><span id="legalTitle">Terms of Service</span><button id="legalClose">Done</button></div>
+    <div class="legalbody" id="legalBody"></div>
+  </div>
+
+  <div class="pinpad" id="pinpad">
+    <div class="pintitle">Enter your PIN to end the alert</div>
+    <div class="pinsub">This confirms it's really you — and stops your circle from being alerted.</div>
+    <div class="pindots" id="pinDots"><i></i><i></i><i></i><i></i></div>
+    <div class="pinerr" id="pinErr"></div>
+    <div class="keys" id="keys">
+      <button>1</button><button>2</button><button>3</button>
+      <button>4</button><button>5</button><button>6</button>
+      <button>7</button><button>8</button><button>9</button>
+      <button class="faint" data-k="face">Face ID</button><button>0</button><button class="faint" data-k="del">⌫</button>
+    </div>
+    <button class="linkbtn" id="pinCancel" style="width:100%">Keep alert active</button>
+    <div class="devnote">Demo PIN: 1234 · so someone who grabs the phone can't just tap “I'm safe.”</div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+</div></div>
+<script src="app.js"></script>
+</body>
+</html>

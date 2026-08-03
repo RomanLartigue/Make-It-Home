@@ -1,0 +1,652 @@
+require('dotenv').config();
+
+const crypto = require('crypto');
+const express = require('express');
+const helmet = require('helmet');
+const twilio = require('twilio');
+const multer = require('multer');
+const cors = require('cors');
+const path = require('path');
+const fs = require('fs');
+const rateLimit = require('express-rate-limit');
+const Redis = require('ioredis');
+
+const {
+  TWILIO_ACCOUNT_SID,
+  TWILIO_AUTH_TOKEN,
+  TWILIO_PHONE_NUMBER,
+  SERVER_URL,
+  REGISTRATION_SECRET,
+  ALLOWED_ORIGINS,
+  REDIS_URL,
+  PORT = 3000,
+} = process.env;
+
+const app = express();
+
+// ── Security headers ──────────────────────────────────────────────────────────
+// Sets X-Content-Type-Options, X-Frame-Options, Strict-Transport-Security,
+// X-DNS-Prefetch-Control, and more. contentSecurityPolicy is customised to
+// allow the live tracking page to load Google Maps and inline styles.
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'none'"],
+      styleSrc: ["'unsafe-inline'"],   // live page uses inline <style>
+      imgSrc: ["'self'", 'data:'],
+      connectSrc: ["'self'", 'https://maps.google.com'],
+      frameSrc: ["'none'"],
+      objectSrc: ["'none'"],
+    },
+  },
+  crossOriginEmbedderPolicy: false,    // allow media to be fetched by Twilio
+}));
+
+// ── CORS ──────────────────────────────────────────────────────────────────────
+// ALLOWED_ORIGINS is a comma-separated list of permitted origins, e.g.:
+//   https://makeithome.app,https://admin.makeithome.app
+// If unset, only the live tracking page (same-origin) and the mobile app
+// (no Origin header) are allowed through — cross-origin browser requests
+// from unknown sites are blocked.
+const allowedOrigins = ALLOWED_ORIGINS
+  ? ALLOWED_ORIGINS.split(',').map(o => o.trim())
+  : [];
+
+app.use(cors({
+  origin(origin, callback) {
+    // Mobile app requests have no Origin header — always allow.
+    if (!origin) return callback(null, true);
+    // Allow explicitly listed origins.
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    callback(new Error(`CORS: origin ${origin} is not allowed.`));
+  },
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['Content-Type', 'X-MIH-Key', 'X-MIH-Registration-Secret'],
+}));
+
+app.use(express.json());
+
+const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+
+// ── Redis client (optional) ───────────────────────────────────────────────────
+// If REDIS_URL is set, check-ins and sessions are persisted across restarts.
+// If not set, falls back to in-memory Maps (fine for local dev).
+let redis = null;
+if (REDIS_URL) {
+  redis = new Redis(REDIS_URL, { lazyConnect: true, maxRetriesPerRequest: 2 });
+  redis.on('connect', () => console.log('[redis] Connected.'));
+  redis.on('error', err => console.error('[redis] Error:', err.message));
+  redis.connect().catch(() => {
+    console.warn('[redis] Could not connect — falling back to in-memory store.');
+    redis = null;
+  });
+}
+
+const CHECKIN_PREFIX = 'checkin:';
+const SESSION_PREFIX = 'session:';
+const SESSION_TTL = 24 * 60 * 60; // seconds
+
+async function redisSet(key, value, ttlSeconds) {
+  if (!redis) return;
+  await redis.set(key, JSON.stringify(value), 'EX', ttlSeconds).catch(() => {});
+}
+
+async function redisDel(key) {
+  if (!redis) return;
+  await redis.del(key).catch(() => {});
+}
+
+async function redisGet(key) {
+  if (!redis) return null;
+  const raw = await redis.get(key).catch(() => null);
+  return raw ? JSON.parse(raw) : null;
+}
+
+async function redisScanAll(pattern) {
+  if (!redis) return [];
+  const keys = [];
+  let cursor = '0';
+  do {
+    const [next, found] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 100).catch(() => ['0', []]);
+    cursor = next;
+    keys.push(...found);
+  } while (cursor !== '0');
+  return keys;
+}
+
+// ── Per-device token store ────────────────────────────────────────────────────
+// Tokens are 256-bit random hex strings issued at device registration.
+// Redis stores them with a 90-day TTL; in-memory Map is the fallback.
+const TOKEN_PREFIX = 'token:';
+const TOKEN_TTL = 90 * 24 * 60 * 60; // 90 days in seconds
+const tokenStore = new Map(); // id → true (in-memory fallback)
+
+async function saveToken(token, deviceId) {
+  if (redis) {
+    await redisSet(`${TOKEN_PREFIX}${token}`, { deviceId }, TOKEN_TTL);
+  } else {
+    tokenStore.set(token, deviceId);
+    setTimeout(() => tokenStore.delete(token), Math.min(TOKEN_TTL * 1000, 2_147_483_647));
+  }
+}
+
+async function isTokenValid(token) {
+  if (redis) {
+    const val = await redisGet(`${TOKEN_PREFIX}${token}`);
+    return val !== null;
+  }
+  return tokenStore.has(token);
+}
+
+// ── Signed media tokens ───────────────────────────────────────────────────────
+// Each uploaded file gets a single-use 192-bit random token embedded in its
+// URL. Twilio can download without auth headers; guessing is infeasible.
+// Tokens expire when the file is deleted (24 h after upload).
+const MEDIA_TOKEN_PREFIX = 'mediatoken:';
+const MEDIA_TOKEN_TTL = 24 * 60 * 60; // 24 hours in seconds
+const mediaTokenStore = new Map(); // token → filename (in-memory fallback)
+
+async function saveMediaToken(token, filename) {
+  if (redis) {
+    await redisSet(`${MEDIA_TOKEN_PREFIX}${token}`, { filename }, MEDIA_TOKEN_TTL);
+  } else {
+    mediaTokenStore.set(token, filename);
+    setTimeout(() => mediaTokenStore.delete(token), MEDIA_TOKEN_TTL * 1000);
+  }
+}
+
+async function resolveMediaToken(token) {
+  if (redis) {
+    const val = await redisGet(`${MEDIA_TOKEN_PREFIX}${token}`);
+    return val?.filename ?? null;
+  }
+  return mediaTokenStore.get(token) ?? null;
+}
+
+// ── Rate limiting ─────────────────────────────────────────────────────────────
+const smsLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Too many requests. Please wait before trying again.' },
+});
+
+// Tight limit on registration: 5 attempts per hour per IP.
+const registerLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  limit: 5,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Too many registration attempts. Try again later.' },
+});
+
+app.use('/register', registerLimiter);
+app.use('/notify', smsLimiter);
+app.use('/upload', smsLimiter);
+app.use('/safe', smsLimiter);
+app.use('/checkin/start', smsLimiter);
+app.use('/session/start', smsLimiter);
+
+// ── Auth middleware ───────────────────────────────────────────────────────────
+// Unauthenticated paths:
+//   /health   — monitoring
+//   /register — issues tokens (guarded by REGISTRATION_SECRET)
+//   /media/*  — guarded by signed per-file query token (Twilio has no X-MIH-Key)
+// Everything else requires a valid per-device token in X-MIH-Key.
+app.use(async (req, res, next) => {
+  if (
+    req.path === '/health' ||
+    req.path === '/register' ||
+    req.path.startsWith('/media/')
+  ) return next();
+  const token = req.headers['x-mih-key'];
+  if (!token) return res.status(401).json({ error: 'Unauthorized.' });
+  const valid = await isTokenValid(String(token));
+  if (!valid) return res.status(401).json({ error: 'Unauthorized.' });
+  next();
+});
+
+// ── HTML escaping ─────────────────────────────────────────────────────────────
+function escapeHtml(str) {
+  return String(str ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#x27;');
+}
+
+// ── Phone number validation ───────────────────────────────────────────────────
+// Accepts E.164 format only: + followed by 7–15 digits.
+const E164_RE = /^\+[1-9]\d{6,14}$/;
+
+function validatePhones(phones) {
+  if (!Array.isArray(phones) || phones.length === 0) {
+    return 'No phone numbers provided.';
+  }
+  const invalid = phones.filter(p => typeof p !== 'string' || !E164_RE.test(p));
+  if (invalid.length > 0) {
+    return `Invalid phone number(s): ${invalid.join(', ')}. Numbers must be in E.164 format (e.g. +12125551234).`;
+  }
+  return null; // null = valid
+}
+
+// ── Shared helpers ────────────────────────────────────────────────────────────
+async function sendSmsToAll(phones, body) {
+  return Promise.all(
+    phones.map(to => twilioClient.messages.create({ body, from: TWILIO_PHONE_NUMBER, to })),
+  );
+}
+
+// ── Check-in timer store ──────────────────────────────────────────────────────
+// In-memory Map holds the live timeout handles (can't be serialised).
+// Redis holds the metadata so timers can be restored after a restart.
+const checkIns = new Map(); // id → { timeout, phones, name, latitude, longitude, expiresAt }
+
+function buildAlertBody(name, latitude, longitude) {
+  const who = name?.trim() || 'Someone';
+  const mapsLink =
+    latitude != null && longitude != null
+      ? `\n\nLast known location: https://maps.google.com/?q=${latitude},${longitude}`
+      : '';
+  return `🚨 EMERGENCY — ${who} missed their check-in! Open Make It Home NOW.${mapsLink}`;
+}
+
+function scheduleAlert(id, entry, delayMs) {
+  return setTimeout(async () => {
+    checkIns.delete(id);
+    await redisDel(`${CHECKIN_PREFIX}${id}`);
+    try {
+      await sendSmsToAll(entry.phones, buildAlertBody(entry.name, entry.latitude, entry.longitude));
+      console.log(`[checkin] Fired for ${id}, alerted ${entry.phones.length} contact(s).`);
+    } catch (err) {
+      console.error(`[checkin] Alert error for ${id}:`, err.message);
+    }
+  }, Math.max(delayMs, 0));
+}
+
+// ── Restore check-ins from Redis on startup ───────────────────────────────────
+async function restoreCheckIns() {
+  const keys = await redisScanAll(`${CHECKIN_PREFIX}*`);
+  if (!keys.length) return;
+  console.log(`[checkin] Restoring ${keys.length} active check-in(s) from Redis…`);
+  for (const key of keys) {
+    const entry = await redisGet(key);
+    if (!entry) continue;
+    const id = key.slice(CHECKIN_PREFIX.length);
+    const delayMs = entry.expiresAt - Date.now();
+    if (delayMs <= 0) {
+      // Already expired while server was down — fire alert immediately
+      console.log(`[checkin] ${id} expired while offline, firing now.`);
+      await redisDel(key);
+      sendSmsToAll(entry.phones, buildAlertBody(entry.name, entry.latitude, entry.longitude))
+        .catch(err => console.error(`[checkin] Late alert error for ${id}:`, err.message));
+      continue;
+    }
+    const timeout = scheduleAlert(id, entry, delayMs);
+    checkIns.set(id, { ...entry, timeout });
+    console.log(`[checkin] Restored ${id}, fires in ${Math.round(delayMs / 1000)}s.`);
+  }
+}
+
+// ── Video storage ─────────────────────────────────────────────────────────────
+const uploadDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
+
+const storage = multer.diskStorage({
+  destination: uploadDir,
+  filename: (req, file, cb) => cb(null, `${Date.now()}-recording.mp4`),
+});
+
+function videoFileFilter(req, file, cb) {
+  if (file.mimetype === 'video/mp4') {
+    cb(null, true);
+  } else {
+    cb(Object.assign(new Error('Only video/mp4 files are accepted.'), { status: 415 }), false);
+  }
+}
+
+const upload = multer({
+  storage,
+  limits: { fileSize: 100 * 1024 * 1024 }, // 100 MB
+  fileFilter: videoFileFilter,
+});
+
+// GET /media/:filename?token=<signed-token>
+// Serves a recorded video only when the signed token matches.
+// Twilio calls this URL without auth headers, so it is exempt from the
+// X-MIH-Key middleware but protected by the per-file query token instead.
+app.get('/media/:filename', async (req, res) => {
+  const { filename } = req.params;
+  const { token } = req.query;
+
+  // Reject obviously bad filenames before touching the filesystem
+  if (!filename || !/^[\w.-]+$/.test(filename)) {
+    return res.status(400).json({ error: 'Invalid filename.' });
+  }
+  if (!token || typeof token !== 'string') {
+    return res.status(401).json({ error: 'Missing media token.' });
+  }
+
+  const expected = await resolveMediaToken(token);
+  if (!expected || expected !== filename) {
+    return res.status(403).json({ error: 'Invalid or expired media token.' });
+  }
+
+  const filePath = path.join(uploadDir, filename);
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: 'File not found.' });
+  }
+
+  res.sendFile(filePath);
+});
+
+// ── POST /notify ──────────────────────────────────────────────────────────────
+app.post('/notify', async (req, res) => {
+  const { phones, latitude, longitude, name } = req.body;
+
+  const phoneErr = validatePhones(phones);
+  if (phoneErr) return res.status(400).json({ error: phoneErr });
+  if (latitude == null || longitude == null) {
+    return res.status(400).json({ error: 'latitude and longitude are required.' });
+  }
+
+  const mapsLink = `https://maps.google.com/?q=${latitude},${longitude}`;
+  const who = name?.trim() ? `${name.trim()} needs help` : 'Someone needs help';
+  const body = `🚨 EMERGENCY — ${who}! Open the Make It Home app RIGHT NOW.\n\nLocation: ${mapsLink}`;
+
+  try {
+    await sendSmsToAll(phones, body);
+    console.log(`[/notify] Sent location SMS to ${phones.length} contact(s).`);
+    res.json({ sent: phones.length });
+  } catch (err) {
+    console.error('[/notify] Twilio error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /upload ──────────────────────────────────────────────────────────────
+app.post('/upload', (req, res, next) => {
+  upload.single('video')(req, res, err => {
+    if (err) {
+      const status = err.status || (err.code === 'LIMIT_FILE_SIZE' ? 413 : 400);
+      return res.status(status).json({ error: err.message });
+    }
+    next();
+  });
+}, async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No video file received.' });
+
+  let phones;
+  try {
+    phones = JSON.parse(req.body.phones || '[]');
+  } catch {
+    return res.status(400).json({ error: 'phones must be a JSON array.' });
+  }
+  const phoneErr = validatePhones(phones);
+  if (phoneErr) return res.status(400).json({ error: phoneErr });
+  if (!SERVER_URL) return res.status(500).json({ error: 'SERVER_URL is not configured.' });
+
+  // Generate a signed token so Twilio can download the file without auth headers
+  const mediaToken = crypto.randomBytes(24).toString('hex');
+  await saveMediaToken(mediaToken, req.file.filename);
+  const mediaUrl = `${SERVER_URL}/media/${req.file.filename}?token=${mediaToken}`;
+  const body = '🎥 Safety recording from your safety circle.';
+
+  try {
+    await Promise.all(
+      phones.map(to =>
+        twilioClient.messages.create({ body, from: TWILIO_PHONE_NUMBER, to, mediaUrl: [mediaUrl] }),
+      ),
+    );
+    console.log(`[/upload] Sent MMS to ${phones.length} contact(s). Media: ${mediaUrl}`);
+    setTimeout(() => fs.unlink(req.file.path, () => {}), 24 * 60 * 60 * 1000);
+    res.json({ sent: phones.length, mediaUrl });
+  } catch (err) {
+    console.error('[/upload] Twilio error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /checkin/start ───────────────────────────────────────────────────────
+app.post('/checkin/start', async (req, res) => {
+  const { id, phones, name, durationSeconds, latitude, longitude } = req.body;
+
+  if (!id || !durationSeconds) {
+    return res.status(400).json({ error: 'id and durationSeconds are required.' });
+  }
+  const phoneErr = validatePhones(phones);
+  if (phoneErr) return res.status(400).json({ error: phoneErr });
+
+  // Replace any existing timer for this id
+  if (checkIns.has(id)) clearTimeout(checkIns.get(id).timeout);
+
+  const expiresAt = Date.now() + durationSeconds * 1000;
+  const entry = { phones, name, latitude, longitude, expiresAt };
+
+  await redisSet(`${CHECKIN_PREFIX}${id}`, entry, durationSeconds + 60); // +60s grace period
+  const timeout = scheduleAlert(id, entry, durationSeconds * 1000);
+  checkIns.set(id, { ...entry, timeout });
+
+  console.log(`[/checkin/start] Started ${id}, fires in ${durationSeconds}s.`);
+  res.json({ id, expiresAt });
+});
+
+// ── POST /checkin/cancel ──────────────────────────────────────────────────────
+app.post('/checkin/cancel', async (req, res) => {
+  const { id, notifySafe } = req.body;
+  if (!id) return res.status(400).json({ error: 'id is required.' });
+
+  const entry = checkIns.get(id);
+  if (!entry) return res.status(404).json({ error: 'Check-in not found.' });
+
+  clearTimeout(entry.timeout);
+  checkIns.delete(id);
+  await redisDel(`${CHECKIN_PREFIX}${id}`);
+  console.log(`[/checkin/cancel] Cancelled ${id}.`);
+
+  if (notifySafe) {
+    const who = entry.name?.trim() || 'Your contact';
+    try {
+      await sendSmsToAll(entry.phones, `✅ ${who} has checked in and is safe.`);
+    } catch (err) {
+      console.error('[/checkin/cancel] Safe SMS error:', err.message);
+    }
+  }
+
+  res.json({ cancelled: true });
+});
+
+// ── POST /checkin/extend ──────────────────────────────────────────────────────
+app.post('/checkin/extend', async (req, res) => {
+  const { id, additionalSeconds } = req.body;
+  if (!id || !additionalSeconds) {
+    return res.status(400).json({ error: 'id and additionalSeconds are required.' });
+  }
+
+  const entry = checkIns.get(id);
+  if (!entry) return res.status(404).json({ error: 'Check-in not found.' });
+
+  clearTimeout(entry.timeout);
+
+  const newExpiresAt = entry.expiresAt + additionalSeconds * 1000;
+  const newDelay = newExpiresAt - Date.now();
+  const updatedEntry = { ...entry, expiresAt: newExpiresAt };
+
+  await redisSet(`${CHECKIN_PREFIX}${id}`, updatedEntry, Math.ceil(newDelay / 1000) + 60);
+  const timeout = scheduleAlert(id, updatedEntry, newDelay);
+  checkIns.set(id, { ...updatedEntry, timeout });
+
+  console.log(`[/checkin/extend] Extended ${id} by ${additionalSeconds}s.`);
+  res.json({ id, expiresAt: newExpiresAt });
+});
+
+// ── Live session tracking ─────────────────────────────────────────────────────
+// Sessions are stored in Redis (with 24h TTL) when available, in-memory otherwise.
+const sessionsMemory = new Map(); // fallback when Redis is not configured
+
+async function sessionSet(sessionId, data) {
+  if (redis) {
+    await redisSet(`${SESSION_PREFIX}${sessionId}`, data, SESSION_TTL);
+  } else {
+    sessionsMemory.set(sessionId, data);
+  }
+}
+
+async function sessionGet(sessionId) {
+  if (redis) return redisGet(`${SESSION_PREFIX}${sessionId}`);
+  return sessionsMemory.get(sessionId) ?? null;
+}
+
+async function sessionDel(sessionId) {
+  if (redis) {
+    await redisDel(`${SESSION_PREFIX}${sessionId}`);
+  } else {
+    sessionsMemory.delete(sessionId);
+  }
+}
+
+// POST /session/start
+app.post('/session/start', async (req, res) => {
+  const { sessionId, phones, name, latitude, longitude } = req.body;
+  if (!sessionId) {
+    return res.status(400).json({ error: 'sessionId is required.' });
+  }
+  const phoneErr = validatePhones(phones);
+  if (phoneErr) return res.status(400).json({ error: phoneErr });
+
+  await sessionSet(sessionId, { name, phones, latitude, longitude, updatedAt: Date.now() });
+
+  // In-memory fallback: expire after 24h
+  if (!redis) setTimeout(() => sessionsMemory.delete(sessionId), SESSION_TTL * 1000);
+
+  const liveLink = `${SERVER_URL}/live/${sessionId}`;
+  const who = name?.trim() ? `${name.trim()} needs help` : 'Someone needs help';
+  const body = `🚨 EMERGENCY — ${who}! Open Make It Home NOW.\n\nTrack live: ${liveLink}`;
+
+  try {
+    await sendSmsToAll(phones, body);
+    console.log(`[/session/start] Started ${sessionId}, alerted ${phones.length} contact(s).`);
+    res.json({ sessionId, liveLink });
+  } catch (err) {
+    console.error('[/session/start] Twilio error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /session/update
+app.post('/session/update', async (req, res) => {
+  const { sessionId, latitude, longitude } = req.body;
+  const session = await sessionGet(sessionId);
+  if (!session) return res.status(404).json({ error: 'Session not found.' });
+  await sessionSet(sessionId, { ...session, latitude, longitude, updatedAt: Date.now() });
+  res.json({ ok: true });
+});
+
+// POST /session/end
+app.post('/session/end', async (req, res) => {
+  const { sessionId } = req.body;
+  if (!sessionId) return res.status(400).json({ error: 'sessionId is required.' });
+  await sessionDel(sessionId);
+  console.log(`[/session/end] Ended session ${sessionId}.`);
+  res.json({ ended: true });
+});
+
+// GET /live/:sessionId
+app.get('/live/:sessionId', async (req, res) => {
+  const session = await sessionGet(req.params.sessionId);
+  if (!session) {
+    return res.status(404).send(
+      `<html><body style="background:#0a0a0a;color:#666;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;font-size:18px;">Session not found or expired.</body></html>`,
+    );
+  }
+
+  const { name, latitude, longitude, updatedAt } = session;
+  const safeName = escapeHtml(name || '');
+  const displayName = safeName || 'Your contact';
+  const displayTitle = safeName || 'Someone';
+  const hasCoords = latitude != null && longitude != null;
+  const mapsUrl = hasCoords
+    ? `https://maps.google.com/?q=${encodeURIComponent(latitude)},${encodeURIComponent(longitude)}`
+    : 'https://maps.google.com/';
+  const ago = Math.round((Date.now() - updatedAt) / 1000);
+  const agoText = ago < 60 ? `${ago}s ago` : `${Math.round(ago / 60)}m ago`;
+  const coordsText = hasCoords
+    ? `${Number(latitude).toFixed(5)}, ${Number(longitude).toFixed(5)}`
+    : 'Location pending…';
+
+  res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="refresh" content="30">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${displayTitle} — Make It Home</title>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#0a0a0a;color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;padding:32px;text-align:center}
+    .dot{width:10px;height:10px;border-radius:50%;background:#dc2626;display:inline-block;margin-right:7px;animation:pulse 1.5s ease-in-out infinite}
+    @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
+    .live{color:#dc2626;font-size:12px;font-weight:700;letter-spacing:1px;text-transform:uppercase;margin-bottom:20px;display:flex;align-items:center;justify-content:center}
+    .name{font-size:34px;font-weight:bold;margin-bottom:6px}
+    .sub{color:#555;font-size:14px;margin-bottom:40px}
+    .btn{display:inline-block;background:#dc2626;color:#fff;text-decoration:none;padding:18px 40px;border-radius:14px;font-size:18px;font-weight:bold}
+    .meta{color:#333;font-size:11px;margin-top:24px;line-height:1.8;font-variant-numeric:tabular-nums}
+  </style>
+</head>
+<body>
+  <div class="live"><span class="dot"></span>LIVE LOCATION</div>
+  <div class="name">${displayName}</div>
+  <div class="sub">needs help — tap to navigate</div>
+  <a class="btn" href="${mapsUrl}">Open in Maps</a>
+  <div class="meta">
+    ${coordsText}<br>
+    Updated ${agoText} &middot; refreshes every 30s
+  </div>
+</body>
+</html>`);
+});
+
+// ── POST /safe ────────────────────────────────────────────────────────────────
+app.post('/safe', async (req, res) => {
+  const { phones, name } = req.body;
+  const phoneErr = validatePhones(phones);
+  if (phoneErr) return res.status(400).json({ error: phoneErr });
+  const who = name?.trim() || 'Your contact';
+  try {
+    await sendSmsToAll(phones, `✅ ${who} is safe — false alarm.`);
+    console.log(`[/safe] Sent safe notification to ${phones.length} contact(s).`);
+    res.json({ sent: phones.length });
+  } catch (err) {
+    console.error('[/safe] Twilio error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /register ────────────────────────────────────────────────────────────
+// Issues a per-device token. Caller must present the REGISTRATION_SECRET in
+// X-MIH-Registration-Secret. Rate-limited to 5 requests/hour/IP.
+app.post('/register', async (req, res) => {
+  const { deviceId } = req.body;
+  if (!deviceId || typeof deviceId !== 'string' || deviceId.length > 128) {
+    return res.status(400).json({ error: 'deviceId is required.' });
+  }
+  if (!REGISTRATION_SECRET || req.headers['x-mih-registration-secret'] !== REGISTRATION_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized.' });
+  }
+  const token = crypto.randomBytes(32).toString('hex');
+  await saveToken(token, deviceId);
+  console.log(`[/register] Issued token for device ${deviceId.slice(0, 8)}…`);
+  res.json({ token });
+});
+
+// ── Health check ──────────────────────────────────────────────────────────────
+app.get('/health', (req, res) => res.json({ ok: true, redis: !!redis }));
+
+// ── Start server ──────────────────────────────────────────────────────────────
+app.listen(PORT, async () => {
+  console.log(`Make It Home server listening on port ${PORT}`);
+  await restoreCheckIns();
+});
