@@ -83,6 +83,17 @@ if (REDIS_URL) {
   });
 }
 
+// In production, check-in timers MUST survive restarts/redeploys — otherwise the
+// "we'll alert your circle if you don't check in" promise silently breaks. Warn
+// loudly at boot when Redis isn't configured in production.
+if (process.env.NODE_ENV === 'production' && !REDIS_URL) {
+  console.warn(
+    '⚠️  FATAL for safety guarantees: Redis is NOT configured (REDIS_URL unset). ' +
+    'Check-in timers live only in memory and will be LOST on the next restart/redeploy. ' +
+    'Attach Redis and set REDIS_URL before serving real users.',
+  );
+}
+
 const CHECKIN_PREFIX = 'checkin:';
 const SESSION_PREFIX = 'session:';
 const SESSION_TTL = 24 * 60 * 60; // seconds
@@ -758,7 +769,15 @@ app.post('/register', async (req, res) => {
 });
 
 // ── Health check ──────────────────────────────────────────────────────────────
-app.get('/health', (req, res) => res.json({ ok: true, redis: !!redis }));
+// In production, a missing Redis is a real fault (check-in timers won't survive
+// restarts), so surface it as 503 for monitors. In dev, in-memory is fine → 200.
+app.get('/health', (req, res) => {
+  const redisUp = !!redis;
+  if (process.env.NODE_ENV === 'production' && !redisUp) {
+    return res.status(503).json({ ok: false, redis: false });
+  }
+  res.json({ ok: true, redis: redisUp });
+});
 
 // ── Start server ──────────────────────────────────────────────────────────────
 app.listen(PORT, async () => {
