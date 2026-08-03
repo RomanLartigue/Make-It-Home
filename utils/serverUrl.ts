@@ -47,6 +47,13 @@ async function getOrCreateDeviceId(): Promise<string> {
   return id;
 }
 
+// Unguessable session/check-in id, e.g. "session_a1b2…" (128 bits of entropy).
+// Replaces the old `${prefix}_${Date.now()}` scheme, which was trivially guessable
+// and let anyone address another user's session on the public /live page.
+export function randomId(prefix: string): string {
+  return `${prefix}_${randomHex(16)}`;
+}
+
 async function registerDevice(): Promise<string | null> {
   try {
     const deviceId = await getOrCreateDeviceId();

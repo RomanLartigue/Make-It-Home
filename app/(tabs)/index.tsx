@@ -18,7 +18,7 @@ import * as Location from 'expo-location';
 import * as Notifications from 'expo-notifications';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
-import { getServerUrl, getUserName, fetchWithAuth } from '@/utils/serverUrl';
+import { getServerUrl, getUserName, fetchWithAuth, randomId } from '@/utils/serverUrl';
 import { BACKGROUND_LOCATION_TASK } from '@/tasks/backgroundLocation';
 import { Beacon } from '@/constants/beacon';
 import { PillButton } from '@/components/beacon/kit';
@@ -324,7 +324,7 @@ export default function HomeScreen() {
       return;
     }
     const name = await getUserName();
-    const id = `checkin_${Date.now()}`;
+    const id = randomId('checkin');
     let latitude: number | null = null;
     let longitude: number | null = null;
     try {
@@ -460,7 +460,7 @@ export default function HomeScreen() {
         setCoords(loc.coords);
         if (!notifiedRef.current) {
           notifiedRef.current = true;
-          const sessionId = `session_${Date.now()}`;
+          const sessionId = randomId('session');
           sessionIdRef.current = sessionId;
           await AsyncStorage.setItem(ACTIVE_SESSION_KEY, sessionId);
           await startSession(loc.coords);

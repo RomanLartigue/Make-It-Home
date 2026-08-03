@@ -199,7 +199,8 @@ app.use(async (req, res, next) => {
   if (
     req.path === '/health' ||
     req.path === '/register' ||
-    req.path.startsWith('/media/')
+    req.path.startsWith('/media/') ||
+    req.path.startsWith('/live/')
   ) return next();
   const token = req.headers['x-mih-key'];
   if (!token) return res.status(401).json({ error: 'Unauthorized.' });
@@ -424,7 +425,9 @@ app.post('/checkin/start', async (req, res) => {
   if (checkIns.has(id)) clearTimeout(checkIns.get(id).timeout);
 
   const expiresAt = Date.now() + durationSeconds * 1000;
-  const entry = { phones, name, latitude, longitude, expiresAt };
+  // Bind this check-in to the creating device so only it can cancel/extend it.
+  const ownerToken = String(req.headers['x-mih-key'] || '');
+  const entry = { phones, name, latitude, longitude, expiresAt, ownerToken };
 
   await redisSet(`${CHECKIN_PREFIX}${id}`, entry, durationSeconds + 60); // +60s grace period
   const timeout = scheduleAlert(id, entry, durationSeconds * 1000);
@@ -441,6 +444,11 @@ app.post('/checkin/cancel', async (req, res) => {
 
   const entry = checkIns.get(id);
   if (!entry) return res.status(404).json({ error: 'Check-in not found.' });
+  // Only the owning device may cancel (prevents silencing someone else's alarm).
+  const token = String(req.headers['x-mih-key'] || '');
+  if (entry.ownerToken && entry.ownerToken !== token) {
+    return res.status(403).json({ error: 'Forbidden.' });
+  }
 
   clearTimeout(entry.timeout);
   checkIns.delete(id);
@@ -468,6 +476,11 @@ app.post('/checkin/extend', async (req, res) => {
 
   const entry = checkIns.get(id);
   if (!entry) return res.status(404).json({ error: 'Check-in not found.' });
+  // Only the owning device may extend it.
+  const token = String(req.headers['x-mih-key'] || '');
+  if (entry.ownerToken && entry.ownerToken !== token) {
+    return res.status(403).json({ error: 'Forbidden.' });
+  }
 
   clearTimeout(entry.timeout);
 
@@ -517,7 +530,9 @@ app.post('/session/start', async (req, res) => {
   const phoneErr = validatePhones(phones);
   if (phoneErr) return res.status(400).json({ error: phoneErr });
 
-  await sessionSet(sessionId, { name, phones, latitude, longitude, updatedAt: Date.now() });
+  // Bind this session to the creating device so only it can update/end it.
+  const ownerToken = String(req.headers['x-mih-key'] || '');
+  await sessionSet(sessionId, { name, phones, latitude, longitude, ownerToken, updatedAt: Date.now() });
 
   // In-memory fallback: expire after 24h
   if (!redis) setTimeout(() => sessionsMemory.delete(sessionId), SESSION_TTL * 1000);
@@ -541,6 +556,11 @@ app.post('/session/update', async (req, res) => {
   const { sessionId, latitude, longitude } = req.body;
   const session = await sessionGet(sessionId);
   if (!session) return res.status(404).json({ error: 'Session not found.' });
+  // Only the device that started the session may move its location.
+  const token = String(req.headers['x-mih-key'] || '');
+  if (session.ownerToken && session.ownerToken !== token) {
+    return res.status(403).json({ error: 'Forbidden.' });
+  }
   await sessionSet(sessionId, { ...session, latitude, longitude, updatedAt: Date.now() });
   res.json({ ok: true });
 });
@@ -549,6 +569,12 @@ app.post('/session/update', async (req, res) => {
 app.post('/session/end', async (req, res) => {
   const { sessionId } = req.body;
   if (!sessionId) return res.status(400).json({ error: 'sessionId is required.' });
+  // Only the owning device may end the session.
+  const session = await sessionGet(sessionId);
+  const token = String(req.headers['x-mih-key'] || '');
+  if (session && session.ownerToken && session.ownerToken !== token) {
+    return res.status(403).json({ error: 'Forbidden.' });
+  }
   await sessionDel(sessionId);
   console.log(`[/session/end] Ended session ${sessionId}.`);
   res.json({ ended: true });
