@@ -310,10 +310,17 @@ function validatePhones(phones) {
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
+// Sends to every recipient independently so one bad number (stale entry, carrier
+// reject) can't blackhole the whole alert. Returns a summary; never throws.
 async function sendSmsToAll(phones, body) {
-  return Promise.all(
+  const results = await Promise.allSettled(
     phones.map(to => twilioClient.messages.create({ body, from: TWILIO_PHONE_NUMBER, to })),
   );
+  const sent = results.filter(r => r.status === 'fulfilled').length;
+  const errors = results
+    .filter(r => r.status === 'rejected')
+    .map(r => r.reason?.message || String(r.reason));
+  return { sent, failed: errors.length, errors };
 }
 
 // ── Check-in timer store ──────────────────────────────────────────────────────
@@ -334,12 +341,9 @@ function scheduleAlert(id, entry, delayMs) {
   return setTimeout(async () => {
     checkIns.delete(id);
     await redisDel(`${CHECKIN_PREFIX}${id}`);
-    try {
-      await sendSmsToAll(entry.phones, buildAlertBody(entry.name, entry.latitude, entry.longitude));
-      console.log(`[checkin] Fired for ${id}, alerted ${entry.phones.length} contact(s).`);
-    } catch (err) {
-      console.error(`[checkin] Alert error for ${id}:`, err.message);
-    }
+    const r = await sendSmsToAll(entry.phones, buildAlertBody(entry.name, entry.latitude, entry.longitude));
+    console.log(`[checkin] Fired for ${id}: sent ${r.sent}/${entry.phones.length}${r.failed ? `, ${r.failed} failed` : ''}.`);
+    if (r.failed) console.error(`[checkin] ${id} send errors:`, r.errors.join('; '));
   }, Math.max(delayMs, 0));
 }
 
@@ -358,7 +362,7 @@ async function restoreCheckIns() {
       console.log(`[checkin] ${id} expired while offline, firing now.`);
       await redisDel(key);
       sendSmsToAll(entry.phones, buildAlertBody(entry.name, entry.latitude, entry.longitude))
-        .catch(err => console.error(`[checkin] Late alert error for ${id}:`, err.message));
+        .then(r => console.log(`[checkin] Late alert for ${id}: sent ${r.sent}, failed ${r.failed}.`));
       continue;
     }
     const timeout = scheduleAlert(id, entry, delayMs);
@@ -434,14 +438,13 @@ app.post('/notify', async (req, res) => {
   const who = name?.trim() ? `${name.trim()} needs help` : 'Someone needs help';
   const body = `🚨 EMERGENCY — ${who}! Open the Make It Home app RIGHT NOW.\n\nLocation: ${mapsLink}`;
 
-  try {
-    await sendSmsToAll(recipients, body);
-    console.log(`[/notify] Sent location SMS to ${recipients.length} contact(s).`);
-    res.json({ sent: recipients.length });
-  } catch (err) {
-    console.error('[/notify] Twilio error:', err.message);
-    res.status(500).json({ error: err.message });
+  const result = await sendSmsToAll(recipients, body);
+  if (result.sent === 0) {
+    console.error('[/notify] All sends failed:', result.errors.join('; '));
+    return res.status(500).json({ error: 'Could not reach any contact.', failed: result.failed });
   }
+  console.log(`[/notify] Sent ${result.sent}/${recipients.length}, ${result.failed} failed.`);
+  res.json({ sent: result.sent, failed: result.failed });
 });
 
 // ── POST /upload ──────────────────────────────────────────────────────────────
@@ -473,19 +476,20 @@ app.post('/upload', (req, res, next) => {
   const mediaUrl = `${SERVER_URL}/media/${req.file.filename}?token=${mediaToken}`;
   const body = '🎥 Safety recording from your safety circle.';
 
-  try {
-    await Promise.all(
-      recipients.map(to =>
-        twilioClient.messages.create({ body, from: TWILIO_PHONE_NUMBER, to, mediaUrl: [mediaUrl] }),
-      ),
-    );
-    console.log(`[/upload] Sent MMS to ${recipients.length} contact(s). Media: ${mediaUrl}`);
-    setTimeout(() => fs.unlink(req.file.path, () => {}), 24 * 60 * 60 * 1000);
-    res.json({ sent: recipients.length, mediaUrl });
-  } catch (err) {
-    console.error('[/upload] Twilio error:', err.message);
-    res.status(500).json({ error: err.message });
+  const results = await Promise.allSettled(
+    recipients.map(to =>
+      twilioClient.messages.create({ body, from: TWILIO_PHONE_NUMBER, to, mediaUrl: [mediaUrl] }),
+    ),
+  );
+  const sent = results.filter(x => x.status === 'fulfilled').length;
+  const failed = results.length - sent;
+  if (sent === 0) {
+    console.error('[/upload] All MMS sends failed.');
+    return res.status(500).json({ error: 'Could not reach any contact.', failed });
   }
+  console.log(`[/upload] Sent MMS ${sent}/${recipients.length}, ${failed} failed. Media: ${mediaUrl}`);
+  setTimeout(() => fs.unlink(req.file.path, () => {}), 24 * 60 * 60 * 1000);
+  res.json({ sent, failed, mediaUrl });
 });
 
 // ── POST /checkin/start ───────────────────────────────────────────────────────
@@ -535,11 +539,8 @@ app.post('/checkin/cancel', async (req, res) => {
 
   if (notifySafe) {
     const who = entry.name?.trim() || 'Your contact';
-    try {
-      await sendSmsToAll(entry.phones, `✅ ${who} has checked in and is safe.`);
-    } catch (err) {
-      console.error('[/checkin/cancel] Safe SMS error:', err.message);
-    }
+    const r = await sendSmsToAll(entry.phones, `✅ ${who} has checked in and is safe.`);
+    console.log(`[/checkin/cancel] Safe SMS: sent ${r.sent}, failed ${r.failed}.`);
   }
 
   res.json({ cancelled: true });
@@ -620,14 +621,13 @@ app.post('/session/start', async (req, res) => {
   const who = name?.trim() ? `${name.trim()} needs help` : 'Someone needs help';
   const body = `🚨 EMERGENCY — ${who}! Open Make It Home NOW.\n\nTrack live: ${liveLink}`;
 
-  try {
-    await sendSmsToAll(recipients, body);
-    console.log(`[/session/start] Started ${sessionId}, alerted ${recipients.length} contact(s).`);
-    res.json({ sessionId, liveLink });
-  } catch (err) {
-    console.error('[/session/start] Twilio error:', err.message);
-    res.status(500).json({ error: err.message });
+  const result = await sendSmsToAll(recipients, body);
+  if (result.sent === 0) {
+    console.error(`[/session/start] ${sessionId} all sends failed:`, result.errors.join('; '));
+    return res.status(500).json({ error: 'Could not reach any contact.', sessionId, liveLink, failed: result.failed });
   }
+  console.log(`[/session/start] Started ${sessionId}: sent ${result.sent}/${recipients.length}, ${result.failed} failed.`);
+  res.json({ sessionId, liveLink, sent: result.sent, failed: result.failed });
 });
 
 // POST /session/update
@@ -721,14 +721,13 @@ app.post('/safe', async (req, res) => {
   if (r.error) return res.status(r.status).json({ error: r.error });
   const recipients = r.recipients;
   const who = name?.trim() || 'Your contact';
-  try {
-    await sendSmsToAll(recipients, `✅ ${who} is safe — false alarm.`);
-    console.log(`[/safe] Sent safe notification to ${recipients.length} contact(s).`);
-    res.json({ sent: recipients.length });
-  } catch (err) {
-    console.error('[/safe] Twilio error:', err.message);
-    res.status(500).json({ error: err.message });
+  const result = await sendSmsToAll(recipients, `✅ ${who} is safe — false alarm.`);
+  if (result.sent === 0) {
+    console.error('[/safe] All sends failed:', result.errors.join('; '));
+    return res.status(500).json({ error: 'Could not reach any contact.', failed: result.failed });
   }
+  console.log(`[/safe] Sent ${result.sent}/${recipients.length}, ${result.failed} failed.`);
+  res.json({ sent: result.sent, failed: result.failed });
 });
 
 // ── POST /circle/sync ─────────────────────────────────────────────────────────
