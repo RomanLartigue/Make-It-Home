@@ -158,11 +158,11 @@ const MEDIA_TOKEN_PREFIX = 'mediatoken:';
 const MEDIA_TOKEN_TTL = 24 * 60 * 60; // 24 hours in seconds
 const mediaTokenStore = new Map(); // token → filename (in-memory fallback)
 
-async function saveMediaToken(token, filename) {
+async function saveMediaToken(token, filename, ownerToken) {
   if (redis) {
-    await redisSet(`${MEDIA_TOKEN_PREFIX}${token}`, { filename }, MEDIA_TOKEN_TTL);
+    await redisSet(`${MEDIA_TOKEN_PREFIX}${token}`, { filename, ownerToken }, MEDIA_TOKEN_TTL);
   } else {
-    mediaTokenStore.set(token, filename);
+    mediaTokenStore.set(token, { filename, ownerToken });
     setTimeout(() => mediaTokenStore.delete(token), MEDIA_TOKEN_TTL * 1000);
   }
 }
@@ -172,7 +172,13 @@ async function resolveMediaToken(token) {
     const val = await redisGet(`${MEDIA_TOKEN_PREFIX}${token}`);
     return val?.filename ?? null;
   }
-  return mediaTokenStore.get(token) ?? null;
+  return mediaTokenStore.get(token)?.filename ?? null;
+}
+
+// Removes a media token after use (Order 9 makes tokens single-use).
+async function deleteMediaToken(token) {
+  if (redis) await redisDel(`${MEDIA_TOKEN_PREFIX}${token}`);
+  else mediaTokenStore.delete(token);
 }
 
 // ── Per-device safety circle ──────────────────────────────────────────────────
@@ -472,7 +478,7 @@ app.post('/upload', (req, res, next) => {
 
   // Generate a signed token so Twilio can download the file without auth headers
   const mediaToken = crypto.randomBytes(24).toString('hex');
-  await saveMediaToken(mediaToken, req.file.filename);
+  await saveMediaToken(mediaToken, req.file.filename, String(req.headers['x-mih-key'] || ''));
   const mediaUrl = `${SERVER_URL}/media/${req.file.filename}?token=${mediaToken}`;
   const body = '🎥 Safety recording from your safety circle.';
 
@@ -728,6 +734,80 @@ app.post('/safe', async (req, res) => {
   }
   console.log(`[/safe] Sent ${result.sent}/${recipients.length}, ${result.failed} failed.`);
   res.json({ sent: result.sent, failed: result.failed });
+});
+
+// ── Account deletion helpers ──────────────────────────────────────────────────
+async function deleteToken(token) {
+  if (redis) await redisDel(`${TOKEN_PREFIX}${token}`);
+  else tokenStore.delete(token);
+}
+
+async function deleteCircleFor(token) {
+  if (redis) await redisDel(`${CIRCLE_PREFIX}${token}`);
+  else circleStore.delete(token);
+}
+
+async function deleteSessionsOwnedBy(token) {
+  if (redis) {
+    for (const key of await redisScanAll(`${SESSION_PREFIX}*`)) {
+      const s = await redisGet(key);
+      if (s && s.ownerToken === token) await redisDel(key);
+    }
+  } else {
+    for (const [sid, s] of sessionsMemory) {
+      if (s && s.ownerToken === token) sessionsMemory.delete(sid);
+    }
+  }
+}
+
+async function deleteCheckInsOwnedBy(token) {
+  for (const [id, entry] of checkIns) {
+    if (entry.ownerToken === token) {
+      clearTimeout(entry.timeout);
+      checkIns.delete(id);
+      await redisDel(`${CHECKIN_PREFIX}${id}`);
+    }
+  }
+  if (redis) {
+    for (const key of await redisScanAll(`${CHECKIN_PREFIX}*`)) {
+      const e = await redisGet(key);
+      if (e && e.ownerToken === token) await redisDel(key);
+    }
+  }
+}
+
+async function deleteMediaOwnedBy(token) {
+  if (redis) {
+    for (const key of await redisScanAll(`${MEDIA_TOKEN_PREFIX}*`)) {
+      const v = await redisGet(key);
+      if (v && v.ownerToken === token) {
+        if (v.filename) fs.unlink(path.join(uploadDir, v.filename), () => {});
+        await redisDel(key);
+      }
+    }
+  } else {
+    for (const [mt, v] of mediaTokenStore) {
+      if (v && v.ownerToken === token) {
+        if (v.filename) fs.unlink(path.join(uploadDir, v.filename), () => {});
+        mediaTokenStore.delete(mt);
+      }
+    }
+  }
+}
+
+// ── POST /account/delete ──────────────────────────────────────────────────────
+// Purges everything tied to the calling device: its sessions, check-in timers,
+// uploaded media, stored circle, and the token itself. Idempotent — after this
+// the token is invalid, so a repeat call is rejected 401 by the auth middleware.
+app.post('/account/delete', async (req, res) => {
+  const token = String(req.headers['x-mih-key'] || '');
+  await deleteSessionsOwnedBy(token);
+  await deleteCheckInsOwnedBy(token);
+  await deleteMediaOwnedBy(token);
+  await deleteCircleFor(token);
+  await deleteToken(token); // last — we needed it to find the above
+  console.log('[/account/delete] Purged all data for a device.');
+  res.json({ deleted: true });
 });
 
 // ── POST /circle/sync ─────────────────────────────────────────────────────────
