@@ -315,6 +315,33 @@ function validatePhones(phones) {
   return null; // null = valid
 }
 
+// ── Input hardening ───────────────────────────────────────────────────────────
+// Coordinates: both absent is allowed (we may alert before a GPS fix). When
+// present, they must be finite and in range — otherwise a caller could inject
+// text/links into the SMS body via the maps URL. Returns an error string or null.
+function validateCoords(latitude, longitude) {
+  if (latitude == null && longitude == null) return null;
+  const lat = Number(latitude);
+  const lon = Number(longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon) || lat < -90 || lat > 90 || lon < -180 || lon > 180) {
+    return 'latitude/longitude must be valid numbers (lat -90..90, lon -180..180).';
+  }
+  return null;
+}
+
+// Clamp a timer duration to [60s, 24h]. Returns null for non-numbers / <= 0
+// (a negative fired the alert immediately; a huge value overflowed setTimeout).
+function clampDuration(seconds) {
+  const n = Number(seconds);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return Math.min(Math.max(Math.round(n), 60), 86400);
+}
+
+// Coerce to string, trim, cap at 100 chars before it's used in an SMS.
+function cleanName(name) {
+  return (typeof name === 'string' ? name : '').trim().slice(0, 100);
+}
+
 // ── Shared helpers ────────────────────────────────────────────────────────────
 // Sends to every recipient independently so one bad number (stale entry, carrier
 // reject) can't blackhole the whole alert. Returns a summary; never throws.
@@ -502,9 +529,13 @@ app.post('/upload', (req, res, next) => {
 app.post('/checkin/start', async (req, res) => {
   const { id, phones, name, durationSeconds, latitude, longitude } = req.body;
 
-  if (!id || !durationSeconds) {
-    return res.status(400).json({ error: 'id and durationSeconds are required.' });
+  if (!id) return res.status(400).json({ error: 'id is required.' });
+  const dur = clampDuration(durationSeconds);
+  if (dur === null) {
+    return res.status(400).json({ error: 'durationSeconds must be a positive number.' });
   }
+  const coordErr = validateCoords(latitude, longitude);
+  if (coordErr) return res.status(400).json({ error: coordErr });
   const r = await recipientsFor(req, phones);
   if (r.error) return res.status(r.status).json({ error: r.error });
   const recipients = r.recipients;
@@ -512,16 +543,16 @@ app.post('/checkin/start', async (req, res) => {
   // Replace any existing timer for this id
   if (checkIns.has(id)) clearTimeout(checkIns.get(id).timeout);
 
-  const expiresAt = Date.now() + durationSeconds * 1000;
+  const expiresAt = Date.now() + dur * 1000;
   // Bind this check-in to the creating device so only it can cancel/extend it.
   const ownerToken = String(req.headers['x-mih-key'] || '');
-  const entry = { phones: recipients, name, latitude, longitude, expiresAt, ownerToken };
+  const entry = { phones: recipients, name: cleanName(name), latitude: latitude ?? null, longitude: longitude ?? null, expiresAt, ownerToken };
 
-  await redisSet(`${CHECKIN_PREFIX}${id}`, entry, durationSeconds + 60); // +60s grace period
-  const timeout = scheduleAlert(id, entry, durationSeconds * 1000);
+  await redisSet(`${CHECKIN_PREFIX}${id}`, entry, dur + 60); // +60s grace period
+  const timeout = scheduleAlert(id, entry, dur * 1000);
   checkIns.set(id, { ...entry, timeout });
 
-  console.log(`[/checkin/start] Started ${id}, fires in ${durationSeconds}s.`);
+  console.log(`[/checkin/start] Started ${id}, fires in ${dur}s.`);
   res.json({ id, expiresAt });
 });
 
@@ -555,8 +586,10 @@ app.post('/checkin/cancel', async (req, res) => {
 // ── POST /checkin/extend ──────────────────────────────────────────────────────
 app.post('/checkin/extend', async (req, res) => {
   const { id, additionalSeconds } = req.body;
-  if (!id || !additionalSeconds) {
-    return res.status(400).json({ error: 'id and additionalSeconds are required.' });
+  if (!id) return res.status(400).json({ error: 'id is required.' });
+  const add = clampDuration(additionalSeconds);
+  if (add === null) {
+    return res.status(400).json({ error: 'additionalSeconds must be a positive number.' });
   }
 
   const entry = checkIns.get(id);
@@ -569,7 +602,7 @@ app.post('/checkin/extend', async (req, res) => {
 
   clearTimeout(entry.timeout);
 
-  const newExpiresAt = entry.expiresAt + additionalSeconds * 1000;
+  const newExpiresAt = entry.expiresAt + add * 1000;
   const newDelay = newExpiresAt - Date.now();
   const updatedEntry = { ...entry, expiresAt: newExpiresAt };
 
@@ -612,19 +645,22 @@ app.post('/session/start', async (req, res) => {
   if (!sessionId) {
     return res.status(400).json({ error: 'sessionId is required.' });
   }
+  const coordErr = validateCoords(latitude, longitude);
+  if (coordErr) return res.status(400).json({ error: coordErr });
   const r = await recipientsFor(req, phones);
   if (r.error) return res.status(r.status).json({ error: r.error });
   const recipients = r.recipients;
+  const nm = cleanName(name);
 
   // Bind this session to the creating device so only it can update/end it.
   const ownerToken = String(req.headers['x-mih-key'] || '');
-  await sessionSet(sessionId, { name, phones: recipients, latitude, longitude, ownerToken, updatedAt: Date.now() });
+  await sessionSet(sessionId, { name: nm, phones: recipients, latitude: latitude ?? null, longitude: longitude ?? null, ownerToken, updatedAt: Date.now() });
 
   // In-memory fallback: expire after 24h
   if (!redis) setTimeout(() => sessionsMemory.delete(sessionId), SESSION_TTL * 1000);
 
   const liveLink = `${SERVER_URL}/live/${sessionId}`;
-  const who = name?.trim() ? `${name.trim()} needs help` : 'Someone needs help';
+  const who = nm ? `${nm} needs help` : 'Someone needs help';
   const body = `🚨 EMERGENCY — ${who}! Open Make It Home NOW.\n\nTrack live: ${liveLink}`;
 
   const result = await sendSmsToAll(recipients, body);
@@ -639,6 +675,8 @@ app.post('/session/start', async (req, res) => {
 // POST /session/update
 app.post('/session/update', async (req, res) => {
   const { sessionId, latitude, longitude } = req.body;
+  const coordErr = validateCoords(latitude, longitude);
+  if (coordErr) return res.status(400).json({ error: coordErr });
   const session = await sessionGet(sessionId);
   if (!session) return res.status(404).json({ error: 'Session not found.' });
   // Only the device that started the session may move its location.
@@ -646,7 +684,7 @@ app.post('/session/update', async (req, res) => {
   if (session.ownerToken && session.ownerToken !== token) {
     return res.status(403).json({ error: 'Forbidden.' });
   }
-  await sessionSet(sessionId, { ...session, latitude, longitude, updatedAt: Date.now() });
+  await sessionSet(sessionId, { ...session, latitude: latitude ?? null, longitude: longitude ?? null, updatedAt: Date.now() });
   res.json({ ok: true });
 });
 
@@ -726,7 +764,7 @@ app.post('/safe', async (req, res) => {
   const r = await recipientsFor(req, phones);
   if (r.error) return res.status(r.status).json({ error: r.error });
   const recipients = r.recipients;
-  const who = name?.trim() || 'Your contact';
+  const who = cleanName(name) || 'Your contact';
   const result = await sendSmsToAll(recipients, `✅ ${who} is safe — false alarm.`);
   if (result.sent === 0) {
     console.error('[/safe] All sends failed:', result.errors.join('; '));
