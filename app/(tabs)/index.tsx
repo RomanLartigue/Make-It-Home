@@ -18,7 +18,7 @@ import * as Location from 'expo-location';
 import * as Notifications from 'expo-notifications';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
-import { getServerUrl, getUserName, fetchWithAuth, randomId } from '@/utils/serverUrl';
+import { getServerUrl, getUserName, fetchWithAuth, randomId, syncCircle } from '@/utils/serverUrl';
 import { BACKGROUND_LOCATION_TASK } from '@/tasks/backgroundLocation';
 import { Beacon } from '@/constants/beacon';
 import { PillButton } from '@/components/beacon/kit';
@@ -249,6 +249,10 @@ export default function HomeScreen() {
       Alert.alert('No safety circle', 'Add contacts to your Safety Circle so they can be notified.');
       return;
     }
+    // Ensure the server has this circle under the CURRENT device token before we
+    // send — syncCircle elsewhere is best-effort/async and the token may have
+    // rotated (401 re-register), which would otherwise 400 as "no circle on file".
+    await syncCircle(phones);
     const [serverUrl, name] = await Promise.all([getServerUrl(), getUserName()]);
     const sessionId = sessionIdRef.current;
     lastLocationUpdateRef.current = Date.now();
@@ -290,6 +294,7 @@ export default function HomeScreen() {
   const uploadRecording = async (videoUri: string) => {
     const phones = await getSafetyCirclePhones();
     if (phones.length === 0) return;
+    await syncCircle(phones); // guarantee the server has this circle under the current token
     setNotifyStatus('uploading');
     const serverUrl = await getServerUrl();
     const formData = new FormData();
@@ -315,6 +320,7 @@ export default function HomeScreen() {
       Alert.alert('No safety circle', 'Add contacts to your Safety Circle first.');
       return;
     }
+    await syncCircle(phones); // guarantee the server has this circle under the current token
     setCheckInStarting(true);
     const serverUrl = await getServerUrl();
     const serverOk = await checkServerHealth(serverUrl);
@@ -533,6 +539,7 @@ export default function HomeScreen() {
   const sendSafeNotification = async () => {
     const phones = await getSafetyCirclePhones();
     if (phones.length === 0) return;
+    await syncCircle(phones); // guarantee the server has this circle under the current token
     const [serverUrl, name] = await Promise.all([getServerUrl(), getUserName()]);
     fetchWithAuth(`${serverUrl}/safe`, {
       method: 'POST',
