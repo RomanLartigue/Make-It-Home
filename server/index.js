@@ -427,6 +427,24 @@ const upload = multer({
   fileFilter: videoFileFilter,
 });
 
+// Deletes any upload older than the media TTL. Runs at boot and hourly, so a
+// restart (which loses the per-file delete-on-fetch fallback timers) can't
+// strand recordings on disk forever.
+// TODO (production): recordings should live in object storage (S3/R2) behind
+// short-lived signed URLs, not on this container's ephemeral disk.
+function sweepOldUploads() {
+  const cutoff = Date.now() - MEDIA_TOKEN_TTL * 1000;
+  fs.readdir(uploadDir, (err, files) => {
+    if (err) return;
+    for (const f of files) {
+      const fp = path.join(uploadDir, f);
+      fs.stat(fp, (e, st) => {
+        if (!e && st.isFile() && st.mtimeMs < cutoff) fs.unlink(fp, () => {});
+      });
+    }
+  });
+}
+
 // GET /media/:filename?token=<signed-token>
 // Serves a recorded video only when the signed token matches.
 // Twilio calls this URL without auth headers, so it is exempt from the
@@ -453,7 +471,13 @@ app.get('/media/:filename', async (req, res) => {
     return res.status(404).json({ error: 'File not found.' });
   }
 
-  res.sendFile(filePath);
+  res.sendFile(filePath, err => {
+    if (err) return; // client aborted mid-download — keep the file for a retry
+    // Single-use: once fetched (Twilio pulling the MMS to deliver it), invalidate
+    // the token and delete the recording so nothing is retained server-side.
+    deleteMediaToken(token);
+    fs.unlink(filePath, () => {});
+  });
 });
 
 // ── POST /notify ──────────────────────────────────────────────────────────────
@@ -521,7 +545,8 @@ app.post('/upload', (req, res, next) => {
     return res.status(500).json({ error: 'Could not reach any contact.', failed });
   }
   console.log(`[/upload] Sent MMS ${sent}/${recipients.length}, ${failed} failed. Media: ${mediaUrl}`);
-  setTimeout(() => fs.unlink(req.file.path, () => {}), 24 * 60 * 60 * 1000);
+  // Cleanup is handled by delete-on-fetch (the /media route) plus the boot sweep,
+  // which survive a restart — the old per-file setTimeout did not.
   res.json({ sent, failed, mediaUrl });
 });
 
@@ -899,5 +924,7 @@ app.get('/health', (req, res) => {
 // ── Start server ──────────────────────────────────────────────────────────────
 app.listen(PORT, async () => {
   console.log(`Make It Home server listening on port ${PORT}`);
+  sweepOldUploads();
+  setInterval(sweepOldUploads, 60 * 60 * 1000); // hourly
   await restoreCheckIns();
 });
