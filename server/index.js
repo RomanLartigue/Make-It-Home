@@ -197,12 +197,6 @@ async function resolveMediaToken(token) {
   return mediaTokenStore.get(token)?.filename ?? null;
 }
 
-// Removes a media token after use (Order 9 makes tokens single-use).
-async function deleteMediaToken(token) {
-  if (redis) await redisDel(`${MEDIA_TOKEN_PREFIX}${token}`);
-  else mediaTokenStore.delete(token);
-}
-
 // ── Per-device safety circle ──────────────────────────────────────────────────
 // The set of numbers a device is allowed to message, stored server-side at
 // /circle/sync. Messaging endpoints only ever send to a device's stored circle,
@@ -368,7 +362,11 @@ function cleanName(name) {
 // reject) can't blackhole the whole alert. Returns a summary; never throws.
 async function sendSmsToAll(phones, body) {
   const results = await Promise.allSettled(
-    phones.map(to => twilioClient.messages.create({ body, from: TWILIO_PHONE_NUMBER, to })),
+    // Promise.resolve().then(...) so a SYNCHRONOUS throw from create() becomes a
+    // rejected promise (caught by allSettled) instead of escaping and crashing.
+    phones.map(to =>
+      Promise.resolve().then(() => twilioClient.messages.create({ body, from: TWILIO_PHONE_NUMBER, to })),
+    ),
   );
   const sent = results.filter(r => r.status === 'fulfilled').length;
   const errors = results
@@ -492,13 +490,10 @@ app.get('/media/:filename', async (req, res) => {
     return res.status(404).json({ error: 'File not found.' });
   }
 
-  res.sendFile(filePath, err => {
-    if (err) return; // client aborted mid-download — keep the file for a retry
-    // Single-use: once fetched (Twilio pulling the MMS to deliver it), invalidate
-    // the token and delete the recording so nothing is retained server-side.
-    deleteMediaToken(token);
-    fs.unlink(filePath, () => {});
-  });
+  // Not single-use: an MMS to N contacts is N independent Twilio fetches of this
+  // URL, so deleting on first fetch would 404 every recipient but the first.
+  // Cleanup is the 24h token TTL + hourly sweepOldUploads().
+  res.sendFile(filePath);
 });
 
 // ── POST /upload ──────────────────────────────────────────────────────────────
@@ -531,8 +526,11 @@ app.post('/upload', (req, res, next) => {
   const body = '🎥 Safety recording from your safety circle.';
 
   const results = await Promise.allSettled(
+    // Promise.resolve().then(...) so a synchronous throw can't escape allSettled.
     recipients.map(to =>
-      twilioClient.messages.create({ body, from: TWILIO_PHONE_NUMBER, to, mediaUrl: [mediaUrl] }),
+      Promise.resolve().then(() =>
+        twilioClient.messages.create({ body, from: TWILIO_PHONE_NUMBER, to, mediaUrl: [mediaUrl] }),
+      ),
     ),
   );
   const sent = results.filter(x => x.status === 'fulfilled').length;
