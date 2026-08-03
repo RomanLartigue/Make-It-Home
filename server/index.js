@@ -264,7 +264,6 @@ const registerLimiter = rateLimit({
 });
 
 app.use('/register', registerLimiter);
-app.use('/notify', smsLimiter);
 app.use('/upload', smsLimiter);
 app.use('/safe', smsLimiter);
 app.use('/checkin/start', smsLimiter);
@@ -478,30 +477,6 @@ app.get('/media/:filename', async (req, res) => {
     deleteMediaToken(token);
     fs.unlink(filePath, () => {});
   });
-});
-
-// ── POST /notify ──────────────────────────────────────────────────────────────
-app.post('/notify', async (req, res) => {
-  const { phones, latitude, longitude, name } = req.body;
-
-  if (latitude == null || longitude == null) {
-    return res.status(400).json({ error: 'latitude and longitude are required.' });
-  }
-  const r = await recipientsFor(req, phones);
-  if (r.error) return res.status(r.status).json({ error: r.error });
-  const recipients = r.recipients;
-
-  const mapsLink = `https://maps.google.com/?q=${latitude},${longitude}`;
-  const who = name?.trim() ? `${name.trim()} needs help` : 'Someone needs help';
-  const body = `🚨 EMERGENCY — ${who}! Open the Make It Home app RIGHT NOW.\n\nLocation: ${mapsLink}`;
-
-  const result = await sendSmsToAll(recipients, body);
-  if (result.sent === 0) {
-    console.error('[/notify] All sends failed:', result.errors.join('; '));
-    return res.status(500).json({ error: 'Could not reach any contact.', failed: result.failed });
-  }
-  console.log(`[/notify] Sent ${result.sent}/${recipients.length}, ${result.failed} failed.`);
-  res.json({ sent: result.sent, failed: result.failed });
 });
 
 // ── POST /upload ──────────────────────────────────────────────────────────────

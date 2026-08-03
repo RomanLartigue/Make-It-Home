@@ -816,7 +816,7 @@ function BeaconChip({
     <View style={[styles.opt, active && styles.optActive, style]} pointerEvents="none">
       <Text style={[styles.optText, active && { color: '#fff' }]}>
         {label}
-        <Text style={styles.optUnit}>m</Text>
+        <Text style={styles.optUnit}>min</Text>
       </Text>
     </View>
   );

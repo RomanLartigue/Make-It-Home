@@ -40,7 +40,6 @@
           "isAndroidBackgroundLocationEnabled": true
         }
       ],
-      ["expo-av"],
       ["expo-notifications"],
       ["expo-contacts"]
     ]
