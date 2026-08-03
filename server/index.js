@@ -22,6 +22,28 @@ const {
   PORT = 3000,
 } = process.env;
 
+// ── Required config check (fail fast) ─────────────────────────────────────────
+// Runs before the Twilio client is constructed so a missing credential produces
+// a clear message instead of a stack trace. In production a missing var is fatal;
+// in dev we only warn so the server can boot for local UI work.
+const REQUIRED_ENV = [
+  'TWILIO_ACCOUNT_SID',
+  'TWILIO_AUTH_TOKEN',
+  'TWILIO_PHONE_NUMBER',
+  'SERVER_URL',
+  'REGISTRATION_SECRET',
+];
+const missingEnv = REQUIRED_ENV.filter(k => !process.env[k]);
+if (missingEnv.length) {
+  const msg = `[config] Missing required env var(s): ${missingEnv.join(', ')}.`;
+  if (process.env.NODE_ENV === 'production') {
+    console.error(`${msg} Refusing to start in production.`);
+    process.exit(1);
+  } else {
+    console.warn(`${msg} Continuing in dev — SMS / live-tracking features will not work.`);
+  }
+}
+
 const app = express();
 
 // ── Security headers ──────────────────────────────────────────────────────────
