@@ -1,0 +1,48 @@
+{
+  "expo": {
+    "name": "Make It Home",
+    "slug": "make-it-home",
+    "version": "1.0.0",
+    "icon": "./assets/images/icon.png",
+    "assetBundlePatterns": ["**/*"],
+    "splash": {
+      "image": "./assets/images/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#000000"
+    },
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.makeithome.app",
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "Make It Home records audio during safety sessions so your safety circle receives a video of your surroundings.",
+        "NSContactsUsageDescription": "Make It Home uses your contacts so you can add trusted people to your safety circle."
+      }
+    },
+    "android": {
+      "package": "com.makeithome.app",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/images/android-icon-foreground.png",
+        "monochromeImage": "./assets/images/android-icon-monochrome.png",
+        "backgroundColor": "#000000"
+      }
+    },
+    "web": {
+      "favicon": "./assets/images/favicon.png"
+    },
+    "plugins": [
+      "expo-router",
+      ["expo-camera"],
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "Make It Home needs your location to keep your safety circle updated when the app is in the background.",
+          "isIosBackgroundLocationEnabled": true,
+          "isAndroidBackgroundLocationEnabled": true
+        }
+      ],
+      ["expo-av"],
+      ["expo-notifications"],
+      ["expo-contacts"]
+    ]
+  }
+}
