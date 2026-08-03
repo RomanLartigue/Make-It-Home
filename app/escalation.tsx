@@ -10,7 +10,14 @@ import { DetailHeader, SectionLabel, Callout, Toggle, Card } from '@/components/
 
 const STORAGE_KEY = '@makeithome_safety_circle';
 const WAIT_KEY = '@makeithome_escalation_wait';
+const ACK_KEY = '@makeithome_escalation_ack';
 const WAIT_CYCLE = [2, 3, 5, 10];
+
+// TODO: true staged escalation (alert contacts one at a time, climbing the
+// ladder until someone acknowledges) needs a server-side scheduler plus an
+// acknowledgement link contacts can tap. Until that ships, every alert path
+// texts the whole circle at once — the settings below (order, wait, stop-on-ack)
+// are stored now so they take effect the moment that feature lands.
 
 interface SafetyContact {
   id: string;
@@ -29,8 +36,10 @@ export default function EscalationScreen() {
     (async () => {
       const raw = await AsyncStorage.getItem(STORAGE_KEY);
       const w = await AsyncStorage.getItem(WAIT_KEY);
+      const a = await AsyncStorage.getItem(ACK_KEY);
       if (raw) setCircle(JSON.parse(raw));
       if (w) setWait(Number(w));
+      if (a != null) setStopOnAck(a === 'true');
       setLoaded(true);
     })();
   }, []);
@@ -56,12 +65,21 @@ export default function EscalationScreen() {
     AsyncStorage.setItem(WAIT_KEY, String(next));
   };
 
+  const toggleAck = () => {
+    setStopOnAck(prev => {
+      const next = !prev;
+      AsyncStorage.setItem(ACK_KEY, String(next));
+      return next;
+    });
+  };
+
   return (
     <SafeAreaView style={styles.root} edges={['top']}>
       <View style={{ paddingHorizontal: 20 }}>
         <DetailHeader title="Escalation ladder" onBack={() => router.back()} />
         <Text style={styles.subttl}>
-          We climb the ladder until someone responds. Use the arrows to set who&apos;s alerted first.
+          Today, everyone in your circle is alerted at once with your location. This order sets who
+          is listed first in that message. Staged escalation is coming soon.
         </Text>
       </View>
 
@@ -87,7 +105,7 @@ export default function EscalationScreen() {
                 </View>
                 <View style={{ flex: 1 }}>
                   <Text style={styles.escName}>{c.name}</Text>
-                  <Text style={styles.escWhen}>{i === 0 ? 'Alerted first' : `+${i * wait} min`}</Text>
+                  <Text style={styles.escWhen}>{i === 0 ? 'Listed first' : `Listed #${i + 1}`}</Text>
                 </View>
                 <View style={styles.moveBtns}>
                   <Pressable
@@ -110,7 +128,7 @@ export default function EscalationScreen() {
           </Card>
         )}
 
-        <SectionLabel>Rules</SectionLabel>
+        <SectionLabel>Coming soon — staged escalation</SectionLabel>
         <Card style={{ paddingVertical: 2 }}>
           <Pressable style={styles.ruleRow} onPress={cycleWait}>
             <Text style={styles.ruleLabel}>Wait between people</Text>
@@ -118,13 +136,17 @@ export default function EscalationScreen() {
           </Pressable>
           <View style={[styles.ruleRow, { borderBottomWidth: 0 }]}>
             <Text style={styles.ruleLabel}>“On my way” stops the ladder</Text>
-            <Toggle value={stopOnAck} onToggle={() => setStopOnAck(v => !v)} />
+            <Toggle value={stopOnAck} onToggle={toggleAck} />
           </View>
         </Card>
+        <Text style={styles.note}>
+          These settings are saved now and take effect when staged escalation ships — climbing the
+          ladder one person at a time and letting a responder stop it.
+        </Text>
 
         <Callout>
-          Responders see each other — “Alex is on the way” — so no one double-panics and help
-          isn&apos;t duplicated.
+          For now, alerting everyone at once is the most reliable way to reach someone fast. We&apos;ll
+          add climb-the-ladder timing and shared “on my way” status in a later update.
         </Callout>
       </ScrollView>
     </SafeAreaView>
@@ -177,4 +199,5 @@ const styles = StyleSheet.create({
   },
   ruleLabel: { fontSize: 14, color: Beacon.text, flexShrink: 1, paddingRight: 10 },
   ruleVal: { fontSize: 13, color: Beacon.muted },
+  note: { fontSize: 11.5, color: Beacon.faint, lineHeight: 17, marginTop: 8, paddingHorizontal: 2 },
 });
