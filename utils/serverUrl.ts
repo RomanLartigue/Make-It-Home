@@ -54,6 +54,22 @@ export function randomId(prefix: string): string {
   return `${prefix}_${randomHex(16)}`;
 }
 
+// Pushes the device's safety circle to the server, which then only ever sends
+// alerts to these numbers (see server /circle/sync). Call whenever the circle
+// changes and once on launch. Best-effort — failures are retried on next change.
+export async function syncCircle(phones: string[]): Promise<void> {
+  try {
+    const serverUrl = await getServerUrl();
+    await fetchWithAuth(`${serverUrl}/circle/sync`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phones }),
+    });
+  } catch {
+    // best-effort; next circle change (or app launch) will re-sync
+  }
+}
+
 async function registerDevice(): Promise<string | null> {
   try {
     const deviceId = await getOrCreateDeviceId();

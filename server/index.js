@@ -164,6 +164,70 @@ async function resolveMediaToken(token) {
   return mediaTokenStore.get(token) ?? null;
 }
 
+// ── Per-device safety circle ──────────────────────────────────────────────────
+// The set of numbers a device is allowed to message, stored server-side at
+// /circle/sync. Messaging endpoints only ever send to a device's stored circle,
+// so a leaked registration secret / token can't turn the server into an open
+// SMS/MMS relay to arbitrary numbers.
+const CIRCLE_PREFIX = 'circle:';
+const circleStore = new Map(); // token → string[] (in-memory fallback)
+
+async function saveCircle(token, phones) {
+  if (redis) {
+    await redisSet(`${CIRCLE_PREFIX}${token}`, { phones }, TOKEN_TTL);
+  } else {
+    circleStore.set(token, phones);
+  }
+}
+
+async function getCircle(token) {
+  if (!token) return [];
+  if (redis) {
+    const val = await redisGet(`${CIRCLE_PREFIX}${token}`);
+    return val?.phones ?? [];
+  }
+  return circleStore.get(token) ?? [];
+}
+
+// ── Per-device daily message cap ──────────────────────────────────────────────
+const DAILY_CAP = 50; // messages per device per day
+const msgCounts = new Map(); // `${token}:${yyyy-mm-dd}` → count (in-memory fallback)
+
+async function incrDailyCount(token, n) {
+  const key = `${token}:${new Date().toISOString().slice(0, 10)}`;
+  if (redis) {
+    const c = await redis.incrby(`msgcount:${key}`, n).catch(() => 0);
+    if (c === n) await redis.expire(`msgcount:${key}`, 25 * 60 * 60).catch(() => {});
+    return c;
+  }
+  const c = (msgCounts.get(key) || 0) + n;
+  msgCounts.set(key, c);
+  return c;
+}
+
+// Resolves the recipients for a messaging request: always the device's stored
+// circle, narrowed to the intersection with client-supplied phones when given
+// (but never down to zero when a circle exists). Also enforces the daily cap.
+// Returns { recipients } or { status, error }.
+async function recipientsFor(req, clientPhones) {
+  const token = String(req.headers['x-mih-key'] || '');
+  const stored = await getCircle(token);
+  if (!stored.length) {
+    return { status: 400, error: 'No safety circle on file for this device. Add contacts and try again.' };
+  }
+  let recipients = stored;
+  if (Array.isArray(clientPhones) && clientPhones.length) {
+    const set = new Set(stored);
+    const inter = clientPhones.filter(p => set.has(p));
+    if (inter.length) recipients = inter;
+  }
+  const count = await incrDailyCount(token, recipients.length);
+  if (count > DAILY_CAP) {
+    return { status: 429, error: 'Daily message limit reached for this device.' };
+  }
+  return { recipients };
+}
+
 // ── Rate limiting ─────────────────────────────────────────────────────────────
 const smsLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -348,20 +412,21 @@ app.get('/media/:filename', async (req, res) => {
 app.post('/notify', async (req, res) => {
   const { phones, latitude, longitude, name } = req.body;
 
-  const phoneErr = validatePhones(phones);
-  if (phoneErr) return res.status(400).json({ error: phoneErr });
   if (latitude == null || longitude == null) {
     return res.status(400).json({ error: 'latitude and longitude are required.' });
   }
+  const r = await recipientsFor(req, phones);
+  if (r.error) return res.status(r.status).json({ error: r.error });
+  const recipients = r.recipients;
 
   const mapsLink = `https://maps.google.com/?q=${latitude},${longitude}`;
   const who = name?.trim() ? `${name.trim()} needs help` : 'Someone needs help';
   const body = `🚨 EMERGENCY — ${who}! Open the Make It Home app RIGHT NOW.\n\nLocation: ${mapsLink}`;
 
   try {
-    await sendSmsToAll(phones, body);
-    console.log(`[/notify] Sent location SMS to ${phones.length} contact(s).`);
-    res.json({ sent: phones.length });
+    await sendSmsToAll(recipients, body);
+    console.log(`[/notify] Sent location SMS to ${recipients.length} contact(s).`);
+    res.json({ sent: recipients.length });
   } catch (err) {
     console.error('[/notify] Twilio error:', err.message);
     res.status(500).json({ error: err.message });
@@ -386,8 +451,9 @@ app.post('/upload', (req, res, next) => {
   } catch {
     return res.status(400).json({ error: 'phones must be a JSON array.' });
   }
-  const phoneErr = validatePhones(phones);
-  if (phoneErr) return res.status(400).json({ error: phoneErr });
+  const r = await recipientsFor(req, phones);
+  if (r.error) return res.status(r.status).json({ error: r.error });
+  const recipients = r.recipients;
   if (!SERVER_URL) return res.status(500).json({ error: 'SERVER_URL is not configured.' });
 
   // Generate a signed token so Twilio can download the file without auth headers
@@ -398,13 +464,13 @@ app.post('/upload', (req, res, next) => {
 
   try {
     await Promise.all(
-      phones.map(to =>
+      recipients.map(to =>
         twilioClient.messages.create({ body, from: TWILIO_PHONE_NUMBER, to, mediaUrl: [mediaUrl] }),
       ),
     );
-    console.log(`[/upload] Sent MMS to ${phones.length} contact(s). Media: ${mediaUrl}`);
+    console.log(`[/upload] Sent MMS to ${recipients.length} contact(s). Media: ${mediaUrl}`);
     setTimeout(() => fs.unlink(req.file.path, () => {}), 24 * 60 * 60 * 1000);
-    res.json({ sent: phones.length, mediaUrl });
+    res.json({ sent: recipients.length, mediaUrl });
   } catch (err) {
     console.error('[/upload] Twilio error:', err.message);
     res.status(500).json({ error: err.message });
@@ -418,8 +484,9 @@ app.post('/checkin/start', async (req, res) => {
   if (!id || !durationSeconds) {
     return res.status(400).json({ error: 'id and durationSeconds are required.' });
   }
-  const phoneErr = validatePhones(phones);
-  if (phoneErr) return res.status(400).json({ error: phoneErr });
+  const r = await recipientsFor(req, phones);
+  if (r.error) return res.status(r.status).json({ error: r.error });
+  const recipients = r.recipients;
 
   // Replace any existing timer for this id
   if (checkIns.has(id)) clearTimeout(checkIns.get(id).timeout);
@@ -427,7 +494,7 @@ app.post('/checkin/start', async (req, res) => {
   const expiresAt = Date.now() + durationSeconds * 1000;
   // Bind this check-in to the creating device so only it can cancel/extend it.
   const ownerToken = String(req.headers['x-mih-key'] || '');
-  const entry = { phones, name, latitude, longitude, expiresAt, ownerToken };
+  const entry = { phones: recipients, name, latitude, longitude, expiresAt, ownerToken };
 
   await redisSet(`${CHECKIN_PREFIX}${id}`, entry, durationSeconds + 60); // +60s grace period
   const timeout = scheduleAlert(id, entry, durationSeconds * 1000);
@@ -527,12 +594,13 @@ app.post('/session/start', async (req, res) => {
   if (!sessionId) {
     return res.status(400).json({ error: 'sessionId is required.' });
   }
-  const phoneErr = validatePhones(phones);
-  if (phoneErr) return res.status(400).json({ error: phoneErr });
+  const r = await recipientsFor(req, phones);
+  if (r.error) return res.status(r.status).json({ error: r.error });
+  const recipients = r.recipients;
 
   // Bind this session to the creating device so only it can update/end it.
   const ownerToken = String(req.headers['x-mih-key'] || '');
-  await sessionSet(sessionId, { name, phones, latitude, longitude, ownerToken, updatedAt: Date.now() });
+  await sessionSet(sessionId, { name, phones: recipients, latitude, longitude, ownerToken, updatedAt: Date.now() });
 
   // In-memory fallback: expire after 24h
   if (!redis) setTimeout(() => sessionsMemory.delete(sessionId), SESSION_TTL * 1000);
@@ -542,8 +610,8 @@ app.post('/session/start', async (req, res) => {
   const body = `🚨 EMERGENCY — ${who}! Open Make It Home NOW.\n\nTrack live: ${liveLink}`;
 
   try {
-    await sendSmsToAll(phones, body);
-    console.log(`[/session/start] Started ${sessionId}, alerted ${phones.length} contact(s).`);
+    await sendSmsToAll(recipients, body);
+    console.log(`[/session/start] Started ${sessionId}, alerted ${recipients.length} contact(s).`);
     res.json({ sessionId, liveLink });
   } catch (err) {
     console.error('[/session/start] Twilio error:', err.message);
@@ -638,17 +706,38 @@ app.get('/live/:sessionId', async (req, res) => {
 // ── POST /safe ────────────────────────────────────────────────────────────────
 app.post('/safe', async (req, res) => {
   const { phones, name } = req.body;
-  const phoneErr = validatePhones(phones);
-  if (phoneErr) return res.status(400).json({ error: phoneErr });
+  const r = await recipientsFor(req, phones);
+  if (r.error) return res.status(r.status).json({ error: r.error });
+  const recipients = r.recipients;
   const who = name?.trim() || 'Your contact';
   try {
-    await sendSmsToAll(phones, `✅ ${who} is safe — false alarm.`);
-    console.log(`[/safe] Sent safe notification to ${phones.length} contact(s).`);
-    res.json({ sent: phones.length });
+    await sendSmsToAll(recipients, `✅ ${who} is safe — false alarm.`);
+    console.log(`[/safe] Sent safe notification to ${recipients.length} contact(s).`);
+    res.json({ sent: recipients.length });
   } catch (err) {
     console.error('[/safe] Twilio error:', err.message);
     res.status(500).json({ error: err.message });
   }
+});
+
+// ── POST /circle/sync ─────────────────────────────────────────────────────────
+// Stores the caller's safety circle (the numbers it's allowed to message).
+// The app calls this whenever the circle changes. Accepts an empty array (the
+// user removed everyone). Authenticated by X-MIH-Key via the middleware.
+app.post('/circle/sync', async (req, res) => {
+  const { phones } = req.body;
+  if (!Array.isArray(phones)) {
+    return res.status(400).json({ error: 'phones must be an array.' });
+  }
+  if (phones.length) {
+    const phoneErr = validatePhones(phones);
+    if (phoneErr) return res.status(400).json({ error: phoneErr });
+  }
+  const token = String(req.headers['x-mih-key'] || '');
+  const unique = [...new Set(phones)];
+  await saveCircle(token, unique);
+  console.log(`[/circle/sync] Stored ${unique.length} number(s) for a device.`);
+  res.json({ count: unique.length });
 });
 
 // ── POST /register ────────────────────────────────────────────────────────────

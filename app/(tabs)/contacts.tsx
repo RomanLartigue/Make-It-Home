@@ -16,6 +16,7 @@ import * as Contacts from 'expo-contacts';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 import { toE164 } from '@/utils/phoneNumber';
+import { syncCircle } from '@/utils/serverUrl';
 import { confirmDestructive } from '@/utils/confirm';
 import { Beacon, AVATAR_COLORS, initials } from '@/constants/beacon';
 import { PillButton } from '@/components/beacon/kit';
@@ -60,9 +61,12 @@ export default function CircleScreen() {
     });
   }, []);
 
-  // Persist after initial load (so we don't clobber storage with []).
+  // Persist after initial load (so we don't clobber storage with []), and push
+  // the circle to the server so alerts can only ever go to these numbers.
   useEffect(() => {
-    if (loaded) AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(circle));
+    if (!loaded) return;
+    AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(circle));
+    syncCircle(circle.map(c => c.phone).filter(Boolean));
   }, [circle, loaded]);
 
   // Re-read on focus in case the escalation screen reordered the list.

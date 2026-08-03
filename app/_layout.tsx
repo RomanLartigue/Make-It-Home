@@ -11,16 +11,26 @@ import * as Location from 'expo-location';
 // component uses it (importing the module runs its registration side effect).
 import { BACKGROUND_LOCATION_TASK } from '@/tasks/backgroundLocation';
 
-import { getDeviceToken } from '@/utils/serverUrl';
+import { getDeviceToken, syncCircle } from '@/utils/serverUrl';
 import { BeaconNavTheme } from '@/constants/theme';
 import { Beacon } from '@/constants/beacon';
 
 const ACTIVE_SESSION_KEY = '@makeithome_active_session';
+const SAFETY_CIRCLE_KEY = '@makeithome_safety_circle';
 
 export default function RootLayout() {
-  // Pre-warm the per-device auth token so the first safety tap never stalls.
+  // Pre-warm the per-device auth token so the first safety tap never stalls,
+  // then push the stored safety circle to the server. The server only sends
+  // alerts to a device's synced circle, so this must happen before a go-live —
+  // it covers installs whose circle predates server-side circle storage.
   useEffect(() => {
-    getDeviceToken().catch(() => {});
+    (async () => {
+      await getDeviceToken().catch(() => {});
+      const raw = await AsyncStorage.getItem(SAFETY_CIRCLE_KEY);
+      if (!raw) return;
+      const phones = JSON.parse(raw).map((c: any) => c.phone).filter(Boolean);
+      if (phones.length) syncCircle(phones);
+    })();
   }, []);
 
   // Clean up any session that was orphaned by a force-kill
