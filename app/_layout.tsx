@@ -2,6 +2,7 @@ import { ThemeProvider } from '@react-navigation/native';
 import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
+import { View, StyleSheet, Platform } from 'react-native';
 import 'react-native-reanimated';
 import { useEffect } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -44,18 +45,39 @@ export default function RootLayout() {
   }, []);
 
   // Make It Home is a dark-only "beacon" experience — no light variant.
+  // On web we constrain the app to a centered phone-width column so it doesn't
+  // stretch edge-to-edge on a desktop monitor (native fills the screen as usual).
   return (
     <SafeAreaProvider>
       <ThemeProvider value={BeaconNavTheme}>
-        <Stack screenOptions={{ contentStyle: { backgroundColor: Beacon.night } }}>
-          <Stack.Screen name="index" options={{ headerShown: false }} />
-          <Stack.Screen name="onboarding" options={{ headerShown: false }} />
-          <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
-          <Stack.Screen name="escalation" options={{ headerShown: false }} />
-          <Stack.Screen name="legal" options={{ headerShown: false, presentation: 'modal' }} />
-        </Stack>
+        <View style={styles.frame}>
+          <View style={styles.inner}>
+            <Stack screenOptions={{ contentStyle: { backgroundColor: Beacon.night } }}>
+              <Stack.Screen name="index" options={{ headerShown: false }} />
+              <Stack.Screen name="onboarding" options={{ headerShown: false }} />
+              <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
+              <Stack.Screen name="escalation" options={{ headerShown: false }} />
+              <Stack.Screen name="legal" options={{ headerShown: false, presentation: 'modal' }} />
+            </Stack>
+          </View>
+        </View>
         <StatusBar style="light" />
       </ThemeProvider>
     </SafeAreaProvider>
   );
 }
+
+const styles = StyleSheet.create({
+  frame: {
+    flex: 1,
+    backgroundColor: Beacon.night,
+    // Center the app horizontally on web/large screens.
+    ...Platform.select({ web: { alignItems: 'center' }, default: {} }),
+  },
+  inner: {
+    flex: 1,
+    width: '100%',
+    // Phone-width cap on web; unconstrained on native.
+    ...Platform.select({ web: { maxWidth: 440 }, default: {} }),
+  },
+});
