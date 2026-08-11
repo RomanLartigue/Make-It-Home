@@ -89,7 +89,18 @@ app.use(cors({
 
 app.use(express.json());
 
-const twilioClient = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+// Only build the Twilio client when credentials are present. Without them the
+// twilio() constructor throws, which would crash the server on boot — but in dev
+// (e.g. while A2P/toll-free verification is pending) we want the server to run
+// without Twilio. When null, send attempts fail gracefully (allSettled) instead
+// of crashing, so /health and everything non-SMS still work.
+const twilioClient =
+  TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN
+    ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    : null;
+if (!twilioClient) {
+  console.warn('[twilio] No credentials set — SMS/MMS sending is disabled (server still runs).');
+}
 
 // ── Redis client (optional) ───────────────────────────────────────────────────
 // If REDIS_URL is set, check-ins and sessions are persisted across restarts.
@@ -361,6 +372,9 @@ function cleanName(name) {
 // Sends to every recipient independently so one bad number (stale entry, carrier
 // reject) can't blackhole the whole alert. Returns a summary; never throws.
 async function sendSmsToAll(phones, body) {
+  if (!twilioClient) {
+    return { sent: 0, failed: phones.length, errors: ['Twilio not configured on the server.'] };
+  }
   const results = await Promise.allSettled(
     // Promise.resolve().then(...) so a SYNCHRONOUS throw from create() becomes a
     // rejected promise (caught by allSettled) instead of escaping and crashing.
@@ -518,6 +532,7 @@ app.post('/upload', (req, res, next) => {
   if (r.error) return res.status(r.status).json({ error: r.error });
   const recipients = r.recipients;
   if (!SERVER_URL) return res.status(500).json({ error: 'SERVER_URL is not configured.' });
+  if (!twilioClient) return res.status(503).json({ error: 'Twilio not configured on the server.' });
 
   // Generate a signed token so Twilio can download the file without auth headers
   const mediaToken = crypto.randomBytes(24).toString('hex');
