@@ -6,10 +6,11 @@ import {
   StyleSheet,
   Animated,
   Alert,
-  PanResponder,
   Easing,
+  Platform,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { GestureDetector, Gesture } from 'react-native-gesture-handler';
 import { useRouter, useFocusEffect } from 'expo-router';
 import Ionicons from '@expo/vector-icons/Ionicons';
 import * as Haptics from 'expo-haptics';
@@ -45,6 +46,11 @@ const DIR: Record<string, { sec: number; label: string }> = {
   right: { sec: 45 * 60, label: '45' },
   down: { sec: 60 * 60, label: '60' },
 };
+
+// On web/desktop the hold-and-swipe gesture is awkward (or impossible) with a
+// mouse, so there we make the beacon and the timer chips plain click targets.
+// Touch devices keep the hold-and-swipe gesture.
+const IS_WEB = Platform.OS === 'web';
 
 // ── Server / notification helpers (unchanged backend contract) ───────────────
 async function checkServerHealth(serverUrl: string) {
@@ -585,14 +591,22 @@ export default function HomeScreen() {
   // ── Beacon gesture ─────────────────────────────────────────────────────────
   const onBeaconRelease = (k: string) => {
     if (circleCount === 0) {
-      Alert.alert(
-        'No one in your circle',
-        'Add someone to your safety circle first so an alert can actually reach them.',
-        [
-          { text: 'Add someone', onPress: () => router.push('/(tabs)/contacts') },
-          { text: 'Cancel', style: 'cancel' },
-        ],
-      );
+      // Alert.alert is a no-op on react-native-web, so give web its own prompt.
+      if (IS_WEB) {
+        if (typeof window !== 'undefined' &&
+            window.confirm('No one is in your safety circle yet.\n\nAdd someone so an alert can reach them?')) {
+          router.push('/(tabs)/contacts');
+        }
+      } else {
+        Alert.alert(
+          'No one in your circle',
+          'Add someone to your safety circle first so an alert can actually reach them.',
+          [
+            { text: 'Add someone', onPress: () => router.push('/(tabs)/contacts') },
+            { text: 'Cancel', style: 'cancel' },
+          ],
+        );
+      }
       return;
     }
     if (k === 'now') handleSafetyTap();
@@ -605,18 +619,23 @@ export default function HomeScreen() {
     releaseRef.current = onBeaconRelease;
   });
 
-  const pan = useRef(
-    PanResponder.create({
-      onStartShouldSetPanResponder: () => true,
-      onMoveShouldSetPanResponder: () => true,
-      onPanResponderGrant: () => {
+  // react-native-gesture-handler Pan — works with both touch and a desktop mouse
+  // (PanResponder does not reliably handle mouse drags on web). minDistance(0)
+  // lets a plain press/tap register (release in center = go live); a drag past
+  // the threshold selects a timer. runOnJS lets the callbacks call setState.
+  const beaconGesture = useRef(
+    Gesture.Pan()
+      .runOnJS(true)
+      .minDistance(0)
+      .onBegin(() => {
         selRef.current = 'now';
         setSel('now');
         setArmed(true);
-        Haptics.selectionAsync();
-      },
-      onPanResponderMove: (_e, g) => {
-        const { dx, dy } = g;
+        if (!IS_WEB) Haptics.selectionAsync();
+      })
+      .onUpdate(e => {
+        const dx = e.translationX;
+        const dy = e.translationY;
         let k = 'now';
         if (Math.hypot(dx, dy) >= 42) {
           if (Math.abs(dx) > Math.abs(dy)) k = dx < 0 ? 'left' : 'right';
@@ -625,20 +644,16 @@ export default function HomeScreen() {
         if (k !== selRef.current) {
           selRef.current = k;
           setSel(k);
-          Haptics.selectionAsync();
+          if (!IS_WEB) Haptics.selectionAsync();
         }
-      },
-      onPanResponderRelease: () => {
-        const k = selRef.current;
+      })
+      .onEnd(() => {
+        releaseRef.current(selRef.current);
+      })
+      .onFinalize(() => {
         setArmed(false);
         setSel(null);
-        releaseRef.current(k);
-      },
-      onPanResponderTerminate: () => {
-        setArmed(false);
-        setSel(null);
-      },
-    }),
+      }),
   ).current;
 
   // ── Camera / go-live screen ────────────────────────────────────────────────
@@ -780,28 +795,31 @@ export default function HomeScreen() {
         </View>
       </View>
 
-      {/* Beacon */}
-      <View style={styles.arena} {...pan.panHandlers}>
-        <BeaconChip label="15" active={sel === 'left'} visible={armed} style={styles.optLeft} />
-        <BeaconChip label="30" active={sel === 'up'} visible={armed} style={styles.optUp} />
-        <BeaconChip label="45" active={sel === 'right'} visible={armed} style={styles.optRight} />
-        <BeaconChip label="60" active={sel === 'down'} visible={armed} style={styles.optDown} />
-        <Animated.View
-          style={[
-            styles.beacon,
-            armed && styles.beaconArmed,
-            { transform: [{ scale: armed ? 1 : pulse }] },
-          ]}
-          pointerEvents="none">
-          <Text style={styles.beaconText}>Hold</Text>
-          <Text style={styles.beaconSub}>{armed ? 'release' : '& swipe'}</Text>
-        </Animated.View>
-      </View>
+      {/* Beacon — hold-and-swipe (touch and mouse), via gesture-handler.
+          userSelect:none keeps a mouse-drag from starting a text selection. */}
+      <GestureDetector gesture={beaconGesture}>
+        <View style={styles.arena}>
+          <BeaconChip label="15" active={sel === 'left'} visible={armed} style={styles.optLeft} />
+          <BeaconChip label="30" active={sel === 'up'} visible={armed} style={styles.optUp} />
+          <BeaconChip label="45" active={sel === 'right'} visible={armed} style={styles.optRight} />
+          <BeaconChip label="60" active={sel === 'down'} visible={armed} style={styles.optDown} />
+          <Animated.View
+            style={[
+              styles.beacon,
+              armed && styles.beaconArmed,
+              { transform: [{ scale: armed ? 1 : pulse }] },
+            ]}
+            pointerEvents="none">
+            <Text style={styles.beaconText}>Hold</Text>
+            <Text style={styles.beaconSub}>{armed ? 'release' : '& swipe'}</Text>
+          </Animated.View>
+        </View>
+      </GestureDetector>
 
       <Text style={styles.undertext}>
         {checkInStarting
           ? 'Starting check-in…'
-          : 'Release in the center to go live — or swipe to a timer (15 / 30 / 45 / 60)'}
+          : 'Hold the beacon, then release in the center to go live — or drag to a timer (15 / 30 / 45 / 60 min)'}
       </Text>
     </SafeAreaView>
   );
@@ -929,7 +947,14 @@ const styles = StyleSheet.create({
   },
   mapTagText: { fontSize: 10.5, fontWeight: '700', color: Beacon.text },
 
-  arena: { flex: 1, alignItems: 'center', justifyContent: 'center', marginVertical: 8 },
+  arena: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginVertical: 8,
+    // Prevents a mouse-drag on web from selecting text instead of driving the gesture.
+    userSelect: 'none',
+  },
   beacon: {
     width: BEACON_SIZE,
     height: BEACON_SIZE,

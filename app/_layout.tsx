@@ -3,6 +3,8 @@ import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { View, StyleSheet, Platform } from 'react-native';
+import 'react-native-gesture-handler';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import 'react-native-reanimated';
 import { useEffect } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -48,22 +50,24 @@ export default function RootLayout() {
   // On web we constrain the app to a centered phone-width column so it doesn't
   // stretch edge-to-edge on a desktop monitor (native fills the screen as usual).
   return (
-    <SafeAreaProvider>
-      <ThemeProvider value={BeaconNavTheme}>
-        <View style={styles.frame}>
-          <View style={styles.inner}>
-            <Stack screenOptions={{ contentStyle: { backgroundColor: Beacon.night } }}>
-              <Stack.Screen name="index" options={{ headerShown: false }} />
-              <Stack.Screen name="onboarding" options={{ headerShown: false }} />
-              <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
-              <Stack.Screen name="escalation" options={{ headerShown: false }} />
-              <Stack.Screen name="legal" options={{ headerShown: false, presentation: 'modal' }} />
-            </Stack>
+    <GestureHandlerRootView style={{ flex: 1 }}>
+      <SafeAreaProvider>
+        <ThemeProvider value={BeaconNavTheme}>
+          <View style={styles.frame}>
+            <View style={styles.inner}>
+              <Stack screenOptions={{ contentStyle: { backgroundColor: Beacon.night } }}>
+                <Stack.Screen name="index" options={{ headerShown: false }} />
+                <Stack.Screen name="onboarding" options={{ headerShown: false }} />
+                <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
+                <Stack.Screen name="escalation" options={{ headerShown: false }} />
+                <Stack.Screen name="legal" options={{ headerShown: false, presentation: 'modal' }} />
+              </Stack>
+            </View>
           </View>
-        </View>
-        <StatusBar style="light" />
-      </ThemeProvider>
-    </SafeAreaProvider>
+          <StatusBar style="light" />
+        </ThemeProvider>
+      </SafeAreaProvider>
+    </GestureHandlerRootView>
   );
 }
 
