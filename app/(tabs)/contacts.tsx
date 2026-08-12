@@ -10,7 +10,6 @@ import {
   Alert,
   KeyboardAvoidingView,
   Platform,
-  Linking,
 } from 'react-native';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -33,10 +32,8 @@ interface SafetyContact {
   phone: string;
 }
 
-// A single sheet with several modes avoids stacking multiple RN Modals, which
-// don't present reliably at the same time (the old bug: opening the contact
-// picker on top of the add sheet).
-type SheetMode = 'closed' | 'form' | 'action' | 'picker';
+// One sheet, two modes — no stacked RN Modals.
+type SheetMode = 'closed' | 'form' | 'action';
 
 function avatarColor(name: string): string {
   let hash = 0;
@@ -55,9 +52,6 @@ export default function CircleScreen() {
   const [phone, setPhone] = useState('');
   const [actionFor, setActionFor] = useState<SafetyContact | null>(null);
 
-  const [deviceContacts, setDeviceContacts] = useState<Contacts.Contact[]>([]);
-  const [search, setSearch] = useState('');
-
   useEffect(() => {
     AsyncStorage.getItem(STORAGE_KEY).then(raw => {
       setCircle(raw ? JSON.parse(raw) : []);
@@ -73,9 +67,8 @@ export default function CircleScreen() {
     syncCircle(circle.map(c => c.phone).filter(Boolean));
   }, [circle, loaded]);
 
-  // Re-read on focus in case the escalation screen reordered the list, or the
-  // data was deleted from Settings — reset to [] when storage is empty so
-  // deleted contacts don't linger in memory.
+  // Re-read on focus (escalation reorder, or data deleted from Settings). Reset
+  // to [] when storage is empty so deleted contacts don't linger in memory.
   useFocusEffect(
     useCallback(() => {
       AsyncStorage.getItem(STORAGE_KEY).then(raw => {
@@ -98,7 +91,6 @@ export default function CircleScreen() {
     setMode('action');
   };
 
-  // Switches the same sheet from the action view to the edit form — no second modal.
   const editFromAction = () => {
     if (!actionFor) return;
     setEditId(actionFor.id);
@@ -141,58 +133,27 @@ export default function CircleScreen() {
     );
   };
 
-  // Loads device contacts and switches THIS sheet to picker mode (not a new modal).
-  const openPickerMode = async () => {
-    const { status, canAskAgain } = await Contacts.requestPermissionsAsync();
-    if (status !== 'granted') {
-      // Once denied, the OS won't re-prompt — guide the user to Settings.
-      if (!canAskAgain) {
-        Alert.alert(
-          'Contacts access is off',
-          'Turn on Contacts for Make It Home in Settings to pick from your phone — or just type the number above.',
-          [
-            { text: 'Not now', style: 'cancel' },
-            { text: 'Open Settings', onPress: () => Linking.openSettings() },
-          ],
-        );
-      } else {
-        Alert.alert('Permission needed', 'Allow contacts access to pick from your phone, or type the number above.');
-      }
-      return;
-    }
+  // Opens the OS's native contact picker (like other apps). No custom list and
+  // no full contacts-permission prompt needed — the user picks one contact.
+  const pickFromContacts = async () => {
     try {
-      const { data } = await Contacts.getContactsAsync({
-        fields: [Contacts.Fields.Name, Contacts.Fields.PhoneNumbers],
-      });
-      const withPhone = data
-        .filter(c => c.name && c.phoneNumbers && c.phoneNumbers.length > 0)
-        .sort((a, b) => (a.name ?? '').localeCompare(b.name ?? ''));
-      setDeviceContacts(withPhone);
-      setSearch('');
-      setMode('picker');
+      const contact = await Contacts.presentContactPickerAsync();
+      if (!contact) return; // cancelled
+      const raw = contact.phoneNumbers?.[0]?.number ?? '';
+      const e164 = toE164(raw);
+      if (!e164) {
+        Alert.alert(
+          'No usable number',
+          `${contact.name ?? 'That contact'} doesn't have a number we can use — pick another, or type it in above.`,
+        );
+        return;
+      }
+      setName(contact.name ?? 'Unknown');
+      setPhone(e164);
     } catch {
-      Alert.alert('Couldn’t load contacts', 'Something went wrong reading your contacts — you can type the number above instead.');
+      Alert.alert('Couldn’t open contacts', 'Try again, or just type the number in above.');
     }
   };
-
-  const pickDeviceContact = (contact: Contacts.Contact) => {
-    const rawPhone = contact.phoneNumbers?.[0]?.number ?? '';
-    const e164 = toE164(rawPhone);
-    if (!e164) {
-      Alert.alert(
-        'Unsupported number',
-        `"${rawPhone}" couldn't be converted to a dialable format. Edit it in your Contacts app to include a full number.`,
-      );
-      return;
-    }
-    setName(contact.name ?? 'Unknown');
-    setPhone(e164);
-    setMode('form');
-  };
-
-  const filtered = search
-    ? deviceContacts.filter(c => c.name?.toLowerCase().includes(search.toLowerCase()))
-    : deviceContacts;
 
   return (
     <SafeAreaView style={styles.root} edges={['top']}>
@@ -239,57 +200,15 @@ export default function CircleScreen() {
         </Pressable>
       </View>
 
-      {/* One modal, several modes — never two modals at once. The inner
-          GestureHandlerRootView is required: a RN Modal renders outside the app's
-          root GestureHandlerRootView, and without one here taps inside the modal
-          don't register once react-native-gesture-handler is installed. */}
+      {/* One modal, form/action modes. The inner GestureHandlerRootView is
+          required — a RN Modal renders outside the app's root one, and without
+          it taps inside the modal don't register once gesture-handler is used. */}
       <Modal
         visible={mode !== 'closed'}
         transparent
         animationType="slide"
         onRequestClose={closeSheet}>
         <GestureHandlerRootView style={{ flex: 1 }}>
-        {mode === 'picker' ? (
-          <SafeAreaView style={styles.pickerRoot}>
-            <View style={styles.pickerHead}>
-              <Pressable onPress={() => setMode('form')} hitSlop={8} style={styles.pickerBack}>
-                <Ionicons name="chevron-back" size={22} color={Beacon.text} />
-              </Pressable>
-              <Text style={styles.pickerTitle}>Choose a contact</Text>
-              <Pressable onPress={() => setMode('form')} hitSlop={8}>
-                <Text style={styles.pickerDone}>Done</Text>
-              </Pressable>
-            </View>
-            <TextInput
-              style={styles.searchInput}
-              placeholder="Search contacts…"
-              placeholderTextColor={Beacon.faint}
-              value={search}
-              onChangeText={setSearch}
-            />
-            <FlatList
-              data={filtered}
-              keyExtractor={(item, index) => (item as any).id ?? `${item.name ?? 'c'}-${index}`}
-              keyboardShouldPersistTaps="handled"
-              renderItem={({ item }) => {
-                const nm = item.name ?? 'Unknown';
-                const raw = item.phoneNumbers?.[0]?.number ?? '';
-                const disp = toE164(raw) ?? raw;
-                return (
-                  <Pressable style={styles.pickRow} onPress={() => pickDeviceContact(item)}>
-                    <View style={[styles.avatar, { backgroundColor: avatarColor(nm) }]}>
-                      <Text style={styles.avatarText}>{initials(nm)}</Text>
-                    </View>
-                    <View style={{ flex: 1 }}>
-                      <Text style={styles.rowName}>{nm}</Text>
-                      <Text style={styles.rowPhone}>{disp}</Text>
-                    </View>
-                  </Pressable>
-                );
-              }}
-            />
-          </SafeAreaView>
-        ) : (
           <View style={{ flex: 1 }}>
             <Pressable style={styles.scrim} onPress={closeSheet} />
             <KeyboardAvoidingView
@@ -335,7 +254,7 @@ export default function CircleScreen() {
                       keyboardType="phone-pad"
                     />
                     {!editId && (
-                      <Pressable onPress={openPickerMode} style={styles.pickLink}>
+                      <Pressable onPress={pickFromContacts} style={styles.pickLink}>
                         <Ionicons name="person-add-outline" size={15} color={Beacon.info} />
                         <Text style={styles.pickLinkText}>Choose from my contacts</Text>
                       </Pressable>
@@ -354,7 +273,6 @@ export default function CircleScreen() {
               </View>
             </KeyboardAvoidingView>
           </View>
-        )}
         </GestureHandlerRootView>
       </Modal>
     </SafeAreaView>
@@ -422,37 +340,4 @@ const styles = StyleSheet.create({
   pickLink: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingVertical: 4, marginBottom: 6 },
   pickLinkText: { color: Beacon.info, fontWeight: '600', fontSize: 13 },
   sheetBtns: { flexDirection: 'row', gap: 10, marginTop: 6 },
-
-  pickerRoot: { flex: 1, backgroundColor: Beacon.night },
-  pickerHead: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingHorizontal: 16,
-    paddingVertical: 16,
-    borderBottomWidth: 1,
-    borderBottomColor: Beacon.line,
-  },
-  pickerBack: { width: 30 },
-  pickerTitle: { fontSize: 17, fontWeight: '800', color: Beacon.text },
-  pickerDone: { fontSize: 15, color: Beacon.beacon, fontWeight: '700' },
-  searchInput: {
-    margin: 16,
-    padding: 12,
-    backgroundColor: Beacon.surface,
-    borderWidth: 1,
-    borderColor: Beacon.line,
-    borderRadius: 10,
-    fontSize: 15,
-    color: Beacon.text,
-  },
-  pickRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 12,
-    paddingHorizontal: 20,
-    paddingVertical: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: Beacon.line,
-  },
 });
