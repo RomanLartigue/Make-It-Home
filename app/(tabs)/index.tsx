@@ -8,6 +8,7 @@ import {
   Alert,
   Easing,
   Platform,
+  Linking,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { GestureDetector, Gesture } from 'react-native-gesture-handler';
@@ -23,6 +24,16 @@ import { getServerUrl, getUserName, fetchWithAuth, randomId, syncCircle } from '
 import { BACKGROUND_LOCATION_TASK } from '@/tasks/backgroundLocation';
 import { Beacon } from '@/constants/beacon';
 import { PillButton } from '@/components/beacon/kit';
+
+// Shown when a permission isn't granted. If it was previously blocked, the OS
+// won't show its own dialog again (canAskAgain === false) — so offer a route to
+// the system Settings, which is the only place the user can flip it back on.
+function permissionDeniedAlert(title: string, message: string) {
+  Alert.alert(title, message, [
+    { text: 'Not now', style: 'cancel' },
+    { text: 'Open Settings', onPress: () => Linking.openSettings() },
+  ]);
+}
 
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
@@ -434,18 +445,27 @@ export default function HomeScreen() {
     let cam = await Camera.getCameraPermissionsAsync();
     if (!cam.granted) cam = await Camera.requestCameraPermissionsAsync();
     if (!cam.granted) {
-      Alert.alert('Camera permission needed', 'Allow camera access to record video during safety sessions.');
+      permissionDeniedAlert(
+        'Camera permission needed',
+        'Allow camera access to record video during safety sessions. If you previously declined, turn it on in Settings.',
+      );
       return;
     }
     let mic = await Camera.getMicrophonePermissionsAsync();
     if (!mic.granted) mic = await Camera.requestMicrophonePermissionsAsync();
     if (!mic.granted) {
-      Alert.alert('Microphone permission needed', 'Allow microphone access to record audio.');
+      permissionDeniedAlert(
+        'Microphone permission needed',
+        'Allow microphone access to record audio. If you previously declined, turn it on in Settings.',
+      );
       return;
     }
     const { granted: locFg } = await Location.requestForegroundPermissionsAsync();
     if (!locFg) {
-      Alert.alert('Location permission needed', 'Allow location access to broadcast your GPS to your safety circle.');
+      permissionDeniedAlert(
+        'Location permission needed',
+        'Allow location access to broadcast your GPS to your safety circle. If you previously declined, turn it on in Settings.',
+      );
       return;
     }
     // Background location isn't available in Expo Go and can throw there — never
