@@ -367,8 +367,10 @@ export default function HomeScreen() {
       setCheckInRemaining(durationSeconds);
       setCheckInActive(true);
       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+      // Read the expiry from the ref (not the captured `expiresAt`) so "+15 min"
+      // — which updates checkInExpiresAt.current — is reflected in the countdown.
       checkInIntervalRef.current = setInterval(() => {
-        const r = Math.max(0, Math.round((expiresAt - Date.now()) / 1000));
+        const r = Math.max(0, Math.round(((checkInExpiresAt.current || 0) - Date.now()) / 1000));
         setCheckInRemaining(r);
         if (r === 0) {
           if (checkInIntervalRef.current) clearInterval(checkInIntervalRef.current);
