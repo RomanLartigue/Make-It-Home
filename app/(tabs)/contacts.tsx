@@ -10,7 +10,9 @@ import {
   Alert,
   KeyboardAvoidingView,
   Platform,
+  Linking,
 } from 'react-native';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter, useFocusEffect } from 'expo-router';
 import Ionicons from '@expo/vector-icons/Ionicons';
@@ -58,7 +60,7 @@ export default function CircleScreen() {
 
   useEffect(() => {
     AsyncStorage.getItem(STORAGE_KEY).then(raw => {
-      if (raw) setCircle(JSON.parse(raw));
+      setCircle(raw ? JSON.parse(raw) : []);
       setLoaded(true);
     });
   }, []);
@@ -71,11 +73,13 @@ export default function CircleScreen() {
     syncCircle(circle.map(c => c.phone).filter(Boolean));
   }, [circle, loaded]);
 
-  // Re-read on focus in case the escalation screen reordered the list.
+  // Re-read on focus in case the escalation screen reordered the list, or the
+  // data was deleted from Settings — reset to [] when storage is empty so
+  // deleted contacts don't linger in memory.
   useFocusEffect(
     useCallback(() => {
       AsyncStorage.getItem(STORAGE_KEY).then(raw => {
-        if (raw) setCircle(JSON.parse(raw));
+        setCircle(raw ? JSON.parse(raw) : []);
       });
     }, []),
   );
@@ -139,20 +143,36 @@ export default function CircleScreen() {
 
   // Loads device contacts and switches THIS sheet to picker mode (not a new modal).
   const openPickerMode = async () => {
-    const { status } = await Contacts.requestPermissionsAsync();
+    const { status, canAskAgain } = await Contacts.requestPermissionsAsync();
     if (status !== 'granted') {
-      Alert.alert('Permission needed', 'Allow contacts access to pick someone from your phone.');
+      // Once denied, the OS won't re-prompt — guide the user to Settings.
+      if (!canAskAgain) {
+        Alert.alert(
+          'Contacts access is off',
+          'Turn on Contacts for Make It Home in Settings to pick from your phone — or just type the number above.',
+          [
+            { text: 'Not now', style: 'cancel' },
+            { text: 'Open Settings', onPress: () => Linking.openSettings() },
+          ],
+        );
+      } else {
+        Alert.alert('Permission needed', 'Allow contacts access to pick from your phone, or type the number above.');
+      }
       return;
     }
-    const { data } = await Contacts.getContactsAsync({
-      fields: [Contacts.Fields.Name, Contacts.Fields.PhoneNumbers],
-    });
-    const withPhone = data
-      .filter(c => c.name && c.phoneNumbers && c.phoneNumbers.length > 0)
-      .sort((a, b) => (a.name ?? '').localeCompare(b.name ?? ''));
-    setDeviceContacts(withPhone);
-    setSearch('');
-    setMode('picker');
+    try {
+      const { data } = await Contacts.getContactsAsync({
+        fields: [Contacts.Fields.Name, Contacts.Fields.PhoneNumbers],
+      });
+      const withPhone = data
+        .filter(c => c.name && c.phoneNumbers && c.phoneNumbers.length > 0)
+        .sort((a, b) => (a.name ?? '').localeCompare(b.name ?? ''));
+      setDeviceContacts(withPhone);
+      setSearch('');
+      setMode('picker');
+    } catch {
+      Alert.alert('Couldn’t load contacts', 'Something went wrong reading your contacts — you can type the number above instead.');
+    }
   };
 
   const pickDeviceContact = (contact: Contacts.Contact) => {
@@ -219,12 +239,16 @@ export default function CircleScreen() {
         </Pressable>
       </View>
 
-      {/* One modal, several modes — never two modals at once. */}
+      {/* One modal, several modes — never two modals at once. The inner
+          GestureHandlerRootView is required: a RN Modal renders outside the app's
+          root GestureHandlerRootView, and without one here taps inside the modal
+          don't register once react-native-gesture-handler is installed. */}
       <Modal
         visible={mode !== 'closed'}
         transparent
         animationType="slide"
         onRequestClose={closeSheet}>
+        <GestureHandlerRootView style={{ flex: 1 }}>
         {mode === 'picker' ? (
           <SafeAreaView style={styles.pickerRoot}>
             <View style={styles.pickerHead}>
@@ -331,6 +355,7 @@ export default function CircleScreen() {
             </KeyboardAvoidingView>
           </View>
         )}
+        </GestureHandlerRootView>
       </Modal>
     </SafeAreaView>
   );

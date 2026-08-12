@@ -446,7 +446,14 @@ export default function HomeScreen() {
       Alert.alert('Location permission needed', 'Allow location access to broadcast your GPS to your safety circle.');
       return;
     }
-    const { granted: bgGranted } = await Location.requestBackgroundPermissionsAsync();
+    // Background location isn't available in Expo Go and can throw there — never
+    // let it break go-live; foreground tracking + the alert still work without it.
+    let bgGranted = false;
+    try {
+      bgGranted = (await Location.requestBackgroundPermissionsAsync()).granted;
+    } catch {
+      // ignore — proceed with foreground only
+    }
 
     const serverUrl = await getServerUrl();
     const serverOk = await checkServerHealth(serverUrl);
