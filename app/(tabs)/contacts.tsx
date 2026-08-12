@@ -8,6 +8,8 @@ import {
   Modal,
   TextInput,
   Alert,
+  KeyboardAvoidingView,
+  Platform,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter, useFocusEffect } from 'expo-router';
@@ -29,6 +31,11 @@ interface SafetyContact {
   phone: string;
 }
 
+// A single sheet with several modes avoids stacking multiple RN Modals, which
+// don't present reliably at the same time (the old bug: opening the contact
+// picker on top of the add sheet).
+type SheetMode = 'closed' | 'form' | 'action' | 'picker';
+
 function avatarColor(name: string): string {
   let hash = 0;
   for (let i = 0; i < name.length; i++) hash = name.charCodeAt(i) + ((hash << 5) - hash);
@@ -40,17 +47,12 @@ export default function CircleScreen() {
   const [circle, setCircle] = useState<SafetyContact[]>([]);
   const [loaded, setLoaded] = useState(false);
 
-  // Add / edit sheet
-  const [sheetOpen, setSheetOpen] = useState(false);
+  const [mode, setMode] = useState<SheetMode>('closed');
   const [editId, setEditId] = useState<string | null>(null);
   const [name, setName] = useState('');
   const [phone, setPhone] = useState('');
-
-  // Contact action sheet
   const [actionFor, setActionFor] = useState<SafetyContact | null>(null);
 
-  // Device picker
-  const [pickerOpen, setPickerOpen] = useState(false);
   const [deviceContacts, setDeviceContacts] = useState<Contacts.Contact[]>([]);
   const [search, setSearch] = useState('');
 
@@ -78,19 +80,27 @@ export default function CircleScreen() {
     }, []),
   );
 
+  const closeSheet = () => setMode('closed');
+
   const openAdd = () => {
     setEditId(null);
     setName('');
     setPhone('');
-    setSheetOpen(true);
+    setMode('form');
   };
 
-  const openEdit = (c: SafetyContact) => {
-    setActionFor(null);
-    setEditId(c.id);
-    setName(c.name);
-    setPhone(c.phone);
-    setSheetOpen(true);
+  const openActions = (c: SafetyContact) => {
+    setActionFor(c);
+    setMode('action');
+  };
+
+  // Switches the same sheet from the action view to the edit form — no second modal.
+  const editFromAction = () => {
+    if (!actionFor) return;
+    setEditId(actionFor.id);
+    setName(actionFor.name);
+    setPhone(actionFor.phone);
+    setMode('form');
   };
 
   const saveContact = () => {
@@ -110,20 +120,25 @@ export default function CircleScreen() {
     } else {
       setCircle(prev => [...prev, { id: String(Date.now()), name: n, phone: e164 }]);
     }
-    setSheetOpen(false);
+    closeSheet();
   };
 
-  const removeContact = (id: string) => {
-    setActionFor(null);
+  const removeFromAction = () => {
+    const id = actionFor?.id;
+    if (!id) return;
     confirmDestructive(
       'Remove from circle',
       'This person will no longer be alerted when you signal.',
       'Remove',
-      () => setCircle(prev => prev.filter(c => c.id !== id)),
+      () => {
+        setCircle(prev => prev.filter(c => c.id !== id));
+        closeSheet();
+      },
     );
   };
 
-  const openPicker = async () => {
+  // Loads device contacts and switches THIS sheet to picker mode (not a new modal).
+  const openPickerMode = async () => {
     const { status } = await Contacts.requestPermissionsAsync();
     if (status !== 'granted') {
       Alert.alert('Permission needed', 'Allow contacts access to pick someone from your phone.');
@@ -137,7 +152,7 @@ export default function CircleScreen() {
       .sort((a, b) => (a.name ?? '').localeCompare(b.name ?? ''));
     setDeviceContacts(withPhone);
     setSearch('');
-    setPickerOpen(true);
+    setMode('picker');
   };
 
   const pickDeviceContact = (contact: Contacts.Contact) => {
@@ -150,10 +165,9 @@ export default function CircleScreen() {
       );
       return;
     }
-    const nm = contact.name ?? 'Unknown';
-    setPickerOpen(false);
-    setName(nm);
+    setName(contact.name ?? 'Unknown');
     setPhone(e164);
+    setMode('form');
   };
 
   const filtered = search
@@ -180,7 +194,7 @@ export default function CircleScreen() {
           renderItem={({ item }) => (
             <Pressable
               style={({ pressed }) => [styles.row, pressed && { opacity: 0.6 }]}
-              onPress={() => setActionFor(item)}>
+              onPress={() => openActions(item)}>
               <View style={[styles.avatar, { backgroundColor: avatarColor(item.name) }]}>
                 <Text style={styles.avatarText}>{initials(item.name)}</Text>
               </View>
@@ -205,107 +219,118 @@ export default function CircleScreen() {
         </Pressable>
       </View>
 
-      {/* Add / edit sheet */}
-      <Modal visible={sheetOpen} transparent animationType="slide" onRequestClose={() => setSheetOpen(false)}>
-        <Pressable style={styles.scrim} onPress={() => setSheetOpen(false)} />
-        <View style={styles.sheet}>
-          <Text style={styles.sheetTitle}>{editId ? 'Edit contact' : 'Add someone'}</Text>
-          <Text style={styles.sheetSub}>
-            They&apos;ll be alerted with your location when you signal.
-          </Text>
-          <TextInput
-            style={styles.input}
-            placeholder="Name"
-            placeholderTextColor={Beacon.faint}
-            value={name}
-            onChangeText={setName}
-            autoCapitalize="words"
-          />
-          <TextInput
-            style={styles.input}
-            placeholder="Phone number"
-            placeholderTextColor={Beacon.faint}
-            value={phone}
-            onChangeText={setPhone}
-            keyboardType="phone-pad"
-          />
-          {!editId && (
-            <Pressable onPress={openPicker} style={styles.pickLink}>
-              <Ionicons name="person-add-outline" size={15} color={Beacon.info} />
-              <Text style={styles.pickLinkText}>Choose from my contacts</Text>
-            </Pressable>
-          )}
-          <View style={styles.sheetBtns}>
-            <PillButton title="Cancel" kind="dark" onPress={() => setSheetOpen(false)} style={{ flex: 1 }} />
-            <PillButton title={editId ? 'Save' : 'Add'} kind="primary" onPress={saveContact} style={{ flex: 1 }} />
-          </View>
-        </View>
-      </Modal>
-
-      {/* Contact action sheet */}
-      <Modal visible={!!actionFor} transparent animationType="slide" onRequestClose={() => setActionFor(null)}>
-        <Pressable style={styles.scrim} onPress={() => setActionFor(null)} />
-        <View style={styles.sheet}>
-          <Text style={styles.sheetTitle}>{actionFor?.name}</Text>
-          <Text style={styles.sheetSub}>{actionFor?.phone}</Text>
-          <View style={styles.sheetBtns}>
-            <PillButton
-              title="Edit"
-              kind="dark"
-              onPress={() => actionFor && openEdit(actionFor)}
-              style={{ flex: 1 }}
+      {/* One modal, several modes — never two modals at once. */}
+      <Modal
+        visible={mode !== 'closed'}
+        transparent
+        animationType="slide"
+        onRequestClose={closeSheet}>
+        {mode === 'picker' ? (
+          <SafeAreaView style={styles.pickerRoot}>
+            <View style={styles.pickerHead}>
+              <Pressable onPress={() => setMode('form')} hitSlop={8} style={styles.pickerBack}>
+                <Ionicons name="chevron-back" size={22} color={Beacon.text} />
+              </Pressable>
+              <Text style={styles.pickerTitle}>Choose a contact</Text>
+              <Pressable onPress={() => setMode('form')} hitSlop={8}>
+                <Text style={styles.pickerDone}>Done</Text>
+              </Pressable>
+            </View>
+            <TextInput
+              style={styles.searchInput}
+              placeholder="Search contacts…"
+              placeholderTextColor={Beacon.faint}
+              value={search}
+              onChangeText={setSearch}
             />
-            <PillButton
-              title="Remove"
-              kind="dark"
-              onPress={() => actionFor && removeContact(actionFor.id)}
-              style={{ flex: 1 }}
-              textStyle={{ color: '#ff8a6e' }}
+            <FlatList
+              data={filtered}
+              keyExtractor={(item, index) => (item as any).id ?? `${item.name ?? 'c'}-${index}`}
+              keyboardShouldPersistTaps="handled"
+              renderItem={({ item }) => {
+                const nm = item.name ?? 'Unknown';
+                const raw = item.phoneNumbers?.[0]?.number ?? '';
+                const disp = toE164(raw) ?? raw;
+                return (
+                  <Pressable style={styles.pickRow} onPress={() => pickDeviceContact(item)}>
+                    <View style={[styles.avatar, { backgroundColor: avatarColor(nm) }]}>
+                      <Text style={styles.avatarText}>{initials(nm)}</Text>
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.rowName}>{nm}</Text>
+                      <Text style={styles.rowPhone}>{disp}</Text>
+                    </View>
+                  </Pressable>
+                );
+              }}
             />
+          </SafeAreaView>
+        ) : (
+          <View style={{ flex: 1 }}>
+            <Pressable style={styles.scrim} onPress={closeSheet} />
+            <KeyboardAvoidingView
+              behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+              style={styles.kav}>
+              <View style={styles.sheet}>
+                {mode === 'action' ? (
+                  <>
+                    <Text style={styles.sheetTitle}>{actionFor?.name}</Text>
+                    <Text style={styles.sheetSub}>{actionFor?.phone}</Text>
+                    <View style={styles.sheetBtns}>
+                      <PillButton title="Edit" kind="dark" onPress={editFromAction} style={{ flex: 1 }} />
+                      <PillButton
+                        title="Remove"
+                        kind="dark"
+                        onPress={removeFromAction}
+                        style={{ flex: 1 }}
+                        textStyle={{ color: '#ff8a6e' }}
+                      />
+                    </View>
+                    <PillButton title="Cancel" kind="ghost" onPress={closeSheet} style={{ marginTop: 10 }} />
+                  </>
+                ) : (
+                  <>
+                    <Text style={styles.sheetTitle}>{editId ? 'Edit contact' : 'Add someone'}</Text>
+                    <Text style={styles.sheetSub}>
+                      They&apos;ll be alerted with your location when you signal.
+                    </Text>
+                    <TextInput
+                      style={styles.input}
+                      placeholder="Name"
+                      placeholderTextColor={Beacon.faint}
+                      value={name}
+                      onChangeText={setName}
+                      autoCapitalize="words"
+                    />
+                    <TextInput
+                      style={styles.input}
+                      placeholder="Phone number"
+                      placeholderTextColor={Beacon.faint}
+                      value={phone}
+                      onChangeText={setPhone}
+                      keyboardType="phone-pad"
+                    />
+                    {!editId && (
+                      <Pressable onPress={openPickerMode} style={styles.pickLink}>
+                        <Ionicons name="person-add-outline" size={15} color={Beacon.info} />
+                        <Text style={styles.pickLinkText}>Choose from my contacts</Text>
+                      </Pressable>
+                    )}
+                    <View style={styles.sheetBtns}>
+                      <PillButton title="Cancel" kind="dark" onPress={closeSheet} style={{ flex: 1 }} />
+                      <PillButton
+                        title={editId ? 'Save' : 'Add'}
+                        kind="primary"
+                        onPress={saveContact}
+                        style={{ flex: 1 }}
+                      />
+                    </View>
+                  </>
+                )}
+              </View>
+            </KeyboardAvoidingView>
           </View>
-          <PillButton title="Cancel" kind="ghost" onPress={() => setActionFor(null)} style={{ marginTop: 10 }} />
-        </View>
-      </Modal>
-
-      {/* Device contact picker */}
-      <Modal visible={pickerOpen} animationType="slide" onRequestClose={() => setPickerOpen(false)}>
-        <SafeAreaView style={styles.pickerRoot}>
-          <View style={styles.pickerHead}>
-            <Text style={styles.pickerTitle}>Choose a contact</Text>
-            <Pressable onPress={() => setPickerOpen(false)}>
-              <Text style={styles.pickerDone}>Done</Text>
-            </Pressable>
-          </View>
-          <TextInput
-            style={styles.searchInput}
-            placeholder="Search contacts…"
-            placeholderTextColor={Beacon.faint}
-            value={search}
-            onChangeText={setSearch}
-            autoFocus
-          />
-          <FlatList
-            data={filtered}
-            keyExtractor={item => (item as any).id ?? item.name ?? String(Math.random())}
-            keyboardShouldPersistTaps="handled"
-            renderItem={({ item }) => {
-              const nm = item.name ?? 'Unknown';
-              const raw = item.phoneNumbers?.[0]?.number ?? '';
-              const disp = toE164(raw) ?? raw;
-              return (
-                <Pressable style={styles.pickRow} onPress={() => pickDeviceContact(item)}>
-                  <View style={[styles.avatar, { backgroundColor: avatarColor(nm) }]}>
-                    <Text style={styles.avatarText}>{initials(nm)}</Text>
-                  </View>
-                  <View style={{ flex: 1 }}>
-                    <Text style={styles.rowName}>{nm}</Text>
-                    <Text style={styles.rowPhone}>{disp}</Text>
-                  </View>
-                </Pressable>
-              );
-            }}
-          />
-        </SafeAreaView>
+        )}
       </Modal>
     </SafeAreaView>
   );
@@ -346,11 +371,8 @@ const styles = StyleSheet.create({
   addText: { color: Beacon.beacon, fontWeight: '700', fontSize: 13.5 },
 
   scrim: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(4,7,12,0.6)' },
+  kav: { marginTop: 'auto' },
   sheet: {
-    position: 'absolute',
-    left: 0,
-    right: 0,
-    bottom: 0,
     backgroundColor: Beacon.surface,
     borderTopWidth: 1,
     borderTopColor: Beacon.line,
@@ -381,12 +403,13 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    paddingHorizontal: 20,
+    paddingHorizontal: 16,
     paddingVertical: 16,
     borderBottomWidth: 1,
     borderBottomColor: Beacon.line,
   },
-  pickerTitle: { fontSize: 18, fontWeight: '800', color: Beacon.text },
+  pickerBack: { width: 30 },
+  pickerTitle: { fontSize: 17, fontWeight: '800', color: Beacon.text },
   pickerDone: { fontSize: 15, color: Beacon.beacon, fontWeight: '700' },
   searchInput: {
     margin: 16,
