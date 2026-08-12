@@ -626,41 +626,53 @@ export default function HomeScreen() {
     releaseRef.current = onBeaconRelease;
   });
 
-  // react-native-gesture-handler Pan — works with both touch and a desktop mouse
-  // (PanResponder does not reliably handle mouse drags on web). minDistance(0)
-  // lets a plain press/tap register (release in center = go live); a drag past
-  // the threshold selects a timer. runOnJS lets the callbacks call setState.
+  // Beacon gesture (touch + mouse), via react-native-gesture-handler:
+  //  • Tap  — a press/hold released without dragging = go live. A Tap fires the
+  //    instant you lift your finger; a Pan does NOT "activate" on a no-drag tap
+  //    on a touchscreen, which is why the old single-Pan version stayed armed and
+  //    never triggered on release.
+  //  • Pan  — a drag past the threshold selects a timer (fires on release).
+  // Raced so exactly one wins: no drag → Tap; a drag → Pan.
   const beaconGesture = useRef(
-    Gesture.Pan()
-      .runOnJS(true)
-      .minDistance(0)
-      .onBegin(() => {
-        selRef.current = 'now';
-        setSel('now');
-        setArmed(true);
-        if (!IS_WEB) Haptics.selectionAsync();
-      })
-      .onUpdate(e => {
-        const dx = e.translationX;
-        const dy = e.translationY;
-        let k = 'now';
-        if (Math.hypot(dx, dy) >= 42) {
-          if (Math.abs(dx) > Math.abs(dy)) k = dx < 0 ? 'left' : 'right';
-          else k = dy < 0 ? 'up' : 'down';
-        }
-        if (k !== selRef.current) {
-          selRef.current = k;
-          setSel(k);
+    Gesture.Race(
+      Gesture.Tap()
+        .runOnJS(true)
+        .maxDuration(60000) // allow a long hold-then-release to still count as a tap
+        .maxDistance(24)
+        .onStart(() => {
+          releaseRef.current('now');
+        }),
+      Gesture.Pan()
+        .runOnJS(true)
+        .minDistance(24)
+        .onBegin(() => {
+          selRef.current = 'now';
+          setSel('now');
+          setArmed(true);
           if (!IS_WEB) Haptics.selectionAsync();
-        }
-      })
-      .onEnd(() => {
-        releaseRef.current(selRef.current);
-      })
-      .onFinalize(() => {
-        setArmed(false);
-        setSel(null);
-      }),
+        })
+        .onUpdate(e => {
+          const dx = e.translationX;
+          const dy = e.translationY;
+          let k = 'now';
+          if (Math.hypot(dx, dy) >= 42) {
+            if (Math.abs(dx) > Math.abs(dy)) k = dx < 0 ? 'left' : 'right';
+            else k = dy < 0 ? 'up' : 'down';
+          }
+          if (k !== selRef.current) {
+            selRef.current = k;
+            setSel(k);
+            if (!IS_WEB) Haptics.selectionAsync();
+          }
+        })
+        .onEnd(() => {
+          releaseRef.current(selRef.current);
+        })
+        .onFinalize(() => {
+          setArmed(false);
+          setSel(null);
+        }),
+    ),
   ).current;
 
   // ── Camera / go-live screen ────────────────────────────────────────────────
