@@ -296,16 +296,32 @@ app.use('/safe', smsLimiter);
 app.use('/checkin/start', smsLimiter);
 app.use('/session/start', smsLimiter);
 
+// ── Public static assets (legal pages + opt-in screenshots) ───────────────────
+// Served from server/public with NO X-MIH-Key auth so a plain browser (and the
+// carrier / A2P reviewer) can open them. Mounted before the auth middleware so
+// these paths never require a token:
+//   GET /privacy       → public/privacy.html
+//   GET /terms         → public/terms.html
+//   GET /optin-1.png … → public/optin-1.png (any file dropped into public/)
+const publicDir = path.join(__dirname, 'public');
+app.get('/privacy', (req, res) => res.sendFile(path.join(publicDir, 'privacy.html')));
+app.get('/terms', (req, res) => res.sendFile(path.join(publicDir, 'terms.html')));
+app.use(express.static(publicDir));
+
 // ── Auth middleware ───────────────────────────────────────────────────────────
 // Unauthenticated paths:
-//   /health   — monitoring
-//   /register — issues tokens (guarded by REGISTRATION_SECRET)
-//   /media/*  — guarded by signed per-file query token (Twilio has no X-MIH-Key)
+//   /health         — monitoring
+//   /register       — issues tokens (guarded by REGISTRATION_SECRET)
+//   /media/*        — guarded by signed per-file query token (Twilio has no X-MIH-Key)
+//   /privacy /terms — public legal pages (also short-circuited by the static
+//                     mount above; listed here as defense in depth)
 // Everything else requires a valid per-device token in X-MIH-Key.
 app.use(async (req, res, next) => {
   if (
     req.path === '/health' ||
     req.path === '/register' ||
+    req.path === '/privacy' ||
+    req.path === '/terms' ||
     req.path.startsWith('/media/') ||
     req.path.startsWith('/live/')
   ) return next();
