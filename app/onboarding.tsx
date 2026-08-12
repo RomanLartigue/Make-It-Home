@@ -97,6 +97,10 @@ export default function OnboardingScreen() {
                 only alert your circle when you trigger it, delivery isn&apos;t guaranteed, and your
                 data is kept briefly and auto-deleted.
               </Text>
+              <Text style={[styles.legalBody, { marginTop: 8 }]}>
+                By adding contacts, you confirm they&apos;ve agreed to receive safety text messages
+                from you. Message &amp; data rates may apply; reply STOP to opt out.
+              </Text>
             </View>
             <View style={styles.legalLinks}>
               <Text style={styles.legalLink} onPress={() => router.push('/legal?doc=terms')}>

@@ -416,7 +416,7 @@ function buildAlertBody(name, latitude, longitude) {
     latitude != null && longitude != null
       ? `\n\nLast known location: https://maps.google.com/?q=${latitude},${longitude}`
       : '';
-  return `🚨 EMERGENCY — ${who} missed their check-in! Open Make It Home NOW.${mapsLink}`;
+  return `🚨 EMERGENCY — ${who} missed their check-in! Open Make It Home NOW.${mapsLink} Reply STOP to opt out.`;
 }
 
 function scheduleAlert(id, entry, delayMs) {
@@ -554,7 +554,7 @@ app.post('/upload', (req, res, next) => {
   const mediaToken = crypto.randomBytes(24).toString('hex');
   await saveMediaToken(mediaToken, req.file.filename, String(req.headers['x-mih-key'] || ''));
   const mediaUrl = `${SERVER_URL}/media/${req.file.filename}?token=${mediaToken}`;
-  const body = '🎥 Safety recording from your safety circle.';
+  const body = '🎥 Safety recording from your safety circle. Reply STOP to opt out.';
 
   const results = await Promise.allSettled(
     // Promise.resolve().then(...) so a synchronous throw can't escape allSettled.
@@ -627,7 +627,7 @@ app.post('/checkin/cancel', async (req, res) => {
 
   if (notifySafe) {
     const who = entry.name?.trim() || 'Your contact';
-    const r = await sendSmsToAll(entry.phones, `✅ ${who} has checked in and is safe.`);
+    const r = await sendSmsToAll(entry.phones, `✅ ${who} has checked in and is safe. Reply STOP to opt out.`);
     console.log(`[/checkin/cancel] Safe SMS: sent ${r.sent}, failed ${r.failed}.`);
   }
 
@@ -712,7 +712,7 @@ app.post('/session/start', async (req, res) => {
 
   const liveLink = `${SERVER_URL}/live/${sessionId}`;
   const who = nm ? `${nm} needs help` : 'Someone needs help';
-  const body = `🚨 EMERGENCY — ${who}! Open Make It Home NOW.\n\nTrack live: ${liveLink}`;
+  const body = `🚨 EMERGENCY — ${who}! Open Make It Home NOW.\n\nTrack live: ${liveLink}\n\nReply STOP to opt out.`;
 
   const result = await sendSmsToAll(recipients, body);
   if (result.sent === 0) {
@@ -816,7 +816,7 @@ app.post('/safe', async (req, res) => {
   if (r.error) return res.status(r.status).json({ error: r.error });
   const recipients = r.recipients;
   const who = cleanName(name) || 'Your contact';
-  const result = await sendSmsToAll(recipients, `✅ ${who} is safe — false alarm.`);
+  const result = await sendSmsToAll(recipients, `✅ ${who} is safe — false alarm. Reply STOP to opt out.`);
   if (result.sent === 0) {
     console.error('[/safe] All sends failed:', result.errors.join('; '));
     return res.status(500).json({ error: 'Could not reach any contact.', failed: result.failed });

@@ -259,6 +259,10 @@ export default function CircleScreen() {
                         <Text style={styles.pickLinkText}>Choose from my contacts</Text>
                       </Pressable>
                     )}
+                    <Text style={styles.consent}>
+                      By adding someone, you confirm they&apos;ve agreed to receive emergency safety
+                      texts from you. Message &amp; data rates may apply. Reply STOP to opt out.
+                    </Text>
                     <View style={styles.sheetBtns}>
                       <PillButton title="Cancel" kind="dark" onPress={closeSheet} style={{ flex: 1 }} />
                       <PillButton
@@ -339,5 +343,6 @@ const styles = StyleSheet.create({
   },
   pickLink: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingVertical: 4, marginBottom: 6 },
   pickLinkText: { color: Beacon.info, fontWeight: '600', fontSize: 13 },
+  consent: { color: Beacon.faint, fontSize: 11, lineHeight: 15, marginBottom: 10 },
   sheetBtns: { flexDirection: 'row', gap: 10, marginTop: 6 },
 });
