@@ -308,6 +308,34 @@ app.get('/privacy', (req, res) => res.sendFile(path.join(publicDir, 'privacy.htm
 app.get('/terms', (req, res) => res.sendFile(path.join(publicDir, 'terms.html')));
 app.use(express.static(publicDir));
 
+// ── Hosted web app (Expo web export) ──────────────────────────────────────────
+// The Expo web build lives in server/web (exported with baseUrl "/app"). Serving
+// it here lets anyone run the app in a browser with nothing to install — same
+// origin as the API, so its fetch() calls need no CORS. Mounted before the auth
+// middleware so the static assets load without a token; the app still obtains a
+// per-device token via /register at runtime like the native app does.
+//
+// The global helmet CSP is strict (script-src 'none') for the live-tracking
+// page; the SPA needs to run its own JS bundle, so relax CSP for /app responses.
+const webAppDir = path.join(__dirname, 'web');
+const APP_CSP =
+  "default-src 'self'; " +
+  "script-src 'self' 'unsafe-inline' 'unsafe-eval'; " +
+  "style-src 'self' 'unsafe-inline'; " +
+  "img-src 'self' data: blob:; " +
+  "font-src 'self' data:; " +
+  "connect-src 'self' https://maps.google.com; " +
+  "worker-src 'self' blob:; " +
+  "child-src 'self' blob:";
+app.use('/app', (req, res, next) => {
+  res.setHeader('Content-Security-Policy', APP_CSP);
+  next();
+});
+app.use('/app', express.static(webAppDir));
+// SPA fallback: client-side routes (/app/contacts, /app/onboarding, …) that don't
+// map to a real file are served the app shell so the router can handle them.
+app.get(/^\/app(\/.*)?$/, (req, res) => res.sendFile(path.join(webAppDir, 'index.html')));
+
 // ── Auth middleware ───────────────────────────────────────────────────────────
 // Unauthenticated paths:
 //   /health         — monitoring
