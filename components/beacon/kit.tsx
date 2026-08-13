@@ -119,12 +119,14 @@ export function PillButton({
   kind = 'primary',
   style,
   textStyle,
+  disabled = false,
 }: {
   title: string;
   onPress?: () => void;
   kind?: BtnKind;
   style?: StyleProp<ViewStyle>;
   textStyle?: StyleProp<TextStyle>;
+  disabled?: boolean;
 }) {
   const bg =
     kind === 'primary' ? Beacon.beacon : kind === 'dark' ? Beacon.surface2 : Beacon.surface;
@@ -133,10 +135,12 @@ export function PillButton({
   return (
     <Pressable
       onPress={onPress}
+      disabled={disabled}
       style={({ pressed }) => [
         styles.pill,
         { backgroundColor: bg, borderColor: border },
         pressed && { opacity: 0.85 },
+        disabled && { opacity: 0.4 },
         style,
       ]}
     >
