@@ -26,6 +26,10 @@ import { PillButton } from '@/components/beacon/kit';
 
 const STORAGE_KEY = '@makeithome_safety_circle';
 
+// The native OS contact picker doesn't exist in a browser, so on the hosted web
+// build we hide "Choose from my contacts" and users type the number in instead.
+const IS_WEB = Platform.OS === 'web';
+
 interface SafetyContact {
   id: string;
   name: string;
@@ -258,7 +262,7 @@ export default function CircleScreen() {
                       onChangeText={setPhone}
                       keyboardType="phone-pad"
                     />
-                    {!editId && (
+                    {!editId && !IS_WEB && (
                       <Pressable onPress={pickFromContacts} style={styles.pickLink}>
                         <Ionicons name="person-add-outline" size={15} color={Beacon.info} />
                         <Text style={styles.pickLinkText}>Choose from my contacts</Text>
