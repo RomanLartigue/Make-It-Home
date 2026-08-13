@@ -45,7 +45,15 @@
         }
       ],
       ["expo-notifications"],
-      ["expo-contacts"]
+      ["expo-contacts"],
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "Make It Home saves your safety recordings to your photo library.",
+          "savePhotosPermission": "Make It Home saves your safety recordings to your photo library so you keep a copy.",
+          "isAccessMediaLocationEnabled": false
+        }
+      ]
     ]
   }
 }

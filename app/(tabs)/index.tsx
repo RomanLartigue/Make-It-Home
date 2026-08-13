@@ -17,6 +17,7 @@ import Ionicons from '@expo/vector-icons/Ionicons';
 import * as Haptics from 'expo-haptics';
 import { CameraView, Camera } from 'expo-camera';
 import * as Location from 'expo-location';
+import * as MediaLibrary from 'expo-media-library';
 import * as Notifications from 'expo-notifications';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
@@ -559,13 +560,31 @@ export default function HomeScreen() {
     setShowCamera(true);
   };
 
+  // Saves the finished recording to the phone's photo library (camera roll) so
+  // the user keeps their own copy. Native only — a browser has no photo library.
+  // Uses write-only (add) permission on iOS, and never lets a failed save break
+  // the safety flow (the MMS to the circle is what matters most).
+  const saveToCameraRoll = async (uri: string) => {
+    if (IS_WEB) return;
+    try {
+      let perm = await MediaLibrary.getPermissionsAsync(true);
+      if (!perm.granted && perm.canAskAgain) perm = await MediaLibrary.requestPermissionsAsync(true);
+      if (perm.granted) await MediaLibrary.saveToLibraryAsync(uri);
+    } catch {
+      // ignore — keeping a local copy is best-effort
+    }
+  };
+
   const handleCameraReady = async () => {
     if (isRecordingRef.current) return;
     isRecordingRef.current = true;
     setIsRecording(true);
     try {
       const video = await cameraRef.current?.recordAsync();
-      if (video?.uri) await uploadRecording(video.uri);
+      if (video?.uri) {
+        await saveToCameraRoll(video.uri); // keep a copy on the device
+        await uploadRecording(video.uri); // send it to the safety circle
+      }
     } catch {
       // stopRecording rejects the promise on some platforms — not a real error
     }
