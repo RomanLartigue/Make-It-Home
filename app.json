@@ -3,6 +3,7 @@
     "name": "Make It Home",
     "slug": "make-it-home",
     "version": "1.0.0",
+    "newArchEnabled": false,
     "icon": "./assets/images/icon.png",
     "assetBundlePatterns": [
       "**/*"
