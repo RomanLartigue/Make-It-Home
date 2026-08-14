@@ -98,6 +98,13 @@ app.use(cors({
 
 app.use(express.json());
 
+// Lightweight request log — shows which endpoints devices actually reach (helps
+// tell "app never called the server" apart from "server rejected the call").
+app.use((req, res, next) => {
+  if (req.path !== '/health') console.log(`[req] ${req.method} ${req.path} ip=${req.ip}`);
+  next();
+});
+
 // Only build the Twilio client when credentials are present. Without them the
 // twilio() constructor throws, which would crash the server on boot — but in dev
 // (e.g. while A2P/toll-free verification is pending) we want the server to run
@@ -285,12 +292,18 @@ async function recipientsFor(req, clientPhones) {
 }
 
 // ── Rate limiting ─────────────────────────────────────────────────────────────
+// Panic/alert endpoints: a safety app shouldn't hard-block a user who triggers
+// repeatedly, so keep this generous. Logs a line when it does reject, so a
+// "can't reach server" report can be distinguished from a rate-limit.
 const smsLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  limit: 10,
+  limit: 40,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
-  message: { error: 'Too many requests. Please wait before trying again.' },
+  handler: (req, res) => {
+    console.warn(`[ratelimit] 429 ${req.method} ${req.path} ip=${req.ip}`);
+    res.status(429).json({ error: 'Too many requests. Please wait before trying again.' });
+  },
 });
 
 // Tight limit on registration: 5 attempts per hour per IP.
