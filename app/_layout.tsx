@@ -13,9 +13,9 @@ import { useEffect, useState } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Location from 'expo-location';
 
-// Imported at root level so the background task is registered before any
-// component uses it (importing the module runs its registration side effect).
-import { BACKGROUND_LOCATION_TASK } from '@/tasks/backgroundLocation';
+// [isolation] background-location task NOT imported — testing whether it's the
+// crash. Notifications remain enabled in this build.
+// import { BACKGROUND_LOCATION_TASK } from '@/tasks/backgroundLocation';
 
 import { getDeviceToken, syncCircle } from '@/utils/serverUrl';
 import { BeaconNavTheme } from '@/constants/theme';
@@ -79,15 +79,15 @@ function RootLayout() {
     })();
   }, []);
 
-  // Clean up any session that was orphaned by a force-kill
-  useEffect(() => {
-    AsyncStorage.getItem(ACTIVE_SESSION_KEY).then(async sessionId => {
-      if (!sessionId) return;
-      await Location.stopLocationUpdatesAsync(BACKGROUND_LOCATION_TASK).catch(() => {});
-      await AsyncStorage.removeItem(ACTIVE_SESSION_KEY);
-      console.log('[launch] Cleared stale session:', sessionId);
-    });
-  }, []);
+  // [isolation] session-cleanup effect disabled (it used the background task).
+  // useEffect(() => {
+  //   AsyncStorage.getItem(ACTIVE_SESSION_KEY).then(async sessionId => {
+  //     if (!sessionId) return;
+  //     await Location.stopLocationUpdatesAsync(BACKGROUND_LOCATION_TASK).catch(() => {});
+  //     await AsyncStorage.removeItem(ACTIVE_SESSION_KEY);
+  //     console.log('[launch] Cleared stale session:', sessionId);
+  //   });
+  // }, []);
 
   // If something threw during launch, show it instead of a blank/crashed screen.
   if (trapped) {
