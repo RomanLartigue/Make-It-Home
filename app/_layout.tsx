@@ -1,3 +1,6 @@
+// MUST be first — installs the global error trap before anything else can throw.
+import { getTrappedError, subscribeTrappedError } from '@/utils/errorTrap';
+
 import { ThemeProvider } from '@react-navigation/native';
 import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
@@ -5,7 +8,7 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { View, Text, ScrollView, StyleSheet, Platform } from 'react-native';
 import 'react-native-gesture-handler';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Location from 'expo-location';
 
@@ -20,23 +23,36 @@ import { Beacon } from '@/constants/beacon';
 const ACTIVE_SESSION_KEY = '@makeithome_active_session';
 const SAFETY_CIRCLE_KEY = '@makeithome_safety_circle';
 
-// expo-router renders this instead of crashing when a route throws. In a release
-// build a launch-time error would otherwise hard-crash with no message; this puts
-// the actual error on screen so it can be read/screenshotted. (Diagnostic aid —
-// safe to keep; it only ever shows if something throws.)
-export function ErrorBoundary({ error }: { error: Error }) {
+// Full-screen error readout used by both the router error boundary and the
+// global trap below. Puts the actual message + stack on screen so a release
+// crash can be read/screenshotted instead of aborting silently.
+function ErrorScreen({ message, stack }: { message: string; stack?: string }) {
   return (
     <View style={styles.errRoot}>
       <ScrollView contentContainerStyle={styles.errScroll}>
         <Text style={styles.errTitle}>Make It Home hit an error</Text>
-        <Text style={styles.errMsg}>{String(error?.message ?? error)}</Text>
-        <Text style={styles.errStack}>{String(error?.stack ?? '')}</Text>
+        <Text style={styles.errMsg}>{message}</Text>
+        {!!stack && <Text style={styles.errStack}>{stack}</Text>}
       </ScrollView>
     </View>
   );
 }
 
+// expo-router renders this when a *route* throws during render.
+export function ErrorBoundary({ error }: { error: Error }) {
+  return <ErrorScreen message={String(error?.message ?? error)} stack={error?.stack} />;
+}
+
 export default function RootLayout() {
+  // Surfaces errors thrown at launch (module load / async) that a React error
+  // boundary can't catch — the global trap captures them, we render them here.
+  const [trapped, setTrapped] = useState<string | null>(getTrappedError());
+  useEffect(() => {
+    const off = subscribeTrappedError(setTrapped);
+    setTrapped(getTrappedError());
+    return off;
+  }, []);
+
   // Pre-warm the per-device auth token so the first safety tap never stalls,
   // then push the stored safety circle to the server. The server only sends
   // alerts to a device's synced circle, so this must happen before a go-live —
@@ -60,6 +76,12 @@ export default function RootLayout() {
       console.log('[launch] Cleared stale session:', sessionId);
     });
   }, []);
+
+  // If something threw during launch, show it instead of a blank/crashed screen.
+  if (trapped) {
+    const [firstLine, ...rest] = trapped.split('\n\n');
+    return <ErrorScreen message={firstLine} stack={rest.join('\n\n')} />;
+  }
 
   // Make It Home is a dark-only "beacon" experience — no light variant.
   // On web we constrain the app to a centered phone-width column so it doesn't
