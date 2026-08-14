@@ -11,17 +11,11 @@ import 'react-native-gesture-handler';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { useEffect, useState } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import * as Location from 'expo-location';
-
-// [isolation] background-location task NOT imported — testing whether it's the
-// crash. Notifications remain enabled in this build.
-// import { BACKGROUND_LOCATION_TASK } from '@/tasks/backgroundLocation';
 
 import { getDeviceToken, syncCircle } from '@/utils/serverUrl';
 import { BeaconNavTheme } from '@/constants/theme';
 import { Beacon } from '@/constants/beacon';
 
-const ACTIVE_SESSION_KEY = '@makeithome_active_session';
 const SAFETY_CIRCLE_KEY = '@makeithome_safety_circle';
 
 // Initialize crash reporting as early as possible so it captures the launch
@@ -78,16 +72,6 @@ function RootLayout() {
       if (phones.length) syncCircle(phones);
     })();
   }, []);
-
-  // [isolation] session-cleanup effect disabled (it used the background task).
-  // useEffect(() => {
-  //   AsyncStorage.getItem(ACTIVE_SESSION_KEY).then(async sessionId => {
-  //     if (!sessionId) return;
-  //     await Location.stopLocationUpdatesAsync(BACKGROUND_LOCATION_TASK).catch(() => {});
-  //     await AsyncStorage.removeItem(ACTIVE_SESSION_KEY);
-  //     console.log('[launch] Cleared stale session:', sessionId);
-  //   });
-  // }, []);
 
   // If something threw during launch, show it instead of a blank/crashed screen.
   if (trapped) {

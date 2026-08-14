@@ -22,7 +22,6 @@ import * as Notifications from 'expo-notifications';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 import { getServerUrl, getUserName, fetchWithAuth, randomId, syncCircle } from '@/utils/serverUrl';
-import { BACKGROUND_LOCATION_TASK } from '@/tasks/backgroundLocation';
 import { Beacon } from '@/constants/beacon';
 import { PillButton } from '@/components/beacon/kit';
 
@@ -469,15 +468,6 @@ export default function HomeScreen() {
       );
       return;
     }
-    // Background location isn't available in Expo Go and can throw there — never
-    // let it break go-live; foreground tracking + the alert still work without it.
-    let bgGranted = false;
-    try {
-      bgGranted = (await Location.requestBackgroundPermissionsAsync()).granted;
-    } catch {
-      // ignore — proceed with foreground only
-    }
-
     const serverUrl = await getServerUrl();
     const serverOk = await checkServerHealth(serverUrl);
     if (!serverOk) {
@@ -514,19 +504,6 @@ export default function HomeScreen() {
       sessionIdRef.current = sessionId;
       await AsyncStorage.setItem(ACTIVE_SESSION_KEY, sessionId);
       await startSession(coords);
-      if (bgGranted) {
-        Location.startLocationUpdatesAsync(BACKGROUND_LOCATION_TASK, {
-          accuracy: Location.Accuracy.Balanced,
-          timeInterval: 30_000,
-          distanceInterval: 20,
-          showsBackgroundLocationIndicator: true,
-          foregroundService: {
-            notificationTitle: 'Make It Home is active',
-            notificationBody: 'Your safety circle can track your location.',
-            notificationColor: '#ff6a4d',
-          },
-        }).catch(err => console.warn('[BG Location] Start failed:', err.message));
-      }
     };
 
     // 1) Seed immediately from the last known fix, if the OS has one cached.
@@ -611,7 +588,6 @@ export default function HomeScreen() {
     cameraRef.current?.stopRecording();
     locationSub.current?.remove();
     locationSub.current = null;
-    Location.stopLocationUpdatesAsync(BACKGROUND_LOCATION_TASK).catch(() => {});
     AsyncStorage.removeItem(ACTIVE_SESSION_KEY);
     if (endedSessionId) {
       getServerUrl().then(serverUrl => {
