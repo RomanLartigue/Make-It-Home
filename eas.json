@@ -15,16 +15,14 @@
         "simulator": false
       },
       "env": {
-        "EXPO_PUBLIC_SERVER_URL": "https://make-it-home-server-production.up.railway.app",
-        "SENTRY_DISABLE_AUTO_UPLOAD": "true"
+        "EXPO_PUBLIC_SERVER_URL": "https://make-it-home-server-production.up.railway.app"
       }
     },
     "production": {
       "autoIncrement": true,
       "environment": "production",
       "env": {
-        "EXPO_PUBLIC_SERVER_URL": "https://make-it-home-server-production.up.railway.app",
-        "SENTRY_DISABLE_AUTO_UPLOAD": "true"
+        "EXPO_PUBLIC_SERVER_URL": "https://make-it-home-server-production.up.railway.app"
       }
     }
   },
