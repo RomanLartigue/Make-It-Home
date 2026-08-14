@@ -11,7 +11,7 @@
 // The deployed server URL. HTTPS in production — emergency location data travels
 // over it. Falls back to the production URL so the app runs without a .env.
 export const SERVER_URL =
-  process.env.EXPO_PUBLIC_SERVER_URL ?? 'https://makeithome-server-production.up.railway.app';
+  process.env.EXPO_PUBLIC_SERVER_URL ?? 'https://make-it-home-server-production.up.railway.app';
 
 // Must match REGISTRATION_SECRET in your server environment. No source fallback —
 // set it in .env (copy from .env.example).
