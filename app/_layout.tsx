@@ -1,5 +1,6 @@
 // MUST be first — installs the global error trap before anything else can throw.
 import { getTrappedError, subscribeTrappedError } from '@/utils/errorTrap';
+import * as Sentry from '@sentry/react-native';
 
 import { ThemeProvider } from '@react-navigation/native';
 import { Stack } from 'expo-router';
@@ -23,6 +24,17 @@ import { Beacon } from '@/constants/beacon';
 const ACTIVE_SESSION_KEY = '@makeithome_active_session';
 const SAFETY_CIRCLE_KEY = '@makeithome_safety_circle';
 
+// Initialize crash reporting as early as possible so it captures the launch
+// crash. sentry-cocoa installs native signal/exception handlers here, which
+// catch native crashes independently of any JS handler.
+Sentry.init({
+  dsn: 'https://cba9cfa4ae09f158b04a08492fa8b44c@o4511910476316672.ingest.us.sentry.io/4511910508494848',
+  enableNativeCrashHandling: true,
+  attachStacktrace: true,
+  tracesSampleRate: 0,
+  debug: false,
+});
+
 // Full-screen error readout used by both the router error boundary and the
 // global trap below. Puts the actual message + stack on screen so a release
 // crash can be read/screenshotted instead of aborting silently.
@@ -43,7 +55,7 @@ export function ErrorBoundary({ error }: { error: Error }) {
   return <ErrorScreen message={String(error?.message ?? error)} stack={error?.stack} />;
 }
 
-export default function RootLayout() {
+function RootLayout() {
   // Surfaces errors thrown at launch (module load / async) that a React error
   // boundary can't catch — the global trap captures them, we render them here.
   const [trapped, setTrapped] = useState<string | null>(getTrappedError());
@@ -107,6 +119,8 @@ export default function RootLayout() {
     </GestureHandlerRootView>
   );
 }
+
+export default Sentry.wrap(RootLayout);
 
 const styles = StyleSheet.create({
   frame: {
