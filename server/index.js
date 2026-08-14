@@ -13,7 +13,8 @@ const Redis = require('ioredis');
 
 const {
   TWILIO_ACCOUNT_SID,
-  TWILIO_AUTH_TOKEN,
+  TWILIO_API_KEY_SID,
+  TWILIO_API_KEY_SECRET,
   TWILIO_PHONE_NUMBER,
   SERVER_URL,
   REGISTRATION_SECRET,
@@ -28,7 +29,8 @@ const {
 // in dev we only warn so the server can boot for local UI work.
 const REQUIRED_ENV = [
   'TWILIO_ACCOUNT_SID',
-  'TWILIO_AUTH_TOKEN',
+  'TWILIO_API_KEY_SID',
+  'TWILIO_API_KEY_SECRET',
   'TWILIO_PHONE_NUMBER',
   'SERVER_URL',
   'REGISTRATION_SECRET',
@@ -94,9 +96,12 @@ app.use(express.json());
 // (e.g. while A2P/toll-free verification is pending) we want the server to run
 // without Twilio. When null, send attempts fail gracefully (allSettled) instead
 // of crashing, so /health and everything non-SMS still work.
+//
+// Uses an API Key (SID + secret) scoped to the account, rather than the account
+// auth token — the recommended production credential (revocable, least-privilege).
 const twilioClient =
-  TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN
-    ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+  TWILIO_ACCOUNT_SID && TWILIO_API_KEY_SID && TWILIO_API_KEY_SECRET
+    ? twilio(TWILIO_API_KEY_SID, TWILIO_API_KEY_SECRET, { accountSid: TWILIO_ACCOUNT_SID })
     : null;
 if (!twilioClient) {
   console.warn('[twilio] No credentials set — SMS/MMS sending is disabled (server still runs).');
