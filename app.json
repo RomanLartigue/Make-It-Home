@@ -79,7 +79,9 @@
           "savePhotosPermission": "Make It Home saves your safety recordings to your photo library so you keep a copy.",
           "isAccessMediaLocationEnabled": false
         }
-      ]
+      ],
+      "expo-font",
+      "expo-web-browser"
     ],
     "extra": {
       "router": {},
