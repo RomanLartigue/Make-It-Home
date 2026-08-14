@@ -2,7 +2,7 @@ import { ThemeProvider } from '@react-navigation/native';
 import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
-import { View, StyleSheet, Platform } from 'react-native';
+import { View, Text, ScrollView, StyleSheet, Platform } from 'react-native';
 import 'react-native-gesture-handler';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { useEffect } from 'react';
@@ -19,6 +19,22 @@ import { Beacon } from '@/constants/beacon';
 
 const ACTIVE_SESSION_KEY = '@makeithome_active_session';
 const SAFETY_CIRCLE_KEY = '@makeithome_safety_circle';
+
+// expo-router renders this instead of crashing when a route throws. In a release
+// build a launch-time error would otherwise hard-crash with no message; this puts
+// the actual error on screen so it can be read/screenshotted. (Diagnostic aid —
+// safe to keep; it only ever shows if something throws.)
+export function ErrorBoundary({ error }: { error: Error }) {
+  return (
+    <View style={styles.errRoot}>
+      <ScrollView contentContainerStyle={styles.errScroll}>
+        <Text style={styles.errTitle}>Make It Home hit an error</Text>
+        <Text style={styles.errMsg}>{String(error?.message ?? error)}</Text>
+        <Text style={styles.errStack}>{String(error?.stack ?? '')}</Text>
+      </ScrollView>
+    </View>
+  );
+}
 
 export default function RootLayout() {
   // Pre-warm the per-device auth token so the first safety tap never stalls,
@@ -83,4 +99,9 @@ const styles = StyleSheet.create({
     // Phone-width cap on web; unconstrained on native.
     ...Platform.select({ web: { maxWidth: 440 }, default: {} }),
   },
+  errRoot: { flex: 1, backgroundColor: '#0a0a0a' },
+  errScroll: { padding: 24, paddingTop: 80 },
+  errTitle: { color: '#fff', fontSize: 18, fontWeight: '800', marginBottom: 12 },
+  errMsg: { color: '#ff8a6e', fontSize: 14, marginBottom: 16 },
+  errStack: { color: '#8a8a8a', fontSize: 10, fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace' },
 });
