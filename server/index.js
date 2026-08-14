@@ -48,6 +48,13 @@ if (missingEnv.length) {
 
 const app = express();
 
+// Railway (and most hosts) put a reverse proxy in front of the app, so the real
+// client IP arrives in X-Forwarded-For. Trust the first proxy hop so
+// express-rate-limit keys on the actual device IP instead of lumping every
+// request under the proxy's single IP (which exhausts the shared SMS limit and
+// 429s /session/start for everyone).
+app.set('trust proxy', 1);
+
 // ── Security headers ──────────────────────────────────────────────────────────
 // Sets X-Content-Type-Options, X-Frame-Options, Strict-Transport-Security,
 // X-DNS-Prefetch-Control, and more. contentSecurityPolicy is customised to
