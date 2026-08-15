@@ -1,7 +1,8 @@
 {
   "expo": {
     "name": "Make It Home",
-    "slug": "make-it-home",
+    "slug": "make-it-home-app",
+    "owner": "romanlartigues-team",
     "version": "1.0.0",
     "newArchEnabled": false,
     "icon": "./assets/images/icon.png",
@@ -79,7 +80,7 @@
     "extra": {
       "router": {},
       "eas": {
-        "projectId": "dd185c59-7a71-415d-9677-8bf5437a3b5f"
+        "projectId": "2edb2d4b-a10e-42c6-92e4-706b01e00220"
       }
     }
   }
