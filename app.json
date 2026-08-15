@@ -3,7 +3,7 @@
     "name": "Make It Home",
     "slug": "make-it-home-app",
     "owner": "romanlartigues-team",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "newArchEnabled": false,
     "icon": "./assets/images/icon.png",
     "assetBundlePatterns": [
