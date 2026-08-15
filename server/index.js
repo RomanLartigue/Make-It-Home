@@ -105,6 +105,21 @@ app.use((req, res, next) => {
   next();
 });
 
+// Diagnostic: the app POSTs uncaught JS startup errors here so we can read the
+// real error text in the server logs (a Release build otherwise just abort()s
+// with no visible message). Public + unauthenticated on purpose — it only logs.
+app.post('/clientlog', (req, res) => {
+  const b = req.body || {};
+  console.log('[clientlog] ===== CLIENT STARTUP ERROR =====');
+  console.log('[clientlog] phase   =', b.phase);
+  console.log('[clientlog] isFatal =', b.isFatal);
+  console.log('[clientlog] name    =', b.name);
+  console.log('[clientlog] message =', b.message);
+  console.log('[clientlog] stack   =', b.stack);
+  console.log('[clientlog] ================================');
+  res.json({ ok: true });
+});
+
 // Only build the Twilio client when credentials are present. Without them the
 // twilio() constructor throws, which would crash the server on boot — but in dev
 // (e.g. while A2P/toll-free verification is pending) we want the server to run
