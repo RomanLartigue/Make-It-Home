@@ -77,6 +77,50 @@ try {
   for (const ms of delays) setTimeout(assertHandler, ms);
 } catch (e) {}
 
+// React 19 routes RENDER-phase errors straight to ExceptionsManager.handleException,
+// bypassing ErrorUtils entirely — hook it so render errors can't reach the
+// native abort() either. Patched before the app loads so later importers pick
+// up the patched function.
+try {
+  const EM = require('react-native/Libraries/Core/ExceptionsManager');
+  const patched = (error, isFatal) => {
+    report(error, isFatal, 'handleException');
+    // Swallow: do NOT forward to native reportFatal (that path aborts).
+  };
+  for (const t of [EM, EM && EM.default]) {
+    if (t && typeof t.handleException === 'function') {
+      try { t.handleException = patched; } catch (e) {}
+    }
+  }
+} catch (e) {}
+
+// Belt-and-braces: neutralize the native fatal reporter itself. Even if some
+// path still reaches NativeExceptionsManager directly, report instead of abort.
+try {
+  const NEM = require('react-native/Libraries/Core/NativeExceptionsManager');
+  const t = (NEM && (NEM.default || NEM)) || null;
+  if (t) {
+    if (typeof t.reportFatalException === 'function') {
+      try {
+        t.reportFatalException = (message, stack, id) =>
+          report({ message, stack: JSON.stringify(stack || []).slice(0, 4000) }, true, 'nativeReportFatal');
+      } catch (e) {}
+    }
+    if (typeof t.reportException === 'function') {
+      try {
+        const orig = t.reportException.bind(t);
+        t.reportException = d => {
+          if (d && d.isFatal) {
+            report({ message: d.message, stack: JSON.stringify(d.stack || []).slice(0, 4000) }, true, 'nativeReportException');
+          } else {
+            try { orig(d); } catch (e) {}
+          }
+        };
+      } catch (e) {}
+    }
+  }
+} catch (e) {}
+
 // Surface (and report) an error captured on a PREVIOUS launch.
 try {
   AsyncStorage.getItem(LAST_ERROR_KEY)
