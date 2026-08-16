@@ -1,80 +1,30 @@
-// Lazy ringtone player.
+// Ringtone player for the Fake Call feature.
 //
-// expo-audio's JS touches its native module the moment it is IMPORTED
-// (it patches AudioModule.AudioPlayer.prototype at module top level). Because
-// expo-router evaluates every route file at app launch, a plain
-// `import ... from 'expo-audio'` in any screen puts audio initialization on the
-// launch path — which crashed the standalone Release build (works in Expo Go,
-// where the module is always present and warm).
+// TEMPORARY: audio is disabled. expo-audio was the only native module added
+// between the last launching TestFlight build (8) and the builds that crash at
+// launch (9–11); it is removed while we confirm it is the cause. The fake call
+// still rings via vibration and the full-screen call UI. Sound returns once the
+// launch crash is confirmed fixed (via a module that is verified safe on the
+// launch path).
 //
-// This module loads expo-audio with a dynamic import(), so it is only pulled in
-// when a ringtone is actually needed (Fake Call screens), never at startup.
+// The interface is kept so callers don't change when audio comes back.
 
 export interface RingtonePlayer {
-  /** Play the loaded source on a loop at full volume. */
   playLooping(): void;
-  /** Play the loaded source once (for previews). */
   playOnce(): void;
-  /** Stop playback (pause + rewind). */
   stop(): void;
-  /** Swap the loaded source (for previews that cycle ringtones). */
   replace(source: number): void;
-  /** Free the native player. */
   release(): void;
 }
 
-let audioModePromise: Promise<void> | null = null;
+const NOOP_PLAYER: RingtonePlayer = {
+  playLooping() {},
+  playOnce() {},
+  stop() {},
+  replace() {},
+  release() {},
+};
 
-async function loadExpoAudio() {
-  // Dynamic import keeps expo-audio out of the launch bundle-evaluation path.
-  return import('expo-audio');
-}
-
-async function ensureAudioMode(mod: typeof import('expo-audio')) {
-  if (!audioModePromise) {
-    audioModePromise = mod
-      .setAudioModeAsync({ playsInSilentMode: true, shouldPlayInBackground: false })
-      .catch(() => {});
-  }
-  return audioModePromise;
-}
-
-export async function createRingtonePlayer(source: number): Promise<RingtonePlayer> {
-  const mod = await loadExpoAudio();
-  await ensureAudioMode(mod);
-  const player = mod.createAudioPlayer(source);
-
-  return {
-    playLooping() {
-      try {
-        player.loop = true;
-        player.volume = 1.0;
-        player.play();
-      } catch {}
-    },
-    playOnce() {
-      try {
-        player.loop = false;
-        player.volume = 1.0;
-        player.seekTo(0).catch(() => {});
-        player.play();
-      } catch {}
-    },
-    stop() {
-      try {
-        player.pause();
-        player.seekTo(0).catch(() => {});
-      } catch {}
-    },
-    replace(next: number) {
-      try {
-        player.replace(next);
-      } catch {}
-    },
-    release() {
-      try {
-        player.remove();
-      } catch {}
-    },
-  };
+export async function createRingtonePlayer(_source: number): Promise<RingtonePlayer> {
+  return NOOP_PLAYER;
 }

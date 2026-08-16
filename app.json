@@ -76,8 +76,7 @@
         }
       ],
       "expo-font",
-      "expo-web-browser",
-      "expo-audio"
+      "expo-web-browser"
     ],
     "extra": {
       "router": {},

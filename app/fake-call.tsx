@@ -160,7 +160,10 @@ export default function FakeCallScreen() {
             );
           })}
         </View>
-        <Text style={styles.hintLine}>Tap a ringtone to hear it. This is what plays when the call comes in.</Text>
+        <Text style={styles.hintLine}>
+          Ringtone sound is temporarily off in this test build — the call still rings with vibration.
+          Your choice is saved for when sound returns.
+        </Text>
 
         <Text style={styles.label}>When?</Text>
         <View style={styles.chips}>

@@ -26,9 +26,26 @@ function describe(error) {
   }
 }
 
+const SERVER_URL =
+  process.env.EXPO_PUBLIC_SERVER_URL ||
+  'https://make-it-home-server-production.up.railway.app';
+
+// Ship the error to the server log too, so it is readable even if the on-screen
+// alert never gets a chance to render (e.g. the process dies mid-presentation).
+function shipToServer(phase, d) {
+  try {
+    fetch(SERVER_URL + '/clientlog', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phase, isFatal: true, ...d }),
+    }).catch(() => {});
+  } catch (e) {}
+}
+
 let shown = false;
 function reportFatal(error, phase) {
   const d = describe(error);
+  shipToServer(phase, d);
   try {
     AsyncStorage.setItem(
       LAST_ERROR_KEY,
@@ -114,6 +131,9 @@ try {
       AsyncStorage.removeItem(LAST_ERROR_KEY).catch(() => {});
       try {
         const p = JSON.parse(raw);
+        // Ship the previous launch's error to the server first — it is the
+        // one record of what killed the app last time.
+        shipToServer('previousLaunch', p);
         Alert.alert('Previous launch error', (p.message || 'unknown') + '\n\n' + (p.stack || '').slice(0, 700));
       } catch (e) {}
     })
