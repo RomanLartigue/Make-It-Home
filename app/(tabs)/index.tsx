@@ -791,9 +791,14 @@ export default function HomeScreen() {
         <Text style={styles.mark}>
           Make It <Text style={{ color: Beacon.beacon }}>Home</Text>
         </Text>
-        <Pressable style={styles.gear} hitSlop={8} onPress={() => router.push('/(tabs)/explore')}>
-          <Ionicons name="settings-outline" size={18} color={Beacon.muted} />
-        </Pressable>
+        <View style={styles.hbarActions}>
+          <Pressable style={styles.gear} hitSlop={8} onPress={() => router.push('/fake-call')}>
+            <Ionicons name="call-outline" size={18} color={Beacon.muted} />
+          </Pressable>
+          <Pressable style={styles.gear} hitSlop={8} onPress={() => router.push('/(tabs)/explore')}>
+            <Ionicons name="settings-outline" size={18} color={Beacon.muted} />
+          </Pressable>
+        </View>
       </View>
 
       {/* Coverage strip */}
@@ -894,6 +899,7 @@ const styles = StyleSheet.create({
     marginTop: 6,
   },
   mark: { fontWeight: '800', fontSize: 17, color: Beacon.text, letterSpacing: -0.2 },
+  hbarActions: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   gear: {
     width: 34,
     height: 34,
