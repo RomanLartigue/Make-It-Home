@@ -8,9 +8,8 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Beacon, RADIUS } from '@/constants/beacon';
 import { DetailHeader, Callout, PillButton } from '@/components/beacon/kit';
 import { RINGTONES, DEFAULT_RINGTONE, ringtoneSource, RingtoneId } from '@/constants/ringtones';
-// expo-audio is loaded lazily (see utils/ringtonePlayer) — importing it at the
-// top of a route file puts audio init on the app launch path and crashed the
-// Release build.
+// Audio (expo-av) is loaded lazily (see utils/ringtonePlayer) to keep it off the
+// app launch path.
 import { createRingtonePlayer, RingtonePlayer } from '@/utils/ringtonePlayer';
 
 const CALLER_KEY = '@makeithome_fakecall_name';
@@ -30,10 +29,9 @@ export default function FakeCallScreen() {
   const [countdown, setCountdown] = useState<number | null>(null);
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // A single reusable player for previewing ringtones as the user taps them.
-  // Created lazily on first preview so expo-audio never loads at app launch.
+  // A player for previewing ringtones as the user taps them. Created lazily on
+  // first preview (a fresh one per tap) so audio never loads at app launch.
   const previewRef = useRef<RingtonePlayer | null>(null);
-  const previewLoading = useRef<Promise<RingtonePlayer> | null>(null);
 
   useEffect(() => {
     AsyncStorage.getItem(CALLER_KEY).then(v => {
@@ -53,15 +51,12 @@ export default function FakeCallScreen() {
     setRingtone(id);
     AsyncStorage.setItem(RINGTONE_KEY, id).catch(() => {});
     try {
-      if (!previewRef.current) {
-        if (!previewLoading.current) {
-          previewLoading.current = createRingtonePlayer(ringtoneSource(id));
-        }
-        previewRef.current = await previewLoading.current;
-      } else {
-        previewRef.current.replace(ringtoneSource(id));
-      }
-      previewRef.current.playOnce();
+      const prev = previewRef.current;
+      previewRef.current = null;
+      prev?.release();
+      const p = await createRingtonePlayer(ringtoneSource(id));
+      previewRef.current = p;
+      p.playOnce();
     } catch {
       // preview is best-effort
     }
@@ -160,10 +155,7 @@ export default function FakeCallScreen() {
             );
           })}
         </View>
-        <Text style={styles.hintLine}>
-          Ringtone sound is temporarily off in this test build — the call still rings with vibration.
-          Your choice is saved for when sound returns.
-        </Text>
+        <Text style={styles.hintLine}>Tap a ringtone to hear it. This is what plays when the call comes in.</Text>
 
         <Text style={styles.label}>When?</Text>
         <View style={styles.chips}>
