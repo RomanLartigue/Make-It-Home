@@ -737,6 +737,7 @@ export default function HomeScreen() {
     Gesture.Race(
       Gesture.Tap()
         .runOnJS(true)
+        .hitSlop(20) // comfortable target around the 168px button, not the whole screen
         .maxDuration(60000) // allow a long hold-then-release to still count as a tap
         .maxDistance(24)
         .onStart(() => {
@@ -744,6 +745,7 @@ export default function HomeScreen() {
         }),
       Gesture.Pan()
         .runOnJS(true)
+        .hitSlop(20)
         .minDistance(24)
         .onBegin(() => {
           selRef.current = 'now';
@@ -920,25 +922,26 @@ export default function HomeScreen() {
       </View>
 
       {/* Beacon — hold-and-swipe (touch and mouse), via gesture-handler.
+          The gesture is attached to ONLY the orange button so a tap elsewhere on
+          the home screen can't accidentally trigger an alert.
           userSelect:none keeps a mouse-drag from starting a text selection. */}
-      <GestureDetector gesture={beaconGesture}>
-        <View style={styles.arena}>
-          <BeaconChip label="15" active={sel === 'left'} visible={armed} style={styles.optLeft} />
-          <BeaconChip label="30" active={sel === 'up'} visible={armed} style={styles.optUp} />
-          <BeaconChip label="45" active={sel === 'right'} visible={armed} style={styles.optRight} />
-          <BeaconChip label="60" active={sel === 'down'} visible={armed} style={styles.optDown} />
+      <View style={styles.arena}>
+        <BeaconChip label="15" active={sel === 'left'} visible={armed} style={styles.optLeft} />
+        <BeaconChip label="30" active={sel === 'up'} visible={armed} style={styles.optUp} />
+        <BeaconChip label="45" active={sel === 'right'} visible={armed} style={styles.optRight} />
+        <BeaconChip label="60" active={sel === 'down'} visible={armed} style={styles.optDown} />
+        <GestureDetector gesture={beaconGesture}>
           <Animated.View
             style={[
               styles.beacon,
               armed && styles.beaconArmed,
               { transform: [{ scale: armed ? 1 : pulse }] },
-            ]}
-            pointerEvents="none">
+            ]}>
             <Text style={styles.beaconText}>Hold</Text>
             <Text style={styles.beaconSub}>{armed ? 'release' : '& swipe'}</Text>
           </Animated.View>
-        </View>
-      </GestureDetector>
+        </GestureDetector>
+      </View>
 
       <Text style={styles.undertext}>
         {checkInStarting
