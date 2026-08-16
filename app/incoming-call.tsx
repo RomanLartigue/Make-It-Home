@@ -3,15 +3,20 @@ import { View, Text, Pressable, StyleSheet, Vibration, Platform, AppState } from
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import Ionicons from '@expo/vector-icons/Ionicons';
-import { useAudioPlayer, setAudioModeAsync } from 'expo-audio';
 
 import { initials } from '@/constants/beacon';
 import { ringtoneSource } from '@/constants/ringtones';
+import { createRingtonePlayer, RingtonePlayer } from '@/utils/ringtonePlayer';
 
 // A convincing fake incoming call the user can trigger to create a natural
 // reason to leave a situation. Full-screen, outside the tab bar. Styled to match
 // a real iOS call. Rings (looping tone + vibration) until answered or declined;
 // answering shows a running call timer.
+//
+// NOTE: expo-audio is loaded lazily via utils/ringtonePlayer, NOT imported at
+// the top of this file. expo-router evaluates every route at launch, and
+// expo-audio touches its native module at import time — importing it here put
+// audio initialization on the app's launch path and crashed the Release build.
 const VIBRATION_PATTERN = Platform.OS === 'ios' ? [0, 1000, 2000] : [0, 700, 1000, 700, 2000];
 
 export default function IncomingCallScreen() {
@@ -23,22 +28,24 @@ export default function IncomingCallScreen() {
   const [answered, setAnswered] = useState(false);
   const [seconds, setSeconds] = useState(0);
 
-  const player = useAudioPlayer(ringtoneSource(params.ringtone));
+  const playerRef = useRef<RingtonePlayer | null>(null);
   const ringingRef = useRef(true);
 
-  // Start ringing on mount.
+  // Start ringing on mount. Audio is created here (lazily), never at import.
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        await setAudioModeAsync({ playsInSilentMode: true, shouldPlayInBackground: false });
-      } catch {}
-      if (cancelled) return;
-      try {
-        player.loop = true;
-        player.volume = 1.0;
-        player.play();
-      } catch {}
+        const p = await createRingtonePlayer(ringtoneSource(params.ringtone));
+        if (cancelled) {
+          p.release();
+          return;
+        }
+        playerRef.current = p;
+        p.playLooping();
+      } catch {
+        // Audio unavailable — vibration still runs, screen still shows.
+      }
     })();
     try {
       Vibration.vibrate(VIBRATION_PATTERN, true);
@@ -46,6 +53,8 @@ export default function IncomingCallScreen() {
     return () => {
       cancelled = true;
       stopRinging();
+      playerRef.current?.release();
+      playerRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -64,7 +73,7 @@ export default function IncomingCallScreen() {
   function stopRinging() {
     ringingRef.current = false;
     try { Vibration.cancel(); } catch {}
-    try { player.pause(); } catch {}
+    try { playerRef.current?.stop(); } catch {}
   }
 
   useEffect(() => {

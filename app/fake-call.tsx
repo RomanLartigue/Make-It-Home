@@ -4,11 +4,14 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
 import Ionicons from '@expo/vector-icons/Ionicons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { useAudioPlayer, setAudioModeAsync } from 'expo-audio';
 
 import { Beacon, RADIUS } from '@/constants/beacon';
 import { DetailHeader, Callout, PillButton } from '@/components/beacon/kit';
 import { RINGTONES, DEFAULT_RINGTONE, ringtoneSource, RingtoneId } from '@/constants/ringtones';
+// expo-audio is loaded lazily (see utils/ringtonePlayer) — importing it at the
+// top of a route file puts audio init on the app launch path and crashed the
+// Release build.
+import { createRingtonePlayer, RingtonePlayer } from '@/utils/ringtonePlayer';
 
 const CALLER_KEY = '@makeithome_fakecall_name';
 const RINGTONE_KEY = '@makeithome_fakecall_ringtone';
@@ -28,7 +31,9 @@ export default function FakeCallScreen() {
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // A single reusable player for previewing ringtones as the user taps them.
-  const preview = useAudioPlayer();
+  // Created lazily on first preview so expo-audio never loads at app launch.
+  const previewRef = useRef<RingtonePlayer | null>(null);
+  const previewLoading = useRef<Promise<RingtonePlayer> | null>(null);
 
   useEffect(() => {
     AsyncStorage.getItem(CALLER_KEY).then(v => {
@@ -37,28 +42,35 @@ export default function FakeCallScreen() {
     AsyncStorage.getItem(RINGTONE_KEY).then(v => {
       if (v && RINGTONES.some(r => r.id === v)) setRingtone(v as RingtoneId);
     });
-    setAudioModeAsync({ playsInSilentMode: true, shouldPlayInBackground: false }).catch(() => {});
     return () => {
       if (timer.current) clearInterval(timer.current);
-      try { preview.pause(); } catch {}
+      previewRef.current?.release();
+      previewRef.current = null;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const pickRingtone = (id: RingtoneId) => {
+  const pickRingtone = async (id: RingtoneId) => {
     setRingtone(id);
     AsyncStorage.setItem(RINGTONE_KEY, id).catch(() => {});
     try {
-      preview.loop = false;
-      preview.replace(ringtoneSource(id));
-      preview.play();
-    } catch {}
+      if (!previewRef.current) {
+        if (!previewLoading.current) {
+          previewLoading.current = createRingtonePlayer(ringtoneSource(id));
+        }
+        previewRef.current = await previewLoading.current;
+      } else {
+        previewRef.current.replace(ringtoneSource(id));
+      }
+      previewRef.current.playOnce();
+    } catch {
+      // preview is best-effort
+    }
   };
 
   const ring = () => {
     const name = caller.trim() || 'Mom';
     AsyncStorage.setItem(CALLER_KEY, name).catch(() => {});
-    try { preview.pause(); } catch {}
+    try { previewRef.current?.stop(); } catch {}
     router.push({ pathname: '/incoming-call', params: { caller: name, ringtone } });
   };
 
