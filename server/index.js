@@ -391,7 +391,8 @@ app.use(async (req, res, next) => {
     req.path === '/privacy' ||
     req.path === '/terms' ||
     req.path.startsWith('/media/') ||
-    req.path.startsWith('/live/')
+    req.path.startsWith('/live/') ||
+    req.path.startsWith('/ack/')
   ) return next();
   const token = req.headers['x-mih-key'];
   if (!token) return res.status(401).json({ error: 'Unauthorized.' });
@@ -758,37 +759,162 @@ async function sessionDel(sessionId) {
   }
 }
 
+// ── Staged escalation ─────────────────────────────────────────────────────────
+// A session carries an ordered list of tiers, each { name, waitMinutes, phones,
+// alertedAt }. Tier 0 is alerted at /session/start; a background sweep climbs to
+// each later tier once (previous tier's alertedAt + waitMinutes) has elapsed and
+// no one has acknowledged. A responder tapping "I'm on my way" acks the session,
+// which halts the climb.
+function clampWait(m) {
+  const n = Number(m);
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return Math.min(120, Math.round(n));
+}
+function cleanTierName(s) {
+  const t = String(s ?? '').trim().slice(0, 40);
+  return t || 'Responders';
+}
+function sessionBody(name, liveLink) {
+  const who = name ? `${name} needs help` : 'Someone needs help';
+  return `🚨 EMERGENCY — ${who}! Open Make It Home NOW.\n\nTrack live: ${liveLink}\n\nReply STOP to opt out.`;
+}
+function sessionBodyEscalated(name, liveLink) {
+  const who = name ? `${name} still needs help` : 'Someone still needs help';
+  return `🚨 EMERGENCY — ${who} — no one has responded yet. Open Make It Home NOW.\n\nTrack live: ${liveLink}\n\nReply STOP to opt out.`;
+}
+
+// Validate the client's tier grouping against the device's stored circle, drop
+// empty tiers, and apply the daily cap on the union. Falls back to a single
+// "everyone at once" tier when no usable grouping was sent.
+async function buildTiers(req, clientTiers, flatPhones) {
+  const token = String(req.headers['x-mih-key'] || '');
+  const stored = await getCircle(token);
+  if (!stored.length) {
+    return { status: 400, error: 'No safety circle on file for this device. Add contacts and try again.' };
+  }
+  const inCircle = new Set(stored);
+
+  let groups;
+  if (Array.isArray(clientTiers) && clientTiers.length) {
+    groups = clientTiers
+      .map(t => ({
+        name: cleanTierName(t?.name),
+        waitMinutes: clampWait(t?.waitMinutes),
+        phones: Array.isArray(t?.phones) ? [...new Set(t.phones.filter(p => inCircle.has(p)))] : [],
+      }))
+      .filter(g => g.phones.length);
+  }
+  if (!groups || !groups.length) {
+    let recipients = stored;
+    if (Array.isArray(flatPhones) && flatPhones.length) {
+      const inter = flatPhones.filter(p => inCircle.has(p));
+      if (inter.length) recipients = inter;
+    }
+    groups = [{ name: 'Everyone', waitMinutes: 0, phones: [...new Set(recipients)] }];
+  }
+
+  const union = [...new Set(groups.flatMap(g => g.phones))];
+  const count = await incrDailyCount(token, union.length);
+  if (count > DAILY_CAP) {
+    return { status: 429, error: 'Daily message limit reached for this device.' };
+  }
+  groups.forEach(g => { g.alertedAt = null; });
+  return { tiers: groups };
+}
+
+// Returns [sessionId, session] for every live session (redis or in-memory).
+async function allSessions() {
+  const out = [];
+  if (redis) {
+    for (const key of await redisScanAll(`${SESSION_PREFIX}*`)) {
+      const s = await redisGet(key);
+      if (s) out.push([key.slice(SESSION_PREFIX.length), s]);
+    }
+  } else {
+    for (const [sid, s] of sessionsMemory) out.push([sid, s]);
+  }
+  return out;
+}
+
+// One pass over live sessions, alerting the next due tier of any unacknowledged
+// session. Idempotent per tier (guarded by alertedAt). Survives restarts because
+// session state (including alertedAt) lives in redis.
+async function escalationSweep() {
+  const sessions = await allSessions();
+  const now = Date.now();
+  for (const [sessionId, s] of sessions) {
+    if (!s || !Array.isArray(s.tiers) || s.acknowledged) continue;
+    let lastAlerted = -1;
+    for (let i = 0; i < s.tiers.length; i++) if (s.tiers[i].alertedAt) lastAlerted = i;
+    const nextIdx = lastAlerted + 1;
+    if (lastAlerted < 0 || nextIdx >= s.tiers.length) continue;
+    const prev = s.tiers[lastAlerted];
+    const next = s.tiers[nextIdx];
+    const dueAt = (prev.alertedAt || now) + (Number(next.waitMinutes) || 0) * 60000;
+    if (now < dueAt) continue;
+
+    const liveLink = `${SERVER_URL}/live/${sessionId}`;
+    const result = await sendSmsToAll(next.phones, sessionBodyEscalated(s.name, liveLink));
+    next.alertedAt = Date.now();
+    await sessionSet(sessionId, s);
+    console.log(
+      `[escalation] ${sessionId}: alerted tier ${nextIdx + 1} "${next.name}" ${result.sent}/${next.phones.length}.`,
+    );
+  }
+}
+
+let sweepRunning = false;
+setInterval(async () => {
+  if (sweepRunning) return;
+  sweepRunning = true;
+  try { await escalationSweep(); } catch (e) { console.error('[escalation] sweep error:', e?.message || e); }
+  finally { sweepRunning = false; }
+}, 15000);
+
 // POST /session/start
 app.post('/session/start', async (req, res) => {
-  const { sessionId, phones, name, latitude, longitude } = req.body;
+  const { sessionId, phones, name, latitude, longitude, tiers: clientTiers } = req.body;
   if (!sessionId) {
     return res.status(400).json({ error: 'sessionId is required.' });
   }
   const coordErr = validateCoords(latitude, longitude);
   if (coordErr) return res.status(400).json({ error: coordErr });
-  const r = await recipientsFor(req, phones);
-  if (r.error) return res.status(r.status).json({ error: r.error });
-  const recipients = r.recipients;
+
+  // Build validated, tier-grouped recipients (falls back to one all-at-once tier).
+  const built = await buildTiers(req, clientTiers, phones);
+  if (built.error) return res.status(built.status).json({ error: built.error });
+  const tiers = built.tiers;
   const nm = cleanName(name);
 
   // Bind this session to the creating device so only it can update/end it.
   const ownerToken = String(req.headers['x-mih-key'] || '');
-  await sessionSet(sessionId, { name: nm, phones: recipients, latitude: latitude ?? null, longitude: longitude ?? null, ownerToken, updatedAt: Date.now() });
+  const now = Date.now();
+  tiers[0].alertedAt = now; // first tier is alerted immediately, below
+  await sessionSet(sessionId, {
+    name: nm,
+    latitude: latitude ?? null,
+    longitude: longitude ?? null,
+    ownerToken,
+    updatedAt: now,
+    startedAt: now,
+    tiers,
+    acknowledged: false,
+    ackedAt: null,
+  });
 
   // In-memory fallback: expire after 24h
   if (!redis) setTimeout(() => sessionsMemory.delete(sessionId), SESSION_TTL * 1000);
 
   const liveLink = `${SERVER_URL}/live/${sessionId}`;
-  const who = nm ? `${nm} needs help` : 'Someone needs help';
-  const body = `🚨 EMERGENCY — ${who}! Open Make It Home NOW.\n\nTrack live: ${liveLink}\n\nReply STOP to opt out.`;
-
-  const result = await sendSmsToAll(recipients, body);
+  const result = await sendSmsToAll(tiers[0].phones, sessionBody(nm, liveLink));
   if (result.sent === 0) {
-    console.error(`[/session/start] ${sessionId} all sends failed:`, result.errors.join('; '));
+    console.error(`[/session/start] ${sessionId} tier1 all sends failed:`, result.errors.join('; '));
     return res.status(500).json({ error: 'Could not reach any contact.', sessionId, liveLink, failed: result.failed });
   }
-  console.log(`[/session/start] Started ${sessionId}: sent ${result.sent}/${recipients.length}, ${result.failed} failed.`);
-  res.json({ sessionId, liveLink, sent: result.sent, failed: result.failed });
+  console.log(
+    `[/session/start] Started ${sessionId}: tier1 sent ${result.sent}/${tiers[0].phones.length}, ${result.failed} failed; ${tiers.length} tier(s).`,
+  );
+  res.json({ sessionId, liveLink, sent: result.sent, failed: result.failed, tiers: tiers.length });
 });
 
 // POST /session/update
@@ -822,16 +948,35 @@ app.post('/session/end', async (req, res) => {
   res.json({ ended: true });
 });
 
+// POST /ack/:sessionId
+// A responder tapping "I'm on my way" on the live page acknowledges the session,
+// which halts the escalation climb (no further tiers are alerted). Public (no
+// auth) — it's reached from the live link, guarded only by knowing the
+// unguessable sessionId. A POST (form submit), never a GET, so SMS/link-preview
+// prefetchers can't acknowledge by accident.
+app.post('/ack/:sessionId', async (req, res) => {
+  const sessionId = req.params.sessionId;
+  const session = await sessionGet(sessionId);
+  if (session && !session.acknowledged) {
+    session.acknowledged = true;
+    session.ackedAt = Date.now();
+    await sessionSet(sessionId, session);
+    console.log(`[ack] ${sessionId} acknowledged — escalation halted.`);
+  }
+  res.redirect(303, `/live/${sessionId}`);
+});
+
 // GET /live/:sessionId
 app.get('/live/:sessionId', async (req, res) => {
-  const session = await sessionGet(req.params.sessionId);
+  const sessionId = req.params.sessionId;
+  const session = await sessionGet(sessionId);
   if (!session) {
     return res.status(404).send(
       `<html><body style="background:#0a0a0a;color:#666;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;font-size:18px;">Session not found or expired.</body></html>`,
     );
   }
 
-  const { name, latitude, longitude, updatedAt } = session;
+  const { name, latitude, longitude, updatedAt, acknowledged } = session;
   const safeName = escapeHtml(name || '');
   const displayName = safeName || 'Your contact';
   const displayTitle = safeName || 'Someone';
@@ -844,6 +989,14 @@ app.get('/live/:sessionId', async (req, res) => {
   const coordsText = hasCoords
     ? `${Number(latitude).toFixed(5)}, ${Number(longitude).toFixed(5)}`
     : 'Location pending…';
+  const ackPath = `/ack/${encodeURIComponent(sessionId)}`;
+
+  // When acknowledged, later responders see it's handled and the button is gone.
+  const respondBlock = acknowledged
+    ? `<div class="acked">✓ Someone is on their way</div>`
+    : `<form method="POST" action="${ackPath}" style="margin-top:16px">
+    <button class="ack" type="submit">I&#x27;m on my way — stop alerting others</button>
+  </form>`;
 
   res.send(`<!DOCTYPE html>
 <html>
@@ -859,8 +1012,11 @@ app.get('/live/:sessionId', async (req, res) => {
     @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
     .live{color:#dc2626;font-size:12px;font-weight:700;letter-spacing:1px;text-transform:uppercase;margin-bottom:20px;display:flex;align-items:center;justify-content:center}
     .name{font-size:34px;font-weight:bold;margin-bottom:6px}
-    .sub{color:#555;font-size:14px;margin-bottom:40px}
+    .sub{color:#555;font-size:14px;margin-bottom:36px}
     .btn{display:inline-block;background:#dc2626;color:#fff;text-decoration:none;padding:18px 40px;border-radius:14px;font-size:18px;font-weight:bold}
+    .ack{display:inline-block;background:#166534;color:#fff;border:none;padding:16px 28px;border-radius:14px;font-size:16px;font-weight:bold;cursor:pointer;line-height:1.3;max-width:320px}
+    .ack:active{opacity:.85}
+    .acked{margin-top:16px;color:#4ade80;font-size:16px;font-weight:700;background:rgba(22,101,52,0.18);border:1px solid #166534;padding:14px 22px;border-radius:12px}
     .meta{color:#333;font-size:11px;margin-top:24px;line-height:1.8;font-variant-numeric:tabular-nums}
   </style>
 </head>
@@ -869,6 +1025,7 @@ app.get('/live/:sessionId', async (req, res) => {
   <div class="name">${displayName}</div>
   <div class="sub">needs help — tap to navigate</div>
   <a class="btn" href="${mapsUrl}">Open in Maps</a>
+  ${respondBlock}
   <div class="meta">
     ${coordsText}<br>
     Updated ${agoText} &middot; refreshes every 30s

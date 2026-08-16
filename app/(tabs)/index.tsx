@@ -24,6 +24,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { getServerUrl, getUserName, fetchWithAuth, randomId, syncCircle } from '@/utils/serverUrl';
 import { Beacon } from '@/constants/beacon';
 import { PillButton } from '@/components/beacon/kit';
+import { ESCALATION_TIERS_KEY, DEFAULT_TIERS, Tier, tierIdFor } from '@/constants/escalation';
 
 // Shown when a permission isn't granted. If it was previously blocked, the OS
 // won't show its own dialog again (canAskAgain === false) — so offer a route to
@@ -102,6 +103,32 @@ async function getSafetyCirclePhones(): Promise<string[]> {
   const raw = await AsyncStorage.getItem(SAFETY_CIRCLE_KEY);
   const circle = raw ? JSON.parse(raw) : [];
   return circle.map((c: any) => c.phone).filter(Boolean);
+}
+
+// Group the circle by escalation tier for staged alerting. Returns null when
+// there's no usable grouping (the server then alerts everyone at once).
+async function getEscalationTiers(): Promise<
+  { name: string; waitMinutes: number; phones: string[] }[] | null
+> {
+  const [rawCircle, rawTiers] = await Promise.all([
+    AsyncStorage.getItem(SAFETY_CIRCLE_KEY),
+    AsyncStorage.getItem(ESCALATION_TIERS_KEY),
+  ]);
+  const circle: any[] = rawCircle ? JSON.parse(rawCircle) : [];
+  if (!circle.length) return null;
+  const tiers: Tier[] = rawTiers ? JSON.parse(rawTiers) : DEFAULT_TIERS;
+  if (!tiers.length) return null;
+  const groups = tiers
+    .map(t => ({
+      name: t.name,
+      waitMinutes: t.waitMinutes,
+      phones: circle
+        .filter(c => tierIdFor(c.tier, tiers) === t.id)
+        .map(c => c.phone)
+        .filter(Boolean),
+    }))
+    .filter(g => g.phones.length);
+  return groups.length ? groups : null;
 }
 
 function formatTime(secs: number) {
@@ -270,7 +297,11 @@ export default function HomeScreen() {
     // send — syncCircle elsewhere is best-effort/async and the token may have
     // rotated (401 re-register), which would otherwise 400 as "no circle on file".
     await syncCircle(phones);
-    const [serverUrl, name] = await Promise.all([getServerUrl(), getUserName()]);
+    const [serverUrl, name, tiers] = await Promise.all([
+      getServerUrl(),
+      getUserName(),
+      getEscalationTiers(),
+    ]);
     const sessionId = sessionIdRef.current;
     lastLocationUpdateRef.current = Date.now();
     try {
@@ -280,6 +311,9 @@ export default function HomeScreen() {
         body: JSON.stringify({
           sessionId,
           phones,
+          // Staged escalation: first tier is alerted now, later tiers climb if
+          // no one responds. Null → server alerts the whole circle at once.
+          tiers,
           name,
           // May be null when we alert before a GPS fix — the live page shows
           // "Location pending…" and updates as fixes arrive.
