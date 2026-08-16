@@ -1,27 +1,29 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { View, Text, Pressable, StyleSheet, Vibration, Platform, AppState } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
+import { StatusBar } from 'expo-status-bar';
 import Ionicons from '@expo/vector-icons/Ionicons';
 import { useAudioPlayer, setAudioModeAsync } from 'expo-audio';
 
-import { Beacon, initials } from '@/constants/beacon';
+import { initials } from '@/constants/beacon';
+import { ringtoneSource } from '@/constants/ringtones';
 
-// A convincing fake incoming call the user can trigger to create a reason to
-// leave a situation. Full-screen, outside the tab bar. Rings (looping tone +
-// vibration) until answered or declined; answering shows a running call timer.
-const RING = require('../assets/sounds/ringtone.wav');
+// A convincing fake incoming call the user can trigger to create a natural
+// reason to leave a situation. Full-screen, outside the tab bar. Styled to match
+// a real iOS call. Rings (looping tone + vibration) until answered or declined;
+// answering shows a running call timer.
 const VIBRATION_PATTERN = Platform.OS === 'ios' ? [0, 1000, 2000] : [0, 700, 1000, 700, 2000];
 
 export default function IncomingCallScreen() {
   const router = useRouter();
-  const params = useLocalSearchParams<{ caller?: string; sub?: string }>();
+  const params = useLocalSearchParams<{ caller?: string; sub?: string; ringtone?: string }>();
   const caller = (typeof params.caller === 'string' && params.caller.trim()) || 'Mom';
   const sub = (typeof params.sub === 'string' && params.sub.trim()) || 'mobile';
 
   const [answered, setAnswered] = useState(false);
   const [seconds, setSeconds] = useState(0);
 
-  const player = useAudioPlayer(RING);
+  const player = useAudioPlayer(ringtoneSource(params.ringtone));
   const ringingRef = useRef(true);
 
   // Start ringing on mount.
@@ -65,7 +67,6 @@ export default function IncomingCallScreen() {
     try { player.pause(); } catch {}
   }
 
-  // Call timer once answered.
   useEffect(() => {
     if (!answered) return;
     const id = setInterval(() => setSeconds(s => s + 1), 1000);
@@ -87,18 +88,20 @@ export default function IncomingCallScreen() {
 
   return (
     <View style={styles.root}>
-      {/* Caller identity */}
+      <StatusBar hidden />
+
+      {/* Caller identity — matches iOS: big name, small gray subtitle, no app label */}
       <View style={styles.header}>
         <View style={styles.avatar}>
           <Text style={styles.avatarText}>{initials(caller)}</Text>
         </View>
         <Text style={styles.caller}>{caller}</Text>
-        <Text style={styles.sub}>{answered ? clock : `${sub} · Make It Home Audio`}</Text>
+        <Text style={styles.sub}>{answered ? clock : sub}</Text>
       </View>
 
       {answered ? (
-        <>
-          {/* Decorative in-call controls */}
+        <View style={styles.activeBottom}>
+          {/* In-call control grid */}
           <View style={styles.grid}>
             {[
               { icon: 'mic-off', label: 'mute' },
@@ -110,32 +113,52 @@ export default function IncomingCallScreen() {
             ].map(c => (
               <View key={c.label} style={styles.gridItem}>
                 <View style={styles.ctrl}>
-                  <Ionicons name={c.icon as any} size={26} color="#fff" />
+                  <Ionicons name={c.icon as any} size={28} color="#fff" />
                 </View>
                 <Text style={styles.ctrlLabel}>{c.label}</Text>
               </View>
             ))}
           </View>
-          <View style={styles.endWrap}>
-            <Pressable style={[styles.round, styles.decline]} onPress={end} hitSlop={8}>
-              <Ionicons name="call" size={32} color="#fff" style={{ transform: [{ rotate: '135deg' }] }} />
-            </Pressable>
-            <Text style={styles.actLabel}>end</Text>
+          <View style={styles.endRow}>
+            <View style={styles.actionCol}>
+              <Pressable style={[styles.round, styles.decline]} onPress={end} hitSlop={8}>
+                <Ionicons name="call" size={32} color="#fff" style={styles.phoneDown} />
+              </Pressable>
+            </View>
           </View>
-        </>
+        </View>
       ) : (
-        <View style={styles.answerRow}>
-          <View style={styles.answerCol}>
-            <Pressable style={[styles.round, styles.decline]} onPress={end} hitSlop={8}>
-              <Ionicons name="call" size={34} color="#fff" style={{ transform: [{ rotate: '135deg' }] }} />
-            </Pressable>
-            <Text style={styles.actLabel}>Decline</Text>
+        <View style={styles.ringBottom}>
+          {/* Secondary actions, like iOS */}
+          <View style={styles.secondaryRow}>
+            <View style={styles.actionCol}>
+              <Pressable style={styles.small} onPress={end} hitSlop={8}>
+                <Ionicons name="alarm" size={26} color="#fff" />
+              </Pressable>
+              <Text style={styles.smallLabel}>Remind Me</Text>
+            </View>
+            <View style={styles.actionCol}>
+              <Pressable style={styles.small} onPress={end} hitSlop={8}>
+                <Ionicons name="chatbubble" size={24} color="#fff" />
+              </Pressable>
+              <Text style={styles.smallLabel}>Message</Text>
+            </View>
           </View>
-          <View style={styles.answerCol}>
-            <Pressable style={[styles.round, styles.accept]} onPress={answer} hitSlop={8}>
-              <Ionicons name="call" size={34} color="#fff" />
-            </Pressable>
-            <Text style={styles.actLabel}>Accept</Text>
+
+          {/* Decline / Accept */}
+          <View style={styles.answerRow}>
+            <View style={styles.actionCol}>
+              <Pressable style={[styles.round, styles.decline]} onPress={end} hitSlop={8}>
+                <Ionicons name="call" size={34} color="#fff" style={styles.phoneDown} />
+              </Pressable>
+              <Text style={styles.actLabel}>Decline</Text>
+            </View>
+            <View style={styles.actionCol}>
+              <Pressable style={[styles.round, styles.accept]} onPress={answer} hitSlop={8}>
+                <Ionicons name="call" size={34} color="#fff" />
+              </Pressable>
+              <Text style={styles.actLabel}>Accept</Text>
+            </View>
           </View>
         </View>
       )}
@@ -146,44 +169,60 @@ export default function IncomingCallScreen() {
 const styles = StyleSheet.create({
   root: {
     flex: 1,
-    backgroundColor: '#0a0d12',
-    paddingHorizontal: 28,
-    paddingTop: 96,
-    paddingBottom: 56,
+    backgroundColor: '#1c1c1e',
+    paddingHorizontal: 40,
+    paddingTop: 84,
+    paddingBottom: 52,
     justifyContent: 'space-between',
   },
-  header: { alignItems: 'center', gap: 10 },
+  header: { alignItems: 'center', gap: 8 },
   avatar: {
-    width: 116,
-    height: 116,
-    borderRadius: 58,
-    backgroundColor: '#2a3441',
+    width: 108,
+    height: 108,
+    borderRadius: 54,
+    backgroundColor: '#3a3a3c',
     alignItems: 'center',
     justifyContent: 'center',
-    marginBottom: 12,
+    marginBottom: 16,
   },
-  avatarText: { color: '#fff', fontSize: 40, fontWeight: '600' },
-  caller: { color: '#fff', fontSize: 34, fontWeight: '600', letterSpacing: 0.3 },
-  sub: { color: '#aab4c2', fontSize: 15, fontVariant: ['tabular-nums'] },
+  avatarText: { color: '#fff', fontSize: 42, fontWeight: '400' },
+  caller: { color: '#fff', fontSize: 38, fontWeight: '400', letterSpacing: 0.2 },
+  sub: { color: '#c7c7cc', fontSize: 17, fontVariant: ['tabular-nums'] },
 
-  grid: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', gap: 26, marginVertical: 8 },
-  gridItem: { width: 84, alignItems: 'center', gap: 7 },
+  // Ringing bottom
+  ringBottom: { gap: 34 },
+  secondaryRow: { flexDirection: 'row', justifyContent: 'space-between', paddingHorizontal: 6 },
+  answerRow: { flexDirection: 'row', justifyContent: 'space-between', paddingHorizontal: 2 },
+
+  // Active bottom
+  activeBottom: { gap: 30 },
+  grid: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', rowGap: 22 },
+  gridItem: { width: '33.33%', alignItems: 'center', gap: 8 },
   ctrl: {
-    width: 68,
-    height: 68,
-    borderRadius: 34,
-    backgroundColor: 'rgba(255,255,255,0.12)',
+    width: 72,
+    height: 72,
+    borderRadius: 36,
+    backgroundColor: 'rgba(255,255,255,0.14)',
     alignItems: 'center',
     justifyContent: 'center',
   },
-  ctrlLabel: { color: '#cfd6e0', fontSize: 12 },
+  ctrlLabel: { color: '#fff', fontSize: 13 },
+  endRow: { alignItems: 'center', marginTop: 4 },
 
-  answerRow: { flexDirection: 'row', justifyContent: 'space-between', paddingHorizontal: 12 },
-  answerCol: { alignItems: 'center', gap: 12 },
-  endWrap: { alignItems: 'center', gap: 12 },
+  actionCol: { alignItems: 'center', gap: 11 },
+  small: {
+    width: 64,
+    height: 64,
+    borderRadius: 32,
+    backgroundColor: 'rgba(255,255,255,0.18)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  smallLabel: { color: '#fff', fontSize: 13 },
 
-  round: { width: 74, height: 74, borderRadius: 37, alignItems: 'center', justifyContent: 'center' },
-  accept: { backgroundColor: '#34c759' },
+  round: { width: 76, height: 76, borderRadius: 38, alignItems: 'center', justifyContent: 'center' },
+  accept: { backgroundColor: '#30d158' },
   decline: { backgroundColor: '#ff3b30' },
-  actLabel: { color: '#fff', fontSize: 14 },
+  phoneDown: { transform: [{ rotate: '135deg' }] },
+  actLabel: { color: '#fff', fontSize: 15 },
 });

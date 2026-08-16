@@ -2,12 +2,16 @@ import React, { useEffect, useRef, useState } from 'react';
 import { View, Text, TextInput, StyleSheet, Pressable, ScrollView } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
+import Ionicons from '@expo/vector-icons/Ionicons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { useAudioPlayer, setAudioModeAsync } from 'expo-audio';
 
 import { Beacon, RADIUS } from '@/constants/beacon';
 import { DetailHeader, Callout, PillButton } from '@/components/beacon/kit';
+import { RINGTONES, DEFAULT_RINGTONE, ringtoneSource, RingtoneId } from '@/constants/ringtones';
 
 const CALLER_KEY = '@makeithome_fakecall_name';
+const RINGTONE_KEY = '@makeithome_fakecall_ringtone';
 const DELAYS = [
   { label: 'Now', seconds: 0 },
   { label: '10s', seconds: 10 },
@@ -19,22 +23,43 @@ export default function FakeCallScreen() {
   const router = useRouter();
   const [caller, setCaller] = useState('Mom');
   const [delay, setDelay] = useState(0);
+  const [ringtone, setRingtone] = useState<RingtoneId>(DEFAULT_RINGTONE);
   const [countdown, setCountdown] = useState<number | null>(null);
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // A single reusable player for previewing ringtones as the user taps them.
+  const preview = useAudioPlayer();
 
   useEffect(() => {
     AsyncStorage.getItem(CALLER_KEY).then(v => {
       if (v) setCaller(v);
     });
+    AsyncStorage.getItem(RINGTONE_KEY).then(v => {
+      if (v && RINGTONES.some(r => r.id === v)) setRingtone(v as RingtoneId);
+    });
+    setAudioModeAsync({ playsInSilentMode: true, shouldPlayInBackground: false }).catch(() => {});
     return () => {
       if (timer.current) clearInterval(timer.current);
+      try { preview.pause(); } catch {}
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  const pickRingtone = (id: RingtoneId) => {
+    setRingtone(id);
+    AsyncStorage.setItem(RINGTONE_KEY, id).catch(() => {});
+    try {
+      preview.loop = false;
+      preview.replace(ringtoneSource(id));
+      preview.play();
+    } catch {}
+  };
 
   const ring = () => {
     const name = caller.trim() || 'Mom';
     AsyncStorage.setItem(CALLER_KEY, name).catch(() => {});
-    router.push({ pathname: '/incoming-call', params: { caller: name } });
+    try { preview.pause(); } catch {}
+    router.push({ pathname: '/incoming-call', params: { caller: name, ringtone } });
   };
 
   const start = () => {
@@ -99,6 +124,32 @@ export default function FakeCallScreen() {
           returnKeyType="done"
         />
 
+        <Text style={styles.label}>Ringtone</Text>
+        <View style={styles.ringtoneList}>
+          {RINGTONES.map(r => {
+            const on = ringtone === r.id;
+            return (
+              <Pressable
+                key={r.id}
+                onPress={() => pickRingtone(r.id)}
+                style={[styles.ringRow, on && styles.ringRowOn]}
+              >
+                <Ionicons
+                  name={on ? 'radio-button-on' : 'radio-button-off'}
+                  size={20}
+                  color={on ? Beacon.beacon : Beacon.faint}
+                />
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.ringName}>{r.label}</Text>
+                  <Text style={styles.ringHint}>{r.hint}</Text>
+                </View>
+                <Ionicons name="volume-medium-outline" size={18} color={Beacon.muted} />
+              </Pressable>
+            );
+          })}
+        </View>
+        <Text style={styles.hintLine}>Tap a ringtone to hear it. This is what plays when the call comes in.</Text>
+
         <Text style={styles.label}>When?</Text>
         <View style={styles.chips}>
           {DELAYS.map(d => {
@@ -143,6 +194,22 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
     paddingVertical: 13,
   },
+  ringtoneList: { gap: 8 },
+  ringRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    backgroundColor: Beacon.surface,
+    borderWidth: 1,
+    borderColor: Beacon.line,
+    borderRadius: RADIUS.field,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+  },
+  ringRowOn: { borderColor: Beacon.beacon, backgroundColor: Beacon.surface2 },
+  ringName: { color: Beacon.text, fontSize: 15.5, fontWeight: '600' },
+  ringHint: { color: Beacon.muted, fontSize: 12.5, marginTop: 1 },
+  hintLine: { color: Beacon.faint, fontSize: 12, marginTop: 8, lineHeight: 17 },
   chips: { flexDirection: 'row', gap: 10 },
   chip: {
     flex: 1,
