@@ -161,6 +161,8 @@ export default function HomeScreen() {
   const lastLocationUpdateRef = useRef(0);
   const isRecordingRef = useRef(false);
   const goLiveFallbackRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const frameTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const frameActiveRef = useRef(false);
 
   // Check-in state
   const [checkInActive, setCheckInActive] = useState(false);
@@ -342,7 +344,7 @@ export default function HomeScreen() {
     });
   };
 
-  const uploadRecording = async (videoUri: string) => {
+  const uploadRecording = async (videoUri: string, sessionId?: string | null) => {
     const phones = await getSafetyCirclePhones();
     if (phones.length === 0) return;
     await syncCircle(phones); // guarantee the server has this circle under the current token
@@ -351,6 +353,9 @@ export default function HomeScreen() {
     const formData = new FormData();
     formData.append('video', { uri: videoUri, type: 'video/mp4', name: 'recording.mp4' } as any);
     formData.append('phones', JSON.stringify(phones));
+    // Tie the recording to its session so the responder's live page can offer a
+    // "Download recording" link once it lands.
+    if (sessionId) formData.append('sessionId', sessionId);
     try {
       const res = await fetchWithAuth(`${serverUrl}/upload`, { method: 'POST', body: formData });
       if (res.ok) setNotifyStatus('uploaded');
@@ -586,15 +591,58 @@ export default function HomeScreen() {
     }
   };
 
+  // ── Live snapshots ─────────────────────────────────────────────────────────
+  // While recording, push a low-res frame to the server every ~1.8s so a
+  // responder can see a near-live view on the live page. Best-effort: if a
+  // capture fails (e.g. mid-recording on some devices) we just skip that frame;
+  // the full video keeps recording and saving regardless.
+  const startFrameLoop = (sessionId: string) => {
+    if (frameActiveRef.current || IS_WEB) return;
+    frameActiveRef.current = true;
+    const loop = async () => {
+      if (!frameActiveRef.current) return;
+      const cam = cameraRef.current;
+      if (cam) {
+        try {
+          const pic = await cam.takePictureAsync({ base64: true, quality: 0.25, shutterSound: false });
+          if (pic?.base64 && frameActiveRef.current) {
+            const serverUrl = await getServerUrl();
+            await fetchWithAuth(`${serverUrl}/frame/${sessionId}`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'text/plain' },
+              body: pic.base64,
+            }).catch(() => {});
+          }
+        } catch {
+          // capture can reject mid-recording on some devices — skip this frame
+        }
+      }
+      if (frameActiveRef.current) frameTimerRef.current = setTimeout(loop, 1800);
+    };
+    // Small initial delay so recording settles before the first capture.
+    frameTimerRef.current = setTimeout(loop, 1200);
+  };
+
+  const stopFrameLoop = () => {
+    frameActiveRef.current = false;
+    if (frameTimerRef.current) {
+      clearTimeout(frameTimerRef.current);
+      frameTimerRef.current = null;
+    }
+  };
+
   const handleCameraReady = async () => {
     if (isRecordingRef.current) return;
     isRecordingRef.current = true;
     setIsRecording(true);
+    // Capture the session id now — handleEnd clears it before recordAsync resolves.
+    const sessionId = sessionIdRef.current;
+    if (sessionId) startFrameLoop(sessionId);
     try {
       const video = await cameraRef.current?.recordAsync();
       if (video?.uri) {
         await saveToCameraRoll(video.uri); // keep a copy on the device
-        await uploadRecording(video.uri); // send it to the safety circle
+        await uploadRecording(video.uri, sessionId); // send it to the safety circle
       }
     } catch {
       // stopRecording rejects the promise on some platforms — not a real error
@@ -619,6 +667,7 @@ export default function HomeScreen() {
       clearTimeout(goLiveFallbackRef.current);
       goLiveFallbackRef.current = null;
     }
+    stopFrameLoop();
     cameraRef.current?.stopRecording();
     locationSub.current?.remove();
     locationSub.current = null;

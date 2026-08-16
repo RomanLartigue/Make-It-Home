@@ -392,7 +392,8 @@ app.use(async (req, res, next) => {
     req.path === '/terms' ||
     req.path.startsWith('/media/') ||
     req.path.startsWith('/live/') ||
-    req.path.startsWith('/ack/')
+    req.path.startsWith('/ack/') ||
+    (req.method === 'GET' && req.path.startsWith('/frame/'))
   ) return next();
   const token = req.headers['x-mih-key'];
   if (!token) return res.status(401).json({ error: 'Unauthorized.' });
@@ -640,6 +641,19 @@ app.post('/upload', (req, res, next) => {
     return res.status(500).json({ error: 'Could not reach any contact.', failed });
   }
   console.log(`[/upload] Sent MMS ${sent}/${recipients.length}, ${failed} failed. Media: ${mediaUrl}`);
+
+  // Attach the recording to its session so the responder's live page can offer a
+  // "Download recording" link (the user already has a local copy in their roll).
+  const sessionId = req.body.sessionId;
+  if (sessionId) {
+    const token = String(req.headers['x-mih-key'] || '');
+    const session = await sessionGet(sessionId);
+    if (session && (!session.ownerToken || session.ownerToken === token)) {
+      session.recordingUrl = mediaUrl;
+      await sessionSet(sessionId, session);
+    }
+  }
+
   // Cleanup is handled by delete-on-fetch (the /media route) plus the boot sweep,
   // which survive a restart — the old per-file setTimeout did not.
   res.json({ sent, failed, mediaUrl });
@@ -737,6 +751,11 @@ app.post('/checkin/extend', async (req, res) => {
 // ── Live session tracking ─────────────────────────────────────────────────────
 // Sessions are stored in Redis (with 24h TTL) when available, in-memory otherwise.
 const sessionsMemory = new Map(); // fallback when Redis is not configured
+
+// Latest live camera frame per session, for the responder's near-live view.
+// Deliberately in-memory only and latest-only: frames are transient, high-churn
+// (~1 every 2s), and worthless after the session ends. sessionId → { buf, at }.
+const liveFrames = new Map();
 
 async function sessionSet(sessionId, data) {
   if (redis) {
@@ -865,6 +884,10 @@ async function escalationSweep() {
 
 let sweepRunning = false;
 setInterval(async () => {
+  // Drop live frames from sessions that ended or went quiet (>3 min stale).
+  const cutoff = Date.now() - 3 * 60 * 1000;
+  for (const [sid, f] of liveFrames) if (f.at < cutoff) liveFrames.delete(sid);
+
   if (sweepRunning) return;
   sweepRunning = true;
   try { await escalationSweep(); } catch (e) { console.error('[escalation] sweep error:', e?.message || e); }
@@ -944,8 +967,54 @@ app.post('/session/end', async (req, res) => {
     return res.status(403).json({ error: 'Forbidden.' });
   }
   await sessionDel(sessionId);
+  liveFrames.delete(sessionId);
   console.log(`[/session/end] Ended session ${sessionId}.`);
   res.json({ ended: true });
+});
+
+// ── Live camera frames ────────────────────────────────────────────────────────
+// The go-live device POSTs a low-res JPEG (base64 in a text/plain body) every
+// ~2s; the responder's live page polls GET /frame to show a near-live view.
+// Latest-only and in-memory (frames are transient). POST is owner-authenticated
+// by X-MIH-Key + session owner; GET is public, guarded by the unguessable
+// sessionId like the live page itself.
+app.post('/frame/:sessionId', express.text({ type: '*/*', limit: '5mb' }), async (req, res) => {
+  const sessionId = req.params.sessionId;
+  const session = await sessionGet(sessionId);
+  if (!session) return res.status(404).json({ error: 'Session not found.' });
+  const token = String(req.headers['x-mih-key'] || '');
+  if (session.ownerToken && session.ownerToken !== token) {
+    return res.status(403).json({ error: 'Forbidden.' });
+  }
+  const b64 = typeof req.body === 'string' ? req.body : '';
+  const buf = b64 ? Buffer.from(b64, 'base64') : Buffer.alloc(0);
+  if (!buf.length || buf.length > 3 * 1024 * 1024) {
+    return res.status(400).json({ error: 'Invalid frame.' });
+  }
+  liveFrames.set(sessionId, { buf, at: Date.now() });
+  res.json({ ok: true });
+});
+
+app.get('/frame/:sessionId', (req, res) => {
+  const f = liveFrames.get(req.params.sessionId);
+  if (!f) return res.status(204).end();
+  res.set('Content-Type', 'image/jpeg');
+  res.set('Cache-Control', 'no-store');
+  res.send(f.buf);
+});
+
+// JSON state for the live page's polling: location, ack, recording, live frame.
+app.get('/live/:sessionId/state', async (req, res) => {
+  const s = await sessionGet(req.params.sessionId);
+  if (!s) return res.status(404).json({ error: 'gone' });
+  res.json({
+    lat: s.latitude ?? null,
+    lng: s.longitude ?? null,
+    updatedAt: s.updatedAt ?? null,
+    acknowledged: !!s.acknowledged,
+    recordingUrl: s.recordingUrl || null,
+    hasFrame: liveFrames.has(req.params.sessionId),
+  });
 });
 
 // POST /ack/:sessionId
@@ -990,11 +1059,12 @@ app.get('/live/:sessionId', async (req, res) => {
     ? `${Number(latitude).toFixed(5)}, ${Number(longitude).toFixed(5)}`
     : 'Location pending…';
   const ackPath = `/ack/${encodeURIComponent(sessionId)}`;
+  const sidJson = JSON.stringify(sessionId);
 
   // When acknowledged, later responders see it's handled and the button is gone.
   const respondBlock = acknowledged
     ? `<div class="acked">✓ Someone is on their way</div>`
-    : `<form method="POST" action="${ackPath}" style="margin-top:16px">
+    : `<form method="POST" action="${ackPath}" style="margin-top:14px">
     <button class="ack" type="submit">I&#x27;m on my way — stop alerting others</button>
   </form>`;
 
@@ -1002,34 +1072,75 @@ app.get('/live/:sessionId', async (req, res) => {
 <html>
 <head>
   <meta charset="utf-8">
-  <meta http-equiv="refresh" content="30">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>${displayTitle} — Make It Home</title>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
-    body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#0a0a0a;color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;padding:32px;text-align:center}
-    .dot{width:10px;height:10px;border-radius:50%;background:#dc2626;display:inline-block;margin-right:7px;animation:pulse 1.5s ease-in-out infinite}
+    body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#0a0a0a;color:#fff;display:flex;flex-direction:column;align-items:center;min-height:100vh;padding:24px 20px 40px;text-align:center}
+    .dot{width:9px;height:9px;border-radius:50%;background:#dc2626;display:inline-block;margin-right:7px;animation:pulse 1.5s ease-in-out infinite}
     @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.3}}
-    .live{color:#dc2626;font-size:12px;font-weight:700;letter-spacing:1px;text-transform:uppercase;margin-bottom:20px;display:flex;align-items:center;justify-content:center}
-    .name{font-size:34px;font-weight:bold;margin-bottom:6px}
-    .sub{color:#555;font-size:14px;margin-bottom:36px}
-    .btn{display:inline-block;background:#dc2626;color:#fff;text-decoration:none;padding:18px 40px;border-radius:14px;font-size:18px;font-weight:bold}
-    .ack{display:inline-block;background:#166534;color:#fff;border:none;padding:16px 28px;border-radius:14px;font-size:16px;font-weight:bold;cursor:pointer;line-height:1.3;max-width:320px}
+    .live{color:#dc2626;font-size:12px;font-weight:700;letter-spacing:1px;text-transform:uppercase;margin:6px 0 14px;display:flex;align-items:center;justify-content:center}
+    .videowrap{position:relative;width:100%;max-width:420px;aspect-ratio:3/4;background:#111;border:1px solid #222;border-radius:16px;overflow:hidden;margin-bottom:18px}
+    #frame{width:100%;height:100%;object-fit:cover;display:block}
+    #waiting{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#555;font-size:14px;padding:20px;text-align:center}
+    .name{font-size:30px;font-weight:bold;margin-bottom:4px}
+    .sub{color:#666;font-size:14px;margin-bottom:22px}
+    .btn{display:inline-block;background:#dc2626;color:#fff;text-decoration:none;padding:16px 36px;border-radius:14px;font-size:17px;font-weight:bold}
+    .ack{display:inline-block;background:#166534;color:#fff;border:none;padding:15px 26px;border-radius:14px;font-size:16px;font-weight:bold;cursor:pointer;line-height:1.3;max-width:320px}
     .ack:active{opacity:.85}
-    .acked{margin-top:16px;color:#4ade80;font-size:16px;font-weight:700;background:rgba(22,101,52,0.18);border:1px solid #166534;padding:14px 22px;border-radius:12px}
-    .meta{color:#333;font-size:11px;margin-top:24px;line-height:1.8;font-variant-numeric:tabular-nums}
+    .acked{margin-top:14px;color:#4ade80;font-size:16px;font-weight:700;background:rgba(22,101,52,0.18);border:1px solid #166534;padding:14px 22px;border-radius:12px}
+    .dl{display:inline-block;margin-top:14px;background:#1f2937;color:#fff;text-decoration:none;padding:14px 24px;border-radius:12px;font-size:15px;font-weight:600;border:1px solid #374151}
+    .meta{color:#444;font-size:11px;margin-top:22px;line-height:1.8;font-variant-numeric:tabular-nums}
   </style>
 </head>
 <body>
-  <div class="live"><span class="dot"></span>LIVE LOCATION</div>
+  <div class="live"><span class="dot"></span>LIVE</div>
+  <div class="videowrap">
+    <img id="frame" alt="">
+    <div id="waiting">Waiting for live video…<br>(starts when the camera is recording)</div>
+  </div>
   <div class="name">${displayName}</div>
   <div class="sub">needs help — tap to navigate</div>
-  <a class="btn" href="${mapsUrl}">Open in Maps</a>
-  ${respondBlock}
+  <a id="maps" class="btn" href="${mapsUrl}">Open in Maps</a>
+  <div id="respond">${respondBlock}</div>
+  <div id="dlwrap"></div>
   <div class="meta">
-    ${coordsText}<br>
-    Updated ${agoText} &middot; refreshes every 30s
+    <span id="coords">${coordsText}</span><br>
+    <span id="ago">Updated ${agoText}</span> &middot; live
   </div>
+  <script>
+    var SID = ${sidJson};
+    var img = document.getElementById('frame');
+    var waiting = document.getElementById('waiting');
+    img.onload = function(){ if (img.naturalWidth > 0) waiting.style.display = 'none'; };
+    img.onerror = function(){ waiting.style.display = 'flex'; };
+    function frameTick(){ img.src = '/frame/' + encodeURIComponent(SID) + '?t=' + Date.now(); }
+    frameTick();
+    setInterval(frameTick, 2000);
+
+    function fmtAgo(ms){ var s = Math.round((Date.now() - ms) / 1000); return s < 60 ? s + 's ago' : Math.round(s/60) + 'm ago'; }
+    function stateTick(){
+      fetch('/live/' + encodeURIComponent(SID) + '/state').then(function(r){ return r.ok ? r.json() : null; }).then(function(s){
+        if (!s) return;
+        if (s.lat != null && s.lng != null){
+          document.getElementById('coords').textContent = Number(s.lat).toFixed(5) + ', ' + Number(s.lng).toFixed(5);
+          document.getElementById('maps').href = 'https://maps.google.com/?q=' + s.lat + ',' + s.lng;
+        }
+        if (s.updatedAt) document.getElementById('ago').textContent = 'Updated ' + fmtAgo(s.updatedAt);
+        if (s.acknowledged) document.getElementById('respond').innerHTML = '<div class="acked">✓ Someone is on their way</div>';
+        var dl = document.getElementById('dlwrap');
+        if (s.recordingUrl && !dl.dataset.set){
+          dl.dataset.set = '1';
+          var a = document.createElement('a');
+          a.className = 'dl'; a.href = s.recordingUrl; a.textContent = '⬇ Download recording';
+          a.setAttribute('download', ''); a.setAttribute('target', '_blank');
+          dl.appendChild(a);
+        }
+      }).catch(function(){});
+    }
+    stateTick();
+    setInterval(stateTick, 5000);
+  </script>
 </body>
 </html>`);
 });
