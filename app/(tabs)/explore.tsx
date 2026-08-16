@@ -147,7 +147,7 @@ export default function SettingsScreen() {
           <SRow label="Delete my data" danger onPress={deleteMyData} right={<View />} last />
         </Card>
 
-        <Text style={styles.version}>Make It Home · v1.0.0</Text>
+        <Text style={styles.version}>Make It Home · v1.0.1</Text>
       </ScrollView>
     </SafeAreaView>
   );
