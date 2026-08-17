@@ -954,7 +954,10 @@ export default function HomeScreen() {
           <Animated.View
             style={[
               styles.beacon,
-              armed && styles.beaconArmed,
+              // Only the "armed" (hot) colour when a length is actually selected.
+              // At the centre with nothing selected, it reads as a cancel target.
+              armed && sel && styles.beaconArmed,
+              armed && !sel && styles.beaconCancel,
               {
                 transform: [
                   { translateX: beaconXY.x },
@@ -963,8 +966,10 @@ export default function HomeScreen() {
                 ],
               },
             ]}>
-            <Text style={styles.beaconText}>{armed ? (sel ? DIR[sel].label : 'Drag') : 'Hold'}</Text>
-            <Text style={styles.beaconSub}>{armed ? (sel ? 'min · release' : 'to a length') : '& drag'}</Text>
+            <Text style={styles.beaconText}>{armed ? (sel ? DIR[sel].label : 'Cancel') : 'Hold'}</Text>
+            <Text style={styles.beaconSub}>
+              {armed ? (sel ? 'min · release' : 'release here') : '& drag'}
+            </Text>
           </Animated.View>
         </GestureDetector>
       </View>
@@ -1151,6 +1156,7 @@ const styles = StyleSheet.create({
     elevation: 14,
   },
   beaconArmed: { backgroundColor: '#ff5238' },
+  beaconCancel: { backgroundColor: '#3a4655' }, // neutral: release here to cancel
   beaconText: { color: '#fff', fontWeight: '800', fontSize: 20 },
   beaconSub: { color: 'rgba(255,255,255,0.9)', fontWeight: '600', fontSize: 11, marginTop: 2 },
 
