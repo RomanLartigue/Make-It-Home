@@ -158,6 +158,7 @@ export default function HomeScreen() {
   const goLiveFallbackRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const frameTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const frameActiveRef = useRef(false);
+  const recordEndTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Check-in state
   const [checkInActive, setCheckInActive] = useState(false);
@@ -637,9 +638,19 @@ export default function HomeScreen() {
     // Capture the session id now — handleEnd clears it before recordAsync resolves.
     const sessionId = sessionIdRef.current;
     if (sessionId) startFrameLoop(sessionId);
+
+    // The chosen recording length is enforced by a wall-clock timer, NOT by
+    // recordAsync resolving — on some devices recordAsync can settle early, and
+    // we must not tear the session down the instant it does.
+    const seconds = recordDurationSecRef.current;
+    if (recordEndTimerRef.current) clearTimeout(recordEndTimerRef.current);
+    recordEndTimerRef.current = setTimeout(() => {
+      if (isRecordingRef.current) finishSession('auto');
+    }, seconds * 1000);
+
     try {
-      // maxDuration caps the video at the length the user chose on the beacon.
-      const video = await cameraRef.current?.recordAsync({ maxDuration: recordDurationSecRef.current });
+      // maxDuration is a backstop cap at the camera level.
+      const video = await cameraRef.current?.recordAsync({ maxDuration: seconds });
       if (video?.uri) {
         await saveToCameraRoll(video.uri); // keep a copy on the device
         await uploadRecording(video.uri, sessionId); // send it to the safety circle
@@ -647,9 +658,8 @@ export default function HomeScreen() {
     } catch {
       // stopRecording rejects the promise on some platforms — not a real error
     }
-    // If recording ended on its own (hit the chosen length) rather than a manual
-    // End, wrap up the session now. A manual End already cleared isRecordingRef.
-    if (isRecordingRef.current) finishSession('auto');
+    // Do NOT finish here — the wall-clock timer (or a manual End) owns the
+    // session lifecycle.
   };
 
   const sendSafeNotification = async () => {
@@ -673,6 +683,10 @@ export default function HomeScreen() {
     if (goLiveFallbackRef.current) {
       clearTimeout(goLiveFallbackRef.current);
       goLiveFallbackRef.current = null;
+    }
+    if (recordEndTimerRef.current) {
+      clearTimeout(recordEndTimerRef.current);
+      recordEndTimerRef.current = null;
     }
     stopFrameLoop();
     if (reason === 'manual') cameraRef.current?.stopRecording();
