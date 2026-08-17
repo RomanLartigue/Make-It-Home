@@ -230,8 +230,8 @@ export default function HomeScreen() {
   useEffect(() => {
     const anim = Animated.loop(
       Animated.sequence([
-        Animated.timing(livePulse, { toValue: 1.1, duration: 700, useNativeDriver: true }),
-        Animated.timing(livePulse, { toValue: 1, duration: 700, useNativeDriver: true }),
+        Animated.timing(livePulse, { toValue: 1.1, duration: 700, useNativeDriver: false }),
+        Animated.timing(livePulse, { toValue: 1, duration: 700, useNativeDriver: false }),
       ]),
     );
     anim.start();
