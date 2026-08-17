@@ -1,208 +1,97 @@
 import React, { useEffect, useState } from 'react';
-import { View, Text, Pressable, StyleSheet, ScrollView, TextInput } from 'react-native';
+import { View, Text, StyleSheet, ScrollView } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
 import Ionicons from '@expo/vector-icons/Ionicons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 import { Beacon, RADIUS } from '@/constants/beacon';
-import { DetailHeader, Callout, PillButton } from '@/components/beacon/kit';
-import {
-  ESCALATION_TIERS_KEY,
-  DEFAULT_TIERS,
-  WAIT_OPTIONS,
-  Tier,
-  tierIdFor,
-  nextTierName,
-} from '@/constants/escalation';
+import { DetailHeader, Callout } from '@/components/beacon/kit';
+import { ESCALATION_SCHEDULE_KEY, DEFAULT_SCHEDULE, normalizeSchedule } from '@/constants/escalation';
 
 const CIRCLE_KEY = '@makeithome_safety_circle';
 
-interface SafetyContact {
-  id: string;
-  name: string;
-  phone: string;
-  tier?: string;
-}
-
 export default function EscalationScreen() {
   const router = useRouter();
-  const [circle, setCircle] = useState<SafetyContact[]>([]);
-  const [tiers, setTiers] = useState<Tier[]>(DEFAULT_TIERS);
-  const [loaded, setLoaded] = useState(false);
+  const [schedule, setSchedule] = useState<number[]>(DEFAULT_SCHEDULE);
+  const [circleCount, setCircleCount] = useState(0);
 
   useEffect(() => {
     (async () => {
-      const [rawCircle, rawTiers] = await Promise.all([
+      const [rawSchedule, rawCircle] = await Promise.all([
+        AsyncStorage.getItem(ESCALATION_SCHEDULE_KEY),
         AsyncStorage.getItem(CIRCLE_KEY),
-        AsyncStorage.getItem(ESCALATION_TIERS_KEY),
       ]);
-      const c: SafetyContact[] = rawCircle ? JSON.parse(rawCircle) : [];
-      const t: Tier[] = rawTiers ? JSON.parse(rawTiers) : DEFAULT_TIERS;
-      setTiers(t.length ? t : DEFAULT_TIERS);
-      setCircle(c);
-      setLoaded(true);
+      setSchedule(normalizeSchedule(rawSchedule ? JSON.parse(rawSchedule) : null));
+      setCircleCount(rawCircle ? JSON.parse(rawCircle).length : 0);
     })();
   }, []);
 
-  const persistTiers = (next: Tier[]) => {
-    setTiers(next);
-    AsyncStorage.setItem(ESCALATION_TIERS_KEY, JSON.stringify(next)).catch(() => {});
-  };
-  const persistCircle = (next: SafetyContact[]) => {
-    setCircle(next);
-    AsyncStorage.setItem(CIRCLE_KEY, JSON.stringify(next)).catch(() => {});
-  };
-
-  // Move a contact to the tier above (-1) or below (+1).
-  const moveContact = (contactId: string, dir: -1 | 1) => {
-    const contact = circle.find(c => c.id === contactId);
-    if (!contact) return;
-    const curIdx = tiers.findIndex(t => t.id === tierIdFor(contact.tier, tiers));
-    const target = curIdx + dir;
-    if (target < 0 || target >= tiers.length) return;
-    persistCircle(circle.map(c => (c.id === contactId ? { ...c, tier: tiers[target].id } : c)));
-  };
-
-  const renameTier = (id: string, name: string) =>
-    persistTiers(tiers.map(t => (t.id === id ? { ...t, name } : t)));
-
-  const cycleWait = (id: string) =>
-    persistTiers(
-      tiers.map(t => {
-        if (t.id !== id) return t;
-        const i = WAIT_OPTIONS.indexOf(t.waitMinutes);
-        return { ...t, waitMinutes: WAIT_OPTIONS[(i + 1) % WAIT_OPTIONS.length] };
-      }),
-    );
-
-  const addTier = () => {
-    const id = `t${Date.now()}`;
-    persistTiers([...tiers, { id, name: nextTierName(tiers.length), waitMinutes: 5 }]);
-  };
-
-  const removeTier = (id: string) => {
-    const idx = tiers.findIndex(t => t.id === id);
-    if (idx <= 0) return; // never remove the first tier
-    const fallbackId = tiers[idx - 1].id;
-    persistCircle(
-      circle.map(c => (tierIdFor(c.tier, tiers) === id ? { ...c, tier: fallbackId } : c)),
-    );
-    persistTiers(tiers.filter(t => t.id !== id));
-  };
-
-  const contactsInTier = (tierId: string) =>
-    circle.filter(c => tierIdFor(c.tier, tiers) === tierId);
-
-  if (!loaded) {
-    return <SafeAreaView style={styles.root} edges={['top']} />;
-  }
+  // Build the visible timeline: an immediate alert, then a re-notification after
+  // each scheduled wait (cumulative from go-live).
+  const timeline: { label: string; at: number; first?: boolean }[] = [];
+  let elapsed = 0;
+  timeline.push({ label: 'You go live — everyone is alerted', at: 0, first: true });
+  schedule.forEach((wait, i) => {
+    elapsed += wait;
+    timeline.push({ label: `Everyone is texted again (reminder ${i + 1})`, at: elapsed });
+  });
 
   return (
     <SafeAreaView style={styles.root} edges={['top']}>
       <View style={{ paddingHorizontal: 20 }}>
-        <DetailHeader title="Escalation ladder" onBack={() => router.back()} />
+        <DetailHeader title="Escalation" onBack={() => router.back()} />
         <Text style={styles.subttl}>
-          Group your circle into tiers. When you go live, the first tier is alerted immediately. If
-          no one taps “I’m on my way,” the next tier is alerted after its wait — climbing until
-          someone responds.
+          If no one taps “I’m on my way,” Make It Home keeps texting your whole circle on a schedule
+          until someone responds — so a missed message doesn’t mean missed help.
         </Text>
       </View>
 
       <ScrollView contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: 44 }}>
-        {circle.length === 0 ? (
+        {circleCount === 0 && (
           <View style={styles.emptyCard}>
             <Text style={styles.emptyText}>
               No one in your circle yet.{' '}
               <Text style={styles.link} onPress={() => router.push('/(tabs)/contacts')}>
                 Add someone
               </Text>{' '}
-              to build your ladder.
+              so these alerts have somewhere to go.
             </Text>
           </View>
-        ) : (
-          tiers.map((tier, i) => {
-            const members = contactsInTier(tier.id);
-            return (
-              <View key={tier.id} style={styles.tierCard}>
-                {/* Tier header */}
-                <View style={styles.tierHead}>
-                  <View style={styles.tierBadge}>
-                    <Text style={styles.tierBadgeText}>{i + 1}</Text>
-                  </View>
-                  <TextInput
-                    style={styles.tierName}
-                    value={tier.name}
-                    onChangeText={t => renameTier(tier.id, t)}
-                    placeholder="Tier name"
-                    placeholderTextColor={Beacon.faint}
-                    maxLength={40}
-                  />
-                  {i > 0 && (
-                    <Pressable onPress={() => removeTier(tier.id)} hitSlop={8} style={styles.trash}>
-                      <Ionicons name="trash-outline" size={17} color={Beacon.faint} />
-                    </Pressable>
-                  )}
-                </View>
+        )}
 
-                {/* Timing */}
-                {i === 0 ? (
-                  <Text style={styles.timing}>
-                    <Ionicons name="flash" size={12} color={Beacon.beacon} /> Alerted immediately
-                  </Text>
-                ) : (
-                  <Pressable style={styles.waitPill} onPress={() => cycleWait(tier.id)}>
-                    <Ionicons name="time-outline" size={13} color={Beacon.muted} />
-                    <Text style={styles.waitText}>
-                      Alert {tier.waitMinutes} min after the tier above, if no response
-                    </Text>
-                    <Ionicons name="chevron-forward" size={13} color={Beacon.faint} />
-                  </Pressable>
-                )}
-
-                {/* Members */}
-                <View style={styles.members}>
-                  {members.length === 0 ? (
-                    <Text style={styles.emptyTier}>No one here yet — move someone in with the arrows.</Text>
-                  ) : (
-                    members.map(c => (
-                      <View key={c.id} style={styles.memberRow}>
-                        <View style={{ flex: 1 }}>
-                          <Text style={styles.memberName}>{c.name}</Text>
-                          <Text style={styles.memberPhone}>{c.phone}</Text>
-                        </View>
-                        <View style={styles.moveBtns}>
-                          <Pressable
-                            onPress={() => moveContact(c.id, -1)}
-                            disabled={i === 0}
-                            hitSlop={6}
-                            style={[styles.moveBtn, i === 0 && styles.moveDisabled]}>
-                            <Ionicons name="chevron-up" size={18} color={Beacon.text} />
-                          </Pressable>
-                          <Pressable
-                            onPress={() => moveContact(c.id, 1)}
-                            disabled={i === tiers.length - 1}
-                            hitSlop={6}
-                            style={[styles.moveBtn, i === tiers.length - 1 && styles.moveDisabled]}>
-                            <Ionicons name="chevron-down" size={18} color={Beacon.text} />
-                          </Pressable>
-                        </View>
-                      </View>
-                    ))
-                  )}
-                </View>
+        <Text style={styles.secLabel}>What happens if no one responds</Text>
+        <View style={styles.card}>
+          {timeline.map((t, i) => (
+            <View key={i} style={[styles.row, i === timeline.length - 1 && { borderBottomWidth: 0 }]}>
+              <View style={styles.timeCol}>
+                <Text style={[styles.timeText, t.first && { color: Beacon.beacon }]}>
+                  {t.at === 0 ? 'now' : `+${t.at}m`}
+                </Text>
               </View>
-            );
-          })
-        )}
+              <View style={styles.dotCol}>
+                <View style={[styles.dot, t.first && styles.dotFirst]} />
+                {i < timeline.length - 1 && <View style={styles.dotLine} />}
+              </View>
+              <Text style={styles.rowLabel}>{t.label}</Text>
+            </View>
+          ))}
+        </View>
+        <Text style={styles.note}>
+          The moment a responder taps “I’m on my way,” the reminders stop — no one is texted again.
+        </Text>
 
-        {circle.length > 0 && (
-          <PillButton title="+ Add another tier" kind="dark" onPress={addTier} style={{ marginTop: 4 }} />
-        )}
+        <View style={styles.upsell}>
+          <Ionicons name="sparkles-outline" size={16} color={Beacon.amber} />
+          <Text style={styles.upsellText}>
+            <Text style={{ color: Beacon.text, fontWeight: '700' }}>Silver &amp; Gold: </Text>
+            set your own reminder times and how many — coming with subscriptions.
+          </Text>
+        </View>
 
         <Callout>
-          When a responder taps “I’m on my way” on your live page, the ladder stops — no one in a
-          later tier is alerted. Everyone already alerted still sees your live location.
+          Reminders only ever go to people already in your safety circle, and always include your
+          live location.
         </Callout>
       </ScrollView>
     </SafeAreaView>
@@ -219,78 +108,49 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: Beacon.line,
     borderRadius: RADIUS.card,
-    paddingVertical: 18,
+    paddingVertical: 16,
     paddingHorizontal: 16,
     alignItems: 'center',
+    marginBottom: 6,
   },
   emptyText: { color: Beacon.muted, fontSize: 13, textAlign: 'center', lineHeight: 19 },
 
-  tierCard: {
+  secLabel: {
+    fontSize: 10.5,
+    fontWeight: '700',
+    letterSpacing: 1,
+    textTransform: 'uppercase',
+    color: Beacon.faint,
+    marginTop: 12,
+    marginBottom: 8,
+  },
+  card: {
     backgroundColor: Beacon.surface,
     borderWidth: 1,
     borderColor: Beacon.line,
     borderRadius: RADIUS.card,
-    padding: 14,
-    marginBottom: 12,
+    paddingHorizontal: 14,
   },
-  tierHead: { flexDirection: 'row', alignItems: 'center', gap: 10 },
-  tierBadge: {
-    width: 26,
-    height: 26,
-    borderRadius: 13,
-    backgroundColor: Beacon.surface2,
-    borderWidth: 1,
-    borderColor: Beacon.beacon,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  tierBadgeText: { color: Beacon.beacon, fontSize: 12, fontWeight: '800' },
-  tierName: {
-    flex: 1,
-    color: Beacon.text,
-    fontSize: 16,
-    fontWeight: '700',
-    paddingVertical: 4,
-  },
-  trash: { padding: 4 },
+  row: { flexDirection: 'row', alignItems: 'flex-start', paddingVertical: 14, borderBottomWidth: 1, borderBottomColor: Beacon.line },
+  timeCol: { width: 46 },
+  timeText: { fontSize: 13, fontWeight: '700', color: Beacon.muted, fontVariant: ['tabular-nums'] },
+  dotCol: { width: 22, alignItems: 'center', alignSelf: 'stretch' },
+  dot: { width: 10, height: 10, borderRadius: 5, backgroundColor: Beacon.faint, marginTop: 3 },
+  dotFirst: { backgroundColor: Beacon.beacon },
+  dotLine: { width: 2, flex: 1, backgroundColor: Beacon.line, marginTop: 2 },
+  rowLabel: { flex: 1, fontSize: 13.5, color: Beacon.text, lineHeight: 18, paddingLeft: 4 },
+  note: { fontSize: 12, color: Beacon.faint, lineHeight: 17, marginTop: 10, paddingHorizontal: 2 },
 
-  timing: { color: Beacon.muted, fontSize: 12, marginTop: 8, marginLeft: 2 },
-  waitPill: {
+  upsell: {
     flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-    backgroundColor: Beacon.surface2,
+    gap: 9,
+    alignItems: 'flex-start',
+    backgroundColor: '#1e1a12',
     borderWidth: 1,
-    borderColor: Beacon.line,
-    borderRadius: RADIUS.pill,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    marginTop: 8,
+    borderColor: '#3a3016',
+    borderRadius: RADIUS.card,
+    padding: 13,
+    marginTop: 18,
   },
-  waitText: { flex: 1, color: Beacon.muted, fontSize: 12.5 },
-
-  members: { marginTop: 6 },
-  memberRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
-    paddingVertical: 10,
-    borderBottomWidth: 1,
-    borderBottomColor: Beacon.line,
-  },
-  memberName: { fontSize: 14.5, fontWeight: '600', color: Beacon.text },
-  memberPhone: { fontSize: 12, color: Beacon.faint, marginTop: 1 },
-  emptyTier: { color: Beacon.faint, fontSize: 12.5, paddingVertical: 10, fontStyle: 'italic' },
-  moveBtns: { flexDirection: 'row', gap: 6 },
-  moveBtn: {
-    width: 34,
-    height: 34,
-    borderRadius: 9,
-    backgroundColor: Beacon.surface2,
-    borderWidth: 1,
-    borderColor: Beacon.line,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  moveDisabled: { opacity: 0.3 },
+  upsellText: { flex: 1, color: Beacon.muted, fontSize: 12.5, lineHeight: 18 },
 });

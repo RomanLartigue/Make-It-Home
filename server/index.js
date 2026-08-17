@@ -335,6 +335,7 @@ app.use('/upload', smsLimiter);
 app.use('/safe', smsLimiter);
 app.use('/checkin/start', smsLimiter);
 app.use('/session/start', smsLimiter);
+app.use('/test', smsLimiter);
 
 // ── Public static assets (legal pages + opt-in screenshots) ───────────────────
 // Served from server/public with NO X-MIH-Key auth so a plain browser (and the
@@ -1158,6 +1159,26 @@ app.post('/safe', async (req, res) => {
     return res.status(500).json({ error: 'Could not reach any contact.', failed: result.failed });
   }
   console.log(`[/safe] Sent ${result.sent}/${recipients.length}, ${result.failed} failed.`);
+  res.json({ sent: result.sent, failed: result.failed });
+});
+
+// ── POST /test ────────────────────────────────────────────────────────────────
+// Sends a clearly-labeled test message to the whole circle so a user can confirm
+// their alerts actually arrive — without a real emergency. Same auth + circle
+// validation as a real alert.
+app.post('/test', async (req, res) => {
+  const { phones, name } = req.body;
+  const r = await recipientsFor(req, phones);
+  if (r.error) return res.status(r.status).json({ error: r.error });
+  const recipients = r.recipients;
+  const who = cleanName(name) || 'Someone';
+  const body = `🧪 TEST — ${who} is testing Make It Home. This is only a test, NOT a real emergency — no action needed. Reply STOP to opt out.`;
+  const result = await sendSmsToAll(recipients, body);
+  if (result.sent === 0) {
+    console.error('[/test] All sends failed:', result.errors.join('; '));
+    return res.status(500).json({ error: 'Could not reach any contact.', failed: result.failed });
+  }
+  console.log(`[/test] Sent ${result.sent}/${recipients.length}, ${result.failed} failed.`);
   res.json({ sent: result.sent, failed: result.failed });
 });
 

@@ -7,30 +7,42 @@ import { Beacon } from '@/constants/beacon';
 import { Card, Callout } from '@/components/beacon/kit';
 
 const STEPS = [
-  { n: '1', title: 'Hold the beacon', desc: 'Hold the orange button, then release in the center to go live instantly.' },
-  { n: '2', title: 'Or swipe to a timer', desc: 'While holding, drag toward 15, 30, 45, or 60 minutes to start a check-in.' },
-  { n: '3', title: "You're covered", desc: 'Your circle gets your live location, a live camera view, and a saved recording.' },
+  { n: '1', title: 'Hold the beacon', desc: 'Hold the orange button and drag to how long to record — 15, 30, 45, or 60 min.' },
+  { n: '2', title: 'Release to go live', desc: 'Let go and your circle is alerted with your live location and a recording for that long.' },
+  { n: '3', title: "You're covered", desc: 'They get your live location, a live camera view, and a saved recording.' },
   { n: '4', title: '“Made it home”', desc: 'End the session and we let your circle know you’re safe.' },
 ];
 
 const FEATURES: { icon: keyof typeof Ionicons.glyphMap; title: string; body: string }[] = [
   {
-    icon: 'layers-outline',
-    title: 'Escalation ladder',
+    icon: 'timer-outline',
+    title: 'Home-safe check-in',
     body:
-      'Group your circle into tiers. Your first responders are alerted the moment you go live. If no one taps “I’m on my way,” the next tier is alerted automatically — climbing until someone responds. Set it up in Settings → Escalation ladder.',
+      'Heading out? Tap “Set a Home-safe check-in” under the beacon and pick a time. If you don’t tap “I’m safe” before it runs out, your circle is automatically alerted with your location.',
+  },
+  {
+    icon: 'notifications-outline',
+    title: 'Escalation',
+    body:
+      'If no one taps “I’m on my way,” we text your whole circle again — after 5 minutes, then 10, then 15 — until someone responds. (Silver & Gold can set their own timing.)',
   },
   {
     icon: 'videocam-outline',
     title: 'Live video & recording',
     body:
-      'Going live starts recording and shares a near-live camera view on your link, so your circle can see what’s happening. They can download the recording to show police if needed — and a copy is always saved to your own photos.',
+      'Going live shares a near-live camera view on your link, so your circle can see what’s happening. They can download the recording to show police if needed — and a copy is always saved to your own photos.',
   },
   {
     icon: 'call-outline',
     title: 'Fake call',
     body:
       'Need a way out? Tap the phone icon at the top of the Home screen for a realistic incoming call — choose who’s calling and when. It never contacts anyone; it just gives you a natural reason to step away.',
+  },
+  {
+    icon: 'flask-outline',
+    title: 'Test your alert',
+    body:
+      'Want to be sure your alerts land? Settings → “Test your alert” sends your circle a clearly-marked test text (not a real emergency), so you can confirm everyone receives it.',
   },
 ];
 

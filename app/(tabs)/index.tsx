@@ -24,7 +24,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { getServerUrl, getUserName, fetchWithAuth, randomId, syncCircle } from '@/utils/serverUrl';
 import { Beacon } from '@/constants/beacon';
 import { PillButton } from '@/components/beacon/kit';
-import { ESCALATION_TIERS_KEY, DEFAULT_TIERS, Tier, tierIdFor } from '@/constants/escalation';
+import { ESCALATION_SCHEDULE_KEY, DEFAULT_SCHEDULE, normalizeSchedule } from '@/constants/escalation';
 
 // Shown when a permission isn't granted. If it was previously blocked, the OS
 // won't show its own dialog again (canAskAgain === false) — so offer a route to
@@ -105,30 +105,25 @@ async function getSafetyCirclePhones(): Promise<string[]> {
   return circle.map((c: any) => c.phone).filter(Boolean);
 }
 
-// Group the circle by escalation tier for staged alerting. Returns null when
-// there's no usable grouping (the server then alerts everyone at once).
+// Build the escalation rounds for a go-live: the whole circle is alerted now
+// (round 0), then re-texted after each scheduled wait until someone acknowledges.
+// Every round targets the SAME whole circle. Returns null when the circle is empty.
 async function getEscalationTiers(): Promise<
   { name: string; waitMinutes: number; phones: string[] }[] | null
 > {
-  const [rawCircle, rawTiers] = await Promise.all([
+  const [rawCircle, rawSchedule] = await Promise.all([
     AsyncStorage.getItem(SAFETY_CIRCLE_KEY),
-    AsyncStorage.getItem(ESCALATION_TIERS_KEY),
+    AsyncStorage.getItem(ESCALATION_SCHEDULE_KEY),
   ]);
   const circle: any[] = rawCircle ? JSON.parse(rawCircle) : [];
-  if (!circle.length) return null;
-  const tiers: Tier[] = rawTiers ? JSON.parse(rawTiers) : DEFAULT_TIERS;
-  if (!tiers.length) return null;
-  const groups = tiers
-    .map(t => ({
-      name: t.name,
-      waitMinutes: t.waitMinutes,
-      phones: circle
-        .filter(c => tierIdFor(c.tier, tiers) === t.id)
-        .map(c => c.phone)
-        .filter(Boolean),
-    }))
-    .filter(g => g.phones.length);
-  return groups.length ? groups : null;
+  const phones = circle.map(c => c.phone).filter(Boolean);
+  if (!phones.length) return null;
+  const schedule = normalizeSchedule(rawSchedule ? JSON.parse(rawSchedule) : DEFAULT_SCHEDULE);
+  const rounds = [{ name: 'Alert', waitMinutes: 0, phones }];
+  schedule.forEach((wait, i) => {
+    rounds.push({ name: `Reminder ${i + 1}`, waitMinutes: wait, phones });
+  });
+  return rounds;
 }
 
 function formatTime(secs: number) {
@@ -176,7 +171,10 @@ export default function HomeScreen() {
   // Beacon gesture state
   const [armed, setArmed] = useState(false);
   const [sel, setSel] = useState<string | null>(null);
-  const selRef = useRef<string>('now');
+  const [showCheckIn, setShowCheckIn] = useState(false);
+  const selRef = useRef<string | null>(null);
+  const recordDurationSecRef = useRef<number>(30 * 60); // chosen recording length
+  const beaconXY = useRef(new Animated.ValueXY({ x: 0, y: 0 })).current; // joystick offset
   const pulse = useRef(new Animated.Value(1)).current;
   const livePulse = useRef(new Animated.Value(1)).current;
 
@@ -477,7 +475,8 @@ export default function HomeScreen() {
   };
 
   // ── Go live ────────────────────────────────────────────────────────────────
-  const handleSafetyTap = async () => {
+  const handleSafetyTap = async (recordSeconds: number) => {
+    recordDurationSecRef.current = recordSeconds;
     // Request camera/mic imperatively at go-live time. We deliberately avoid the
     // useCameraPermissions()/useMicrophonePermissions() hooks so nothing probes
     // the camera while the app is just sitting on Home.
@@ -639,7 +638,8 @@ export default function HomeScreen() {
     const sessionId = sessionIdRef.current;
     if (sessionId) startFrameLoop(sessionId);
     try {
-      const video = await cameraRef.current?.recordAsync();
+      // maxDuration caps the video at the length the user chose on the beacon.
+      const video = await cameraRef.current?.recordAsync({ maxDuration: recordDurationSecRef.current });
       if (video?.uri) {
         await saveToCameraRoll(video.uri); // keep a copy on the device
         await uploadRecording(video.uri, sessionId); // send it to the safety circle
@@ -647,6 +647,9 @@ export default function HomeScreen() {
     } catch {
       // stopRecording rejects the promise on some platforms — not a real error
     }
+    // If recording ended on its own (hit the chosen length) rather than a manual
+    // End, wrap up the session now. A manual End already cleared isRecordingRef.
+    if (isRecordingRef.current) finishSession('auto');
   };
 
   const sendSafeNotification = async () => {
@@ -661,14 +664,18 @@ export default function HomeScreen() {
     }).catch(() => {});
   };
 
-  const handleEnd = () => {
+  // Ends the live session. reason 'manual' = the user tapped End (we stop the
+  // recording); reason 'auto' = the recording already finished at its chosen
+  // length (nothing to stop). Guarded so the two paths can't double-run.
+  const finishSession = (reason: 'manual' | 'auto') => {
+    if (!showCamera && !sessionIdRef.current) return;
     const endedSessionId = sessionIdRef.current;
     if (goLiveFallbackRef.current) {
       clearTimeout(goLiveFallbackRef.current);
       goLiveFallbackRef.current = null;
     }
     stopFrameLoop();
-    cameraRef.current?.stopRecording();
+    if (reason === 'manual') cameraRef.current?.stopRecording();
     locationSub.current?.remove();
     locationSub.current = null;
     AsyncStorage.removeItem(ACTIVE_SESSION_KEY);
@@ -689,14 +696,23 @@ export default function HomeScreen() {
     lastLocationUpdateRef.current = 0;
     isRecordingRef.current = false;
     setTimeout(() => setNotifyStatus('idle'), 3000);
-    Alert.alert('Session ended', "Let your safety circle know you're safe?", [
-      { text: "Yes, I'm safe", onPress: sendSafeNotification },
-      { text: 'No thanks', style: 'cancel' },
-    ]);
+    Alert.alert(
+      reason === 'auto' ? 'Recording finished' : 'Session ended',
+      "Let your safety circle know you're safe?",
+      [
+        { text: "Yes, I'm safe", onPress: sendSafeNotification },
+        { text: 'No thanks', style: 'cancel' },
+      ],
+    );
   };
 
+  const handleEnd = () => finishSession('manual');
+
   // ── Beacon gesture ─────────────────────────────────────────────────────────
-  const onBeaconRelease = (k: string) => {
+  // Hold the beacon and drag toward a recording length (15/30/45/60 min); release
+  // there to go live and record for that long. Releasing near the center cancels.
+  const onBeaconRelease = (k: string | null) => {
+    if (!k || !DIR[k]) return; // released in the center — do nothing
     if (circleCount === 0) {
       // Alert.alert is a no-op on react-native-web, so give web its own prompt.
       if (IS_WEB) {
@@ -716,65 +732,58 @@ export default function HomeScreen() {
       }
       return;
     }
-    if (k === 'now') handleSafetyTap();
-    else if (DIR[k]) startCheckIn(DIR[k].sec);
+    handleSafetyTap(DIR[k].sec);
   };
 
-  // Keep the latest release handler reachable from the (memoized) PanResponder.
+  // Keep the latest release handler reachable from the (memoized) gesture.
   const releaseRef = useRef(onBeaconRelease);
   useEffect(() => {
     releaseRef.current = onBeaconRelease;
   });
 
-  // Beacon gesture (touch + mouse), via react-native-gesture-handler:
-  //  • Tap  — a press/hold released without dragging = go live. A Tap fires the
-  //    instant you lift your finger; a Pan does NOT "activate" on a no-drag tap
-  //    on a touchscreen, which is why the old single-Pan version stayed armed and
-  //    never triggered on release.
-  //  • Pan  — a drag past the threshold selects a timer (fires on release).
-  // Raced so exactly one wins: no drag → Tap; a drag → Pan.
+  // Beacon gesture (touch + mouse) via react-native-gesture-handler. A single Pan
+  // that doubles as a joystick: the beacon follows the thumb (beaconXY) and the
+  // drag direction selects a recording length. Release on a direction to go live;
+  // release near center to cancel. Springs back on release.
+  const MAX_DRAG = 88;
   const beaconGesture = useRef(
-    Gesture.Race(
-      Gesture.Tap()
-        .runOnJS(true)
-        .hitSlop(20) // comfortable target around the 168px button, not the whole screen
-        .maxDuration(60000) // allow a long hold-then-release to still count as a tap
-        .maxDistance(24)
-        .onStart(() => {
-          releaseRef.current('now');
-        }),
-      Gesture.Pan()
-        .runOnJS(true)
-        .hitSlop(20)
-        .minDistance(24)
-        .onBegin(() => {
-          selRef.current = 'now';
-          setSel('now');
-          setArmed(true);
-          if (!IS_WEB) Haptics.selectionAsync();
-        })
-        .onUpdate(e => {
-          const dx = e.translationX;
-          const dy = e.translationY;
-          let k = 'now';
-          if (Math.hypot(dx, dy) >= 42) {
-            if (Math.abs(dx) > Math.abs(dy)) k = dx < 0 ? 'left' : 'right';
-            else k = dy < 0 ? 'up' : 'down';
-          }
-          if (k !== selRef.current) {
-            selRef.current = k;
-            setSel(k);
-            if (!IS_WEB) Haptics.selectionAsync();
-          }
-        })
-        .onEnd(() => {
-          releaseRef.current(selRef.current);
-        })
-        .onFinalize(() => {
-          setArmed(false);
-          setSel(null);
-        }),
-    ),
+    Gesture.Pan()
+      .runOnJS(true)
+      .hitSlop(20)
+      .onBegin(() => {
+        selRef.current = null;
+        setSel(null);
+        setArmed(true);
+        if (!IS_WEB) Haptics.selectionAsync();
+      })
+      .onUpdate(e => {
+        const dx = e.translationX;
+        const dy = e.translationY;
+        const dist = Math.hypot(dx, dy) || 1;
+        // Move the beacon toward the thumb, clamped to a radius (joystick).
+        const scale = dist > MAX_DRAG ? MAX_DRAG / dist : 1;
+        beaconXY.setValue({ x: dx * scale, y: dy * scale });
+        // Select a direction once dragged past the threshold.
+        let k: string | null = null;
+        if (dist >= 42) {
+          if (Math.abs(dx) > Math.abs(dy)) k = dx < 0 ? 'left' : 'right';
+          else k = dy < 0 ? 'up' : 'down';
+        }
+        if (k !== selRef.current) {
+          selRef.current = k;
+          setSel(k);
+          if (k && !IS_WEB) Haptics.selectionAsync();
+        }
+      })
+      .onEnd(() => {
+        releaseRef.current(selRef.current);
+      })
+      .onFinalize(() => {
+        setArmed(false);
+        setSel(null);
+        selRef.current = null;
+        Animated.spring(beaconXY, { toValue: { x: 0, y: 0 }, useNativeDriver: false, bounciness: 8 }).start();
+      }),
   ).current;
 
   // ── Camera / go-live screen ────────────────────────────────────────────────
@@ -921,10 +930,9 @@ export default function HomeScreen() {
         </View>
       </View>
 
-      {/* Beacon — hold-and-swipe (touch and mouse), via gesture-handler.
-          The gesture is attached to ONLY the orange button so a tap elsewhere on
-          the home screen can't accidentally trigger an alert.
-          userSelect:none keeps a mouse-drag from starting a text selection. */}
+      {/* Beacon — hold + joystick-drag to a recording length, release to go live.
+          The gesture is attached to ONLY the orange button so a touch elsewhere on
+          the home screen can't accidentally trigger an alert. */}
       <View style={styles.arena}>
         <BeaconChip label="15" active={sel === 'left'} visible={armed} style={styles.optLeft} />
         <BeaconChip label="30" active={sel === 'up'} visible={armed} style={styles.optUp} />
@@ -935,19 +943,54 @@ export default function HomeScreen() {
             style={[
               styles.beacon,
               armed && styles.beaconArmed,
-              { transform: [{ scale: armed ? 1 : pulse }] },
+              {
+                transform: [
+                  { translateX: beaconXY.x },
+                  { translateY: beaconXY.y },
+                  { scale: armed ? 1 : pulse },
+                ],
+              },
             ]}>
-            <Text style={styles.beaconText}>Hold</Text>
-            <Text style={styles.beaconSub}>{armed ? 'release' : '& swipe'}</Text>
+            <Text style={styles.beaconText}>{armed ? (sel ? DIR[sel].label : 'Drag') : 'Hold'}</Text>
+            <Text style={styles.beaconSub}>{armed ? (sel ? 'min · release' : 'to a length') : '& drag'}</Text>
           </Animated.View>
         </GestureDetector>
       </View>
 
       <Text style={styles.undertext}>
-        {checkInStarting
-          ? 'Starting check-in…'
-          : 'Hold the beacon, then release in the center to go live — or drag to a timer (15 / 30 / 45 / 60 min)'}
+        Hold the beacon and drag to how long to record (15 / 30 / 45 / 60 min), then release to go
+        live.
       </Text>
+
+      {/* Home-safe check-in — separate from go-live. Alerts your circle if you
+          don't tap "I'm safe" before the timer runs out. */}
+      <View style={styles.checkInWrap}>
+        {showCheckIn ? (
+          <View style={styles.checkInChips}>
+            {[15, 30, 45, 60].map(min => (
+              <Pressable
+                key={min}
+                style={styles.ciChip}
+                onPress={() => {
+                  setShowCheckIn(false);
+                  startCheckIn(min * 60);
+                }}>
+                <Text style={styles.ciChipText}>{min}m</Text>
+              </Pressable>
+            ))}
+            <Pressable style={styles.ciCancel} onPress={() => setShowCheckIn(false)}>
+              <Ionicons name="close" size={16} color={Beacon.muted} />
+            </Pressable>
+          </View>
+        ) : (
+          <Pressable style={styles.checkInBtn} onPress={() => setShowCheckIn(true)}>
+            <Ionicons name="timer-outline" size={16} color={Beacon.muted} />
+            <Text style={styles.checkInText}>
+              {checkInStarting ? 'Starting check-in…' : 'Set a Home-safe check-in'}
+            </Text>
+          </Pressable>
+        )}
+      </View>
     </SafeAreaView>
   );
 }
@@ -1122,10 +1165,45 @@ const styles = StyleSheet.create({
     color: Beacon.muted,
     fontSize: 12,
     textAlign: 'center',
-    marginBottom: 16,
+    marginBottom: 12,
     alignSelf: 'center',
     maxWidth: 260,
     lineHeight: 17,
+  },
+
+  // Home-safe check-in launcher
+  checkInWrap: { alignItems: 'center', marginBottom: 16, minHeight: 44, justifyContent: 'center' },
+  checkInBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 7,
+    backgroundColor: Beacon.surface,
+    borderWidth: 1,
+    borderColor: Beacon.line,
+    borderRadius: 999,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+  },
+  checkInText: { color: Beacon.text, fontSize: 13, fontWeight: '600' },
+  checkInChips: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  ciChip: {
+    backgroundColor: Beacon.surface2,
+    borderWidth: 1,
+    borderColor: Beacon.line,
+    borderRadius: 999,
+    paddingHorizontal: 14,
+    paddingVertical: 9,
+  },
+  ciChipText: { color: Beacon.text, fontSize: 13, fontWeight: '700', fontVariant: ['tabular-nums'] },
+  ciCancel: {
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: Beacon.surface,
+    borderWidth: 1,
+    borderColor: Beacon.line,
   },
 
   // Camera / go-live
