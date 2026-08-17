@@ -205,16 +205,19 @@ export default function HomeScreen() {
     }
     const anim = Animated.loop(
       Animated.sequence([
+        // JS driver (not native): the beacon's transform also carries beaconXY
+        // (the joystick offset), which must be JS-driven to follow the thumb.
+        // Mixing drivers on one view throws "node moved to native".
         Animated.timing(pulse, {
           toValue: 1.06,
           duration: 1300,
-          useNativeDriver: true,
+          useNativeDriver: false,
           easing: Easing.inOut(Easing.ease),
         }),
         Animated.timing(pulse, {
           toValue: 1,
           duration: 1300,
-          useNativeDriver: true,
+          useNativeDriver: false,
           easing: Easing.inOut(Easing.ease),
         }),
       ]),
