@@ -52,11 +52,6 @@ export default function RootLayout() {
                 <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
                 <Stack.Screen name="escalation" options={{ headerShown: false }} />
                 <Stack.Screen name="test-alert" options={{ headerShown: false }} />
-                <Stack.Screen name="fake-call" options={{ headerShown: false }} />
-                <Stack.Screen
-                  name="incoming-call"
-                  options={{ headerShown: false, presentation: 'fullScreenModal', animation: 'fade', gestureEnabled: false }}
-                />
                 <Stack.Screen name="legal" options={{ headerShown: false, presentation: 'modal' }} />
               </Stack>
             </View>

@@ -33,12 +33,6 @@ const FEATURES: { icon: keyof typeof Ionicons.glyphMap; title: string; body: str
       'Going live shares a near-live camera view on your link, so your circle can see what’s happening. They can download the recording to show police if needed — and a copy is always saved to your own photos.',
   },
   {
-    icon: 'call-outline',
-    title: 'Fake call',
-    body:
-      'Need a way out? Tap the phone icon at the top of the Home screen for a realistic incoming call — choose who’s calling and when. It never contacts anyone; it just gives you a natural reason to step away.',
-  },
-  {
     icon: 'flask-outline',
     title: 'Test your alert',
     body:
