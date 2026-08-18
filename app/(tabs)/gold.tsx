@@ -6,7 +6,7 @@ import Ionicons from '@expo/vector-icons/Ionicons';
 
 import { Beacon, RADIUS } from '@/constants/beacon';
 import { GOLD, GoldBadge } from '@/components/beacon/GoldGate';
-import { useGold } from '@/utils/gold';
+import { useGold, openManageSubscription } from '@/utils/gold';
 
 // The Gold tab: one always-visible home for the three Gold features and the
 // plan itself. Free users see the same hub (nothing is hidden) — each feature
@@ -56,8 +56,11 @@ export default function GoldTab() {
           {gold && <GoldBadge />}
         </View>
 
-        {/* Plan card */}
-        <Pressable style={[styles.plan, gold && styles.planActive]} onPress={() => router.push('/gold')}>
+        {/* Plan card. Free → the plan/paywall screen. Gold → manage subscription. */}
+        <Pressable
+          style={[styles.plan, gold && styles.planActive]}
+          onPress={gold ? openManageSubscription : () => router.push('/gold')}
+        >
           <View style={styles.planIcon}>
             <Ionicons name={gold ? 'checkmark-circle' : 'star'} size={22} color={gold ? Beacon.safe : GOLD} />
           </View>
@@ -65,7 +68,7 @@ export default function GoldTab() {
             {gold ? (
               <>
                 <Text style={styles.planTitle}>Gold is active</Text>
-                <Text style={styles.planSub}>Thanks for keeping the safety button free for everyone.</Text>
+                <Text style={styles.planSub}>Manage your subscription — change plan or cancel.</Text>
               </>
             ) : (
               <>
@@ -76,8 +79,11 @@ export default function GoldTab() {
               </>
             )}
           </View>
-          <Ionicons name="chevron-forward" size={18} color={Beacon.faint} />
+          <Ionicons name={gold ? 'open-outline' : 'chevron-forward'} size={gold ? 16 : 18} color={Beacon.faint} />
         </Pressable>
+        {gold && (
+          <Text style={styles.thanks}>Thanks for keeping the safety button free for everyone. ♥</Text>
+        )}
 
         <Text style={styles.secLabel}>{gold ? 'Your Gold features' : 'What Gold adds'}</Text>
         {ITEMS.map(it => (
@@ -133,6 +139,7 @@ const styles = StyleSheet.create({
   },
   planTitle: { color: Beacon.text, fontSize: 15, fontWeight: '800' },
   planSub: { color: Beacon.muted, fontSize: 12.5, lineHeight: 17, marginTop: 2 },
+  thanks: { color: Beacon.faint, fontSize: 11.5, textAlign: 'center', marginTop: 8, fontStyle: 'italic' },
 
   secLabel: {
     fontSize: 10.5,

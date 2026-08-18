@@ -7,7 +7,7 @@ import Ionicons from '@expo/vector-icons/Ionicons';
 import { Beacon, RADIUS } from '@/constants/beacon';
 import { DetailHeader, Callout } from '@/components/beacon/kit';
 import { GOLD, GoldBadge } from '@/components/beacon/GoldGate';
-import { GOLD_PRICING, useGold, setGold } from '@/utils/gold';
+import { GOLD_PRICING, useGold, setGold, openManageSubscription } from '@/utils/gold';
 
 type Plan = 'individual' | 'family';
 type Cycle = 'monthly' | 'yearly';
@@ -124,12 +124,19 @@ export default function GoldScreen() {
           })}
         </View>
 
-        <Pressable style={styles.subscribe} onPress={onSubscribe}>
-          <Text style={styles.subscribeText}>
-            Get Gold {plan === 'family' ? 'Family' : 'Individual'} · ${price.toFixed(2)}/{cycle === 'yearly' ? 'yr' : 'mo'}
-          </Text>
-          <Text style={styles.subscribeSub}>≈ ${perMonth.toFixed(2)}/month{cycle === 'yearly' ? ', billed yearly' : ''}</Text>
-        </Pressable>
+        {gold ? (
+          <Pressable style={styles.subscribe} onPress={openManageSubscription}>
+            <Text style={styles.subscribeText}>Manage subscription</Text>
+            <Text style={styles.subscribeSub}>Change plan or cancel in the App Store</Text>
+          </Pressable>
+        ) : (
+          <Pressable style={styles.subscribe} onPress={onSubscribe}>
+            <Text style={styles.subscribeText}>
+              Get Gold {plan === 'family' ? 'Family' : 'Individual'} · ${price.toFixed(2)}/{cycle === 'yearly' ? 'yr' : 'mo'}
+            </Text>
+            <Text style={styles.subscribeSub}>≈ ${perMonth.toFixed(2)}/month{cycle === 'yearly' ? ', billed yearly' : ''}</Text>
+          </Pressable>
+        )}
         <Text style={styles.fine}>
           Cancel anytime. Nothing in the free app is ever taken away.
         </Text>

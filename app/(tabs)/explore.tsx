@@ -110,8 +110,7 @@ export default function SettingsScreen() {
 
         <SectionLabel>Safety</SectionLabel>
         <Card style={{ paddingVertical: 2 }}>
-          <SRow label="Escalation" value="›" onPress={() => router.push('/escalation')} />
-          <SRow label="Test your alert" value="›" onPress={() => router.push('/test-alert')} last />
+          <SRow label="Escalation" value="›" onPress={() => router.push('/escalation')} last />
         </Card>
 
         <SectionLabel>Help</SectionLabel>

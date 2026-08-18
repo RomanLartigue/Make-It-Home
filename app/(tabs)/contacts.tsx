@@ -199,11 +199,20 @@ export default function CircleScreen() {
       )}
 
       <View style={styles.footer}>
-        <PillButton
-          title="⚡  Escalation ladder"
-          kind="ghost"
-          onPress={() => router.push('/escalation')}
-        />
+        <View style={styles.footerRow}>
+          <PillButton
+            title="⚡  Escalation"
+            kind="ghost"
+            onPress={() => router.push('/escalation')}
+            style={{ flex: 1 }}
+          />
+          <PillButton
+            title="🧪  Test alert"
+            kind="ghost"
+            onPress={() => router.push('/test-alert')}
+            style={{ flex: 1 }}
+          />
+        </View>
         <Pressable style={styles.addRow} onPress={openAdd}>
           <Text style={styles.addText}>＋ Add someone</Text>
         </Pressable>
@@ -329,6 +338,7 @@ const styles = StyleSheet.create({
   chevron: { color: Beacon.faint, fontSize: 20 },
 
   footer: { paddingHorizontal: 20, paddingBottom: 16, paddingTop: 10, gap: 10 },
+  footerRow: { flexDirection: 'row', gap: 10 },
   addRow: {
     borderWidth: 1,
     borderColor: '#4a3a34',

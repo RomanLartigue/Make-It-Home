@@ -13,9 +13,20 @@
 // verified server-side, and this module is the single seam that swaps in.
 
 import { useEffect, useState } from 'react';
+import { Linking, Platform } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 const GOLD_KEY = '@makeithome_gold';
+
+// Subscriptions are OS-managed — Apple/Google require cancel/change/refund to go
+// through the system. Opens the platform's subscription-management screen.
+export function openManageSubscription() {
+  const url =
+    Platform.OS === 'android'
+      ? 'https://play.google.com/store/account/subscriptions'
+      : 'https://apps.apple.com/account/subscriptions';
+  Linking.openURL(url).catch(() => {});
+}
 
 export const GOLD_PRICING = {
   individual: { monthly: 4.99, yearly: 39.99 },
