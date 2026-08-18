@@ -25,6 +25,8 @@ import { getServerUrl, getUserName, fetchWithAuth, randomId, syncCircle } from '
 import { Beacon } from '@/constants/beacon';
 import { PillButton } from '@/components/beacon/kit';
 import { ESCALATION_SCHEDULE_KEY, DEFAULT_SCHEDULE, normalizeSchedule } from '@/constants/escalation';
+import { startBackgroundLocation, stopBackgroundLocation } from '@/tasks/backgroundLocation';
+import { startBackgroundAudio, stopBackgroundAudio } from '@/utils/backgroundAudio';
 
 // Shown when a permission isn't granted. If it was previously blocked, the OS
 // won't show its own dialog again (canAskAgain === false) — so offer a route to
@@ -157,6 +159,7 @@ export default function HomeScreen() {
   const isRecordingRef = useRef(false);
   const goLiveFallbackRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const recordEndTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastAudioUriRef = useRef<string | null>(null); // background audio from the last session
 
   // Check-in state
   const [checkInActive, setCheckInActive] = useState(false);
@@ -508,6 +511,15 @@ export default function HomeScreen() {
       );
       return;
     }
+    // Background ("Always") location: asked here, in context, only if not yet
+    // granted. If declined we still go live — location just stops updating when
+    // the phone locks or the app is switched away (foreground-only fallback).
+    if (!IS_WEB) {
+      const bg = await Location.getBackgroundPermissionsAsync().catch(() => null);
+      if (bg && !bg.granted && bg.canAskAgain) {
+        await Location.requestBackgroundPermissionsAsync().catch(() => null);
+      }
+    }
     const serverUrl = await getServerUrl();
     const serverOk = await checkServerHealth(serverUrl);
     if (!serverOk) {
@@ -544,6 +556,13 @@ export default function HomeScreen() {
       sessionIdRef.current = sessionId;
       await AsyncStorage.setItem(ACTIVE_SESSION_KEY, sessionId);
       await startSession(coords);
+      // Keep the session useful when the phone locks / app is switched away:
+      // iOS won't record video in the background, but location + audio may
+      // continue. Both are best-effort and never block going live.
+      if (!IS_WEB) {
+        startBackgroundLocation().catch(() => {});
+        startBackgroundAudio().catch(() => {});
+      }
     };
 
     // 1) Seed immediately from the last known fix, if the OS has one cached.
@@ -704,6 +723,18 @@ export default function HomeScreen() {
     if (reason === 'manual') cameraRef.current?.stopRecording();
     locationSub.current?.remove();
     locationSub.current = null;
+    // Stop background systems. The background audio is the evidence that
+    // survived the phone being locked. iOS Photos can't hold audio files, so we
+    // keep it in the app's storage and offer the OS share sheet (save to Files,
+    // AirDrop, send to police) once the "safe?" prompt is answered.
+    if (!IS_WEB) {
+      stopBackgroundLocation().catch(() => {});
+      stopBackgroundAudio()
+        .then(uri => {
+          if (uri) lastAudioUriRef.current = uri;
+        })
+        .catch(() => {});
+    }
     AsyncStorage.removeItem(ACTIVE_SESSION_KEY);
     if (endedSessionId) {
       getServerUrl().then(serverUrl => {
@@ -726,10 +757,40 @@ export default function HomeScreen() {
       reason === 'auto' ? 'Recording finished' : 'Session ended',
       "Let your safety circle know you're safe?",
       [
-        { text: "Yes, I'm safe", onPress: sendSafeNotification },
-        { text: 'No thanks', style: 'cancel' },
+        { text: "Yes, I'm safe", onPress: () => { sendSafeNotification(); offerBackgroundAudio(); } },
+        { text: 'No thanks', style: 'cancel', onPress: offerBackgroundAudio },
       ],
     );
+  };
+
+  // If audio was captured while the phone was locked / app backgrounded, offer to
+  // keep it. Photos can't store audio, so this uses the OS share sheet (Save to
+  // Files, AirDrop, Messages...). Best-effort; skipped if there's no file.
+  const offerBackgroundAudio = () => {
+    const uri = lastAudioUriRef.current;
+    if (!uri || IS_WEB) return;
+    lastAudioUriRef.current = null;
+    // Give the "safe?" alert a moment to dismiss before presenting another.
+    setTimeout(() => {
+      Alert.alert(
+        'Audio was captured too',
+        'While your phone was locked or you were in another app, Make It Home kept recording audio. Save it as evidence?',
+        [
+          {
+            text: 'Save / share',
+            onPress: async () => {
+              try {
+                const Sharing = await import('expo-sharing');
+                if (await Sharing.isAvailableAsync()) {
+                  await Sharing.shareAsync(uri, { mimeType: 'audio/m4a', dialogTitle: 'Save session audio' });
+                }
+              } catch {}
+            },
+          },
+          { text: 'Not now', style: 'cancel' },
+        ],
+      );
+    }, 400);
   };
 
   const handleEnd = () => finishSession('manual');

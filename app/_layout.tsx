@@ -11,6 +11,10 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { getDeviceToken, syncCircle } from '@/utils/serverUrl';
 import { BeaconNavTheme } from '@/constants/theme';
 import { Beacon } from '@/constants/beacon';
+// Registers the background-location task at launch (TaskManager.defineTask must
+// run at module top level before iOS delivers any background fix). Native, but
+// only registers a handler — it starts nothing until a session goes live.
+import '@/tasks/backgroundLocation';
 
 const ACTIVE_SESSION_KEY = '@makeithome_active_session';
 const SAFETY_CIRCLE_KEY = '@makeithome_safety_circle';
