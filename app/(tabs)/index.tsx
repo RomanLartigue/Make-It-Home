@@ -628,23 +628,44 @@ export default function HomeScreen() {
       if (isRecordingRef.current) finishSession('auto');
     }, seconds * 1000);
 
+    // Start recording, retrying briefly on "Camera is not ready yet". On iOS the
+    // native movie output is attached in setCameraMode() (a prop update after
+    // mount), which can land a beat AFTER onCameraReady fires — so the very first
+    // recordAsync can hit CameraOutputNotReadyException. Retrying for ~3s covers
+    // that race; without it we got no file at all.
     let video: { uri: string } | undefined;
-    try {
-      // maxDuration is a backstop cap at the camera level.
-      video = await cameraRef.current?.recordAsync({ maxDuration: seconds });
-    } catch (e: any) {
-      // A manual End rejects on some platforms — that's fine. Anything else is
-      // real, and losing the recording silently is exactly what we must not do.
-      const msg = String(e?.message ?? e);
-      if (!/stop|cancel/i.test(msg)) Alert.alert('Recording problem', msg);
+    let recordError: string | null = null;
+    const startedAt = Date.now();
+    // Small settle so the movie output exists on the first attempt in most cases.
+    await new Promise(r => setTimeout(r, 400));
+    for (let attempt = 0; ; attempt++) {
+      if (!isRecordingRef.current) break; // user ended before we ever started
+      try {
+        // maxDuration is a backstop cap at the camera level.
+        video = await cameraRef.current?.recordAsync({ maxDuration: seconds });
+        recordError = null;
+        break;
+      } catch (e: any) {
+        const msg = String(e?.message ?? e);
+        const notReady = /not ready/i.test(msg);
+        if (notReady && Date.now() - startedAt < 3000) {
+          await new Promise(r => setTimeout(r, 250));
+          continue; // camera output not attached yet — try again
+        }
+        // A manual End rejects on some platforms — that's fine. Anything else is
+        // real, and losing the recording silently is exactly what we must not do.
+        recordError = /stop|cancel/i.test(msg) ? null : msg;
+        break;
+      }
     }
+    if (recordError) Alert.alert('Recording problem', recordError);
 
     if (video?.uri) {
       const saved = await saveToCameraRoll(video.uri); // keep a copy on the device
       if (saved) setNotifyStatus('saved');
       await uploadRecording(video.uri, sessionId); // send it to the safety circle
-    } else {
-      // recordAsync resolved with no file — surface it instead of a silent miss.
+    } else if (!recordError && isRecordingRef.current) {
+      // Resolved with no file and no error — surface it instead of a silent miss.
       Alert.alert(
         'No video was recorded',
         'The camera stopped without producing a file. This can happen in Expo Go; it works in the installed app.',
