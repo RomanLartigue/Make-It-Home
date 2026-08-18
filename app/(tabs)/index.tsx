@@ -26,7 +26,7 @@ import { Beacon } from '@/constants/beacon';
 import { PillButton } from '@/components/beacon/kit';
 import { ESCALATION_SCHEDULE_KEY, DEFAULT_SCHEDULE, normalizeSchedule } from '@/constants/escalation';
 import { startBackgroundLocation, stopBackgroundLocation } from '@/tasks/backgroundLocation';
-import { isGold } from '@/utils/gold';
+import { isGold, useGold } from '@/utils/gold';
 import { startBackgroundAudio, stopBackgroundAudio } from '@/utils/backgroundAudio';
 
 // Shown when a permission isn't granted. If it was previously blocked, the OS
@@ -142,6 +142,7 @@ function formatTime(secs: number) {
 
 export default function HomeScreen() {
   const router = useRouter();
+  const goldActive = useGold();
 
   // Home / cover state
   const [circleCount, setCircleCount] = useState(0);
@@ -768,14 +769,24 @@ export default function HomeScreen() {
     lastLocationUpdateRef.current = 0;
     isRecordingRef.current = false;
     setTimeout(() => setNotifyStatus('idle'), 3000);
-    Alert.alert(
-      reason === 'auto' ? 'Recording finished' : 'Session ended',
-      "Let your safety circle know you're safe?",
-      [
-        { text: "Yes, I'm safe", onPress: () => { sendSafeNotification(); offerBackgroundAudio(); } },
-        { text: 'No thanks', style: 'cancel', onPress: offerBackgroundAudio },
-      ],
-    );
+    // The end-of-session prompt is the highest-intent moment for the recording:
+    // Gold users get a shortcut to their history; free users get one quiet,
+    // contextual line about keeping recordings — never a blocker.
+    isGold().then(gold => {
+      Alert.alert(
+        reason === 'auto' ? 'Recording finished' : 'Session ended',
+        gold
+          ? "Saved to your camera roll and your Gold history.\n\nLet your safety circle know you're safe?"
+          : "Saved to your camera roll (your circle's download link lasts 24h).\n\nLet your safety circle know you're safe?",
+        [
+          { text: "Yes, I'm safe", onPress: () => { sendSafeNotification(); offerBackgroundAudio(); } },
+          gold
+            ? { text: 'View in history', onPress: () => { offerBackgroundAudio(); router.push('/history'); } }
+            : { text: 'Keep for 90 days with Gold', onPress: () => { offerBackgroundAudio(); router.push('/gold'); } },
+          { text: 'No thanks', style: 'cancel', onPress: offerBackgroundAudio },
+        ],
+      );
+    });
   };
 
   // If audio was captured while the phone was locked / app backgrounded, offer to
@@ -989,9 +1000,15 @@ export default function HomeScreen() {
         <Text style={styles.mark}>
           Make It <Text style={{ color: Beacon.beacon }}>Home</Text>
         </Text>
-        <Pressable style={styles.gear} hitSlop={8} onPress={() => router.push('/(tabs)/explore')}>
-          <Ionicons name="settings-outline" size={18} color={Beacon.muted} />
-        </Pressable>
+        <View style={styles.hbarActions}>
+          {/* Discreet Gold chip: shortcut for Gold users, quiet discovery for free users. */}
+          <Pressable style={styles.gear} hitSlop={8} onPress={() => router.push('/(tabs)/gold')}>
+            <Ionicons name={goldActive ? 'star' : 'star-outline'} size={17} color="#f5b942" />
+          </Pressable>
+          <Pressable style={styles.gear} hitSlop={8} onPress={() => router.push('/(tabs)/explore')}>
+            <Ionicons name="settings-outline" size={18} color={Beacon.muted} />
+          </Pressable>
+        </View>
       </View>
 
       {/* Coverage strip */}
@@ -1132,6 +1149,7 @@ const styles = StyleSheet.create({
     marginTop: 6,
   },
   mark: { fontWeight: '800', fontSize: 17, color: Beacon.text, letterSpacing: -0.2 },
+  hbarActions: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   gear: {
     width: 34,
     height: 34,

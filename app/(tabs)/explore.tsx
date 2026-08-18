@@ -17,12 +17,9 @@ import { getUserName, setUserName, getServerUrl, fetchWithAuth } from '@/utils/s
 import { confirmDestructive } from '@/utils/confirm';
 import { Beacon } from '@/constants/beacon';
 import { Card, SectionLabel, SRow, PillButton } from '@/components/beacon/kit';
-import { GoldBadge } from '@/components/beacon/GoldGate';
-import { useGold } from '@/utils/gold';
 
 export default function SettingsScreen() {
   const router = useRouter();
-  const gold = useGold();
   const [name, setName] = useState('');
   const [saved, setSaved] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -117,20 +114,9 @@ export default function SettingsScreen() {
           <SRow label="Test your alert" value="›" onPress={() => router.push('/test-alert')} last />
         </Card>
 
-        <View style={styles.goldHead}>
-          <SectionLabel>Make It Home Gold</SectionLabel>
-          {gold && <GoldBadge style={{ marginTop: 18, marginBottom: 6 }} />}
-        </View>
+        <SectionLabel>Help</SectionLabel>
         <Card style={{ paddingVertical: 2 }}>
-          <SRow label="Recording history" value="›" onPress={() => router.push('/history')} />
-          <SRow label="Nearby help" value="›" onPress={() => router.push('/nearby')} />
-          <SRow
-            label={gold ? 'Manage Gold' : 'Get Gold'}
-            value={gold ? '›' : 'from $4.99/mo ›'}
-            valueColor={gold ? undefined : '#f5b942'}
-            onPress={() => router.push('/gold')}
-            last
-          />
+          <SRow label="Guide — how it works" value="›" onPress={() => router.push('/guide')} last />
         </Card>
 
         <SectionLabel>Server</SectionLabel>
@@ -174,7 +160,6 @@ export default function SettingsScreen() {
 }
 
 const styles = StyleSheet.create({
-  goldHead: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   root: { flex: 1, backgroundColor: Beacon.night },
   scroll: { paddingHorizontal: 20, paddingBottom: 60 },
   h1: { fontSize: 22, fontWeight: '800', color: Beacon.text, marginTop: 8, letterSpacing: -0.3 },

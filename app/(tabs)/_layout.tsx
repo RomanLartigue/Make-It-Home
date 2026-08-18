@@ -35,20 +35,22 @@ export default function TabLayout() {
         }}
       />
       <Tabs.Screen
-        name="guide"
-        options={{
-          title: 'Guide',
-          tabBarIcon: ({ color, size }) => (
-            <Ionicons name="book-outline" size={size - 3} color={color} />
-          ),
-        }}
-      />
-      <Tabs.Screen
         name="explore"
         options={{
           title: 'Settings',
           tabBarIcon: ({ color, size }) => (
             <Ionicons name="settings-sharp" size={size - 3} color={color} />
+          ),
+        }}
+      />
+      <Tabs.Screen
+        name="gold"
+        options={{
+          title: 'Gold',
+          // Gold star stays gold even when inactive so the tab quietly advertises itself.
+          tabBarActiveTintColor: '#f5b942',
+          tabBarIcon: ({ focused, size }) => (
+            <Ionicons name={focused ? 'star' : 'star-outline'} size={size - 3} color={focused ? '#f5b942' : '#8a7433'} />
           ),
         }}
       />

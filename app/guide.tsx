@@ -1,10 +1,11 @@
 import React from 'react';
 import { View, Text, StyleSheet, ScrollView, Linking } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { useRouter } from 'expo-router';
 import Ionicons from '@expo/vector-icons/Ionicons';
 
 import { Beacon } from '@/constants/beacon';
-import { Card, Callout } from '@/components/beacon/kit';
+import { Card, Callout, DetailHeader } from '@/components/beacon/kit';
 
 const STEPS = [
   { n: '1', title: 'Hold the beacon', desc: 'Hold the orange button and drag to how long to record — 15, 30, 45, or 60 min.' },
@@ -41,10 +42,13 @@ const FEATURES: { icon: keyof typeof Ionicons.glyphMap; title: string; body: str
 ];
 
 export default function GuideScreen() {
+  const router = useRouter();
   return (
     <SafeAreaView style={styles.root} edges={['top']}>
+      <View style={{ paddingHorizontal: 20 }}>
+        <DetailHeader title="Guide" onBack={() => router.back()} />
+      </View>
       <ScrollView contentContainerStyle={styles.scroll}>
-        <Text style={styles.h1}>Guide</Text>
         <Text style={styles.sub}>How Make It Home keeps you covered — always here if you forget.</Text>
 
         <Text style={styles.secLabel}>Going live</Text>
