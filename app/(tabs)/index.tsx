@@ -782,7 +782,7 @@ export default function HomeScreen() {
           { text: "Yes, I'm safe", onPress: () => { sendSafeNotification(); offerBackgroundAudio(); } },
           gold
             ? { text: 'View in history', onPress: () => { offerBackgroundAudio(); router.push('/history'); } }
-            : { text: 'Keep for 90 days with Gold', onPress: () => { offerBackgroundAudio(); router.push('/gold'); } },
+            : { text: 'Keep for 90 days with Gold', onPress: () => { offerBackgroundAudio(); router.push('/gold-plans'); } },
           { text: 'No thanks', style: 'cancel', onPress: offerBackgroundAudio },
         ],
       );

@@ -59,7 +59,7 @@ export default function GoldTab() {
         {/* Plan card. Free → the plan/paywall screen. Gold → manage subscription. */}
         <Pressable
           style={[styles.plan, gold && styles.planActive]}
-          onPress={gold ? openManageSubscription : () => router.push('/gold')}
+          onPress={gold ? openManageSubscription : () => router.push('/gold-plans')}
         >
           <View style={styles.planIcon}>
             <Ionicons name={gold ? 'checkmark-circle' : 'star'} size={22} color={gold ? Beacon.safe : GOLD} />
@@ -92,7 +92,7 @@ export default function GoldTab() {
           <Pressable
             key={it.route}
             style={styles.item}
-            onPress={() => router.push((gold ? it.route : '/gold') as any)}
+            onPress={() => router.push((gold ? it.route : '/gold-plans') as any)}
           >
             <View style={[styles.itemIcon, { backgroundColor: it.color + '1f', borderColor: it.color + '55' }]}>
               <Ionicons name={it.icon} size={19} color={it.color} />
@@ -110,7 +110,7 @@ export default function GoldTab() {
         ))}
 
         {!gold && (
-          <Pressable style={styles.getBtn} onPress={() => router.push('/gold')}>
+          <Pressable style={styles.getBtn} onPress={() => router.push('/gold-plans')}>
             <Ionicons name="star" size={16} color="#1a1200" />
             <Text style={styles.getBtnText}>Get Make It Home Gold</Text>
           </Pressable>

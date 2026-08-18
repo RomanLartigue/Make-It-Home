@@ -41,7 +41,7 @@ export function GoldUpsell({
         <GoldBadge />
       </View>
       <Text style={styles.body}>{body}</Text>
-      <Pressable style={styles.cta} onPress={() => router.push('/gold')}>
+      <Pressable style={styles.cta} onPress={() => router.push('/gold-plans')}>
         <Text style={styles.ctaText}>{cta}</Text>
         <Ionicons name="chevron-forward" size={14} color="#1a1200" />
       </Pressable>

@@ -6,8 +6,8 @@ import Ionicons from '@expo/vector-icons/Ionicons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 import { Beacon, RADIUS } from '@/constants/beacon';
-import { DetailHeader, Callout } from '@/components/beacon/kit';
-import { SlideToConfirm } from '@/components/beacon/SlideToConfirm';
+import { DetailHeader } from '@/components/beacon/kit';
+import { DragBeacon } from '@/components/beacon/DragBeacon';
 import { getServerUrl, getUserName, fetchWithAuth, syncCircle } from '@/utils/serverUrl';
 
 const CIRCLE_KEY = '@makeithome_safety_circle';
@@ -108,14 +108,17 @@ export default function TestAlertScreen() {
                 <Text style={styles.sendingText}>Sending test…</Text>
               </View>
             ) : (
-              <SlideToConfirm
-                label="Slide to send test"
+              <DragBeacon
                 icon="flask"
+                idleLabel="Hold"
+                idleSub="& drag out"
+                armedLabel="Release"
+                armedSub="to send test"
                 onConfirm={sendTest}
                 disabled={empty}
               />
             )}
-            <Text style={styles.footHint}>Nothing is sent until you slide all the way across.</Text>
+            <Text style={styles.footHint}>Hold the beacon, drag out, then release to send a test.</Text>
           </>
         )}
       </View>

@@ -56,7 +56,7 @@ export default function RootLayout() {
                 <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
                 <Stack.Screen name="escalation" options={{ headerShown: false }} />
                 <Stack.Screen name="test-alert" options={{ headerShown: false }} />
-                <Stack.Screen name="gold" options={{ headerShown: false }} />
+                <Stack.Screen name="gold-plans" options={{ headerShown: false }} />
                 <Stack.Screen name="guide" options={{ headerShown: false }} />
                 <Stack.Screen name="history" options={{ headerShown: false }} />
                 <Stack.Screen name="nearby" options={{ headerShown: false }} />
