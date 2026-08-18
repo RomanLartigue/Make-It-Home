@@ -145,7 +145,7 @@ export default function HomeScreen() {
   const [elapsed, setElapsed] = useState(0);
   const [coords, setCoords] = useState<Location.LocationObjectCoords | null>(null);
   const [notifyStatus, setNotifyStatus] = useState<
-    'idle' | 'notified' | 'uploading' | 'uploaded' | 'error'
+    'idle' | 'notified' | 'saved' | 'uploading' | 'uploaded' | 'error'
   >('idle');
 
   const cameraRef = useRef<CameraView>(null);
@@ -156,8 +156,6 @@ export default function HomeScreen() {
   const lastLocationUpdateRef = useRef(0);
   const isRecordingRef = useRef(false);
   const goLiveFallbackRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const frameTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const frameActiveRef = useRef(false);
   const recordEndTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Check-in state
@@ -583,56 +581,32 @@ export default function HomeScreen() {
   // the user keeps their own copy. Native only — a browser has no photo library.
   // Uses write-only (add) permission on iOS, and never lets a failed save break
   // the safety flow (the MMS to the circle is what matters most).
-  const saveToCameraRoll = async (uri: string) => {
-    if (IS_WEB) return;
+  // Returns true if saved. Never throws; a failed save must not break the safety
+  // flow, but we DO surface why (silently failing hid a real bug for days).
+  const saveToCameraRoll = async (uri: string): Promise<boolean> => {
+    if (IS_WEB) return false;
     try {
       let perm = await MediaLibrary.getPermissionsAsync(true);
       if (!perm.granted && perm.canAskAgain) perm = await MediaLibrary.requestPermissionsAsync(true);
-      if (perm.granted) await MediaLibrary.saveToLibraryAsync(uri);
-    } catch {
-      // ignore — keeping a local copy is best-effort
-    }
-  };
-
-  // ── Live snapshots ─────────────────────────────────────────────────────────
-  // While recording, push a low-res frame to the server every ~1.8s so a
-  // responder can see a near-live view on the live page. Best-effort: if a
-  // capture fails (e.g. mid-recording on some devices) we just skip that frame;
-  // the full video keeps recording and saving regardless.
-  const startFrameLoop = (sessionId: string) => {
-    if (frameActiveRef.current || IS_WEB) return;
-    frameActiveRef.current = true;
-    const loop = async () => {
-      if (!frameActiveRef.current) return;
-      const cam = cameraRef.current;
-      if (cam) {
-        try {
-          const pic = await cam.takePictureAsync({ base64: true, quality: 0.25, shutterSound: false });
-          if (pic?.base64 && frameActiveRef.current) {
-            const serverUrl = await getServerUrl();
-            await fetchWithAuth(`${serverUrl}/frame/${sessionId}`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'text/plain' },
-              body: pic.base64,
-            }).catch(() => {});
-          }
-        } catch {
-          // capture can reject mid-recording on some devices — skip this frame
-        }
+      if (!perm.granted) {
+        permissionDeniedAlert(
+          'Photos permission needed',
+          "Allow Make It Home to add to your Photos so each recording is saved to your camera roll. If you previously declined, turn it on in Settings.",
+        );
+        return false;
       }
-      if (frameActiveRef.current) frameTimerRef.current = setTimeout(loop, 1800);
-    };
-    // Small initial delay so recording settles before the first capture.
-    frameTimerRef.current = setTimeout(loop, 1200);
-  };
-
-  const stopFrameLoop = () => {
-    frameActiveRef.current = false;
-    if (frameTimerRef.current) {
-      clearTimeout(frameTimerRef.current);
-      frameTimerRef.current = null;
+      await MediaLibrary.saveToLibraryAsync(uri);
+      return true;
+    } catch (e: any) {
+      Alert.alert('Could not save recording', String(e?.message ?? e));
+      return false;
     }
   };
+
+  // (Live-snapshot capture during recording was removed: on iOS, taking a still
+  // on the shared AVCaptureSession mid-recording finalizes the movie file early
+  // — the recording is the evidence and takes priority. Responders still get
+  // live location and the "Download recording" link on the live page.)
 
   const handleCameraReady = async () => {
     if (isRecordingRef.current) return;
@@ -640,7 +614,10 @@ export default function HomeScreen() {
     setIsRecording(true);
     // Capture the session id now — handleEnd clears it before recordAsync resolves.
     const sessionId = sessionIdRef.current;
-    if (sessionId) startFrameLoop(sessionId);
+    // NOTE: the live-snapshot loop is intentionally NOT started while recording.
+    // On iOS, takePictureAsync during recordAsync can abort the recording (no
+    // video file at all). The recording is the evidence — it takes priority.
+    // Responders still get live location + the "Download recording" link.
 
     // The chosen recording length is enforced by a wall-clock timer, NOT by
     // recordAsync resolving — on some devices recordAsync can settle early, and
@@ -651,15 +628,27 @@ export default function HomeScreen() {
       if (isRecordingRef.current) finishSession('auto');
     }, seconds * 1000);
 
+    let video: { uri: string } | undefined;
     try {
       // maxDuration is a backstop cap at the camera level.
-      const video = await cameraRef.current?.recordAsync({ maxDuration: seconds });
-      if (video?.uri) {
-        await saveToCameraRoll(video.uri); // keep a copy on the device
-        await uploadRecording(video.uri, sessionId); // send it to the safety circle
-      }
-    } catch {
-      // stopRecording rejects the promise on some platforms — not a real error
+      video = await cameraRef.current?.recordAsync({ maxDuration: seconds });
+    } catch (e: any) {
+      // A manual End rejects on some platforms — that's fine. Anything else is
+      // real, and losing the recording silently is exactly what we must not do.
+      const msg = String(e?.message ?? e);
+      if (!/stop|cancel/i.test(msg)) Alert.alert('Recording problem', msg);
+    }
+
+    if (video?.uri) {
+      const saved = await saveToCameraRoll(video.uri); // keep a copy on the device
+      if (saved) setNotifyStatus('saved');
+      await uploadRecording(video.uri, sessionId); // send it to the safety circle
+    } else {
+      // recordAsync resolved with no file — surface it instead of a silent miss.
+      Alert.alert(
+        'No video was recorded',
+        'The camera stopped without producing a file. This can happen in Expo Go; it works in the installed app.',
+      );
     }
     // Do NOT finish here — the wall-clock timer (or a manual End) owns the
     // session lifecycle.
@@ -691,7 +680,6 @@ export default function HomeScreen() {
       clearTimeout(recordEndTimerRef.current);
       recordEndTimerRef.current = null;
     }
-    stopFrameLoop();
     if (reason === 'manual') cameraRef.current?.stopRecording();
     locationSub.current?.remove();
     locationSub.current = null;
@@ -810,12 +798,14 @@ export default function HomeScreen() {
         ? '#f87171'
         : notifyStatus === 'uploading'
           ? Beacon.warn
-          : notifyStatus === 'notified' || notifyStatus === 'uploaded'
+          : notifyStatus === 'notified' || notifyStatus === 'uploaded' || notifyStatus === 'saved'
             ? Beacon.safe
             : Beacon.warn;
     const statusLabel =
       notifyStatus === 'notified'
         ? '✓ Circle notified — tracking live'
+        : notifyStatus === 'saved'
+          ? '✓ Saved to your camera roll'
         : notifyStatus === 'uploading'
           ? '⬆ Uploading recording…'
           : notifyStatus === 'uploaded'

@@ -9,7 +9,7 @@ import { Card, Callout } from '@/components/beacon/kit';
 const STEPS = [
   { n: '1', title: 'Hold the beacon', desc: 'Hold the orange button and drag to how long to record — 15, 30, 45, or 60 min.' },
   { n: '2', title: 'Release to go live', desc: 'Let go and your circle is alerted with your live location and a recording for that long.' },
-  { n: '3', title: "You're covered", desc: 'They get your live location, a live camera view, and a saved recording.' },
+  { n: '3', title: "You're covered", desc: 'They get your live location and a recording they can download — and it’s saved to your camera roll.' },
   { n: '4', title: '“Made it home”', desc: 'End the session and we let your circle know you’re safe.' },
 ];
 
@@ -28,9 +28,9 @@ const FEATURES: { icon: keyof typeof Ionicons.glyphMap; title: string; body: str
   },
   {
     icon: 'videocam-outline',
-    title: 'Live video & recording',
+    title: 'Recording & evidence',
     body:
-      'Going live shares a near-live camera view on your link, so your circle can see what’s happening. They can download the recording to show police if needed — and a copy is always saved to your own photos.',
+      'Going live records video for the length you chose. It’s saved to your camera roll automatically, and your circle can download it from your link — so both of you have a copy to show police if needed.',
   },
   {
     icon: 'flask-outline',
@@ -77,7 +77,7 @@ export default function GuideScreen() {
         <Card style={{ paddingVertical: 12, gap: 4 }}>
           <Text style={styles.cardTitle}>A link — no app, no account</Text>
           <Text style={styles.cardBody}>
-            Each person gets a text with your name, live location, and a live camera view. They tap
+            Each person gets a text with your name and live location, plus a link to download the recording. They tap
             “I&apos;m on my way” to say they’ve got it — which stops the ladder from alerting anyone
             else, so help isn&apos;t duplicated and no one double-panics.
           </Text>

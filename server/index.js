@@ -1098,7 +1098,7 @@ app.get('/live/:sessionId', async (req, res) => {
   <div class="live"><span class="dot"></span>LIVE</div>
   <div class="videowrap">
     <img id="frame" alt="">
-    <div id="waiting">Waiting for live video…<br>(starts when the camera is recording)</div>
+    <div id="waiting">Recording in progress…<br>The video will be available to download here when it ends.</div>
   </div>
   <div class="name">${displayName}</div>
   <div class="sub">needs help — tap to navigate</div>
