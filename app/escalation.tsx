@@ -1,20 +1,31 @@
 import React, { useEffect, useState } from 'react';
-import { View, Text, StyleSheet, ScrollView } from 'react-native';
+import { View, Text, StyleSheet, ScrollView, Pressable } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
 import Ionicons from '@expo/vector-icons/Ionicons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 import { Beacon, RADIUS } from '@/constants/beacon';
-import { DetailHeader, Callout } from '@/components/beacon/kit';
-import { ESCALATION_SCHEDULE_KEY, DEFAULT_SCHEDULE, normalizeSchedule } from '@/constants/escalation';
+import { DetailHeader, Callout, PillButton } from '@/components/beacon/kit';
+import { GoldUpsell, GoldBadge, GOLD } from '@/components/beacon/GoldGate';
+import { useGold } from '@/utils/gold';
+import {
+  ESCALATION_SCHEDULE_KEY,
+  DEFAULT_SCHEDULE,
+  WAIT_OPTIONS,
+  MAX_FREE_ROUNDS,
+  normalizeSchedule,
+} from '@/constants/escalation';
 
 const CIRCLE_KEY = '@makeithome_safety_circle';
+const MAX_GOLD_ROUNDS = 8;
 
 export default function EscalationScreen() {
   const router = useRouter();
+  const gold = useGold();
   const [schedule, setSchedule] = useState<number[]>(DEFAULT_SCHEDULE);
   const [circleCount, setCircleCount] = useState(0);
+  const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
     (async () => {
@@ -24,18 +35,41 @@ export default function EscalationScreen() {
       ]);
       setSchedule(normalizeSchedule(rawSchedule ? JSON.parse(rawSchedule) : null));
       setCircleCount(rawCircle ? JSON.parse(rawCircle).length : 0);
+      setLoaded(true);
     })();
   }, []);
 
-  // Build the visible timeline: an immediate alert, then a re-notification after
-  // each scheduled wait (cumulative from go-live).
-  const timeline: { label: string; at: number; first?: boolean }[] = [];
+  // Free users always run the fixed default schedule, even if a stale custom
+  // one is on disk (e.g. Gold lapsed). Gold users run whatever they've set.
+  const effective = gold ? schedule : DEFAULT_SCHEDULE;
+
+  const persist = (next: number[]) => {
+    setSchedule(next);
+    AsyncStorage.setItem(ESCALATION_SCHEDULE_KEY, JSON.stringify(next)).catch(() => {});
+  };
+  const cycleWait = (i: number) =>
+    persist(schedule.map((w, idx) => (idx === i ? WAIT_OPTIONS[(WAIT_OPTIONS.indexOf(w) + 1) % WAIT_OPTIONS.length] : w)));
+  const addRound = () => {
+    if (schedule.length >= MAX_GOLD_ROUNDS) return;
+    persist([...schedule, schedule[schedule.length - 1] ?? 5]);
+  };
+  const removeRound = (i: number) => {
+    if (schedule.length <= 1) return;
+    persist(schedule.filter((_, idx) => idx !== i));
+  };
+  const resetDefault = () => persist(DEFAULT_SCHEDULE);
+
+  // Timeline: immediate alert, then a reminder after each wait (cumulative).
+  const timeline: { label: string; at: number; first?: boolean; idx?: number }[] = [
+    { label: 'You go live — everyone is alerted', at: 0, first: true },
+  ];
   let elapsed = 0;
-  timeline.push({ label: 'You go live — everyone is alerted', at: 0, first: true });
-  schedule.forEach((wait, i) => {
+  effective.forEach((wait, i) => {
     elapsed += wait;
-    timeline.push({ label: `Everyone is texted again (reminder ${i + 1})`, at: elapsed });
+    timeline.push({ label: `Everyone is texted again (reminder ${i + 1})`, at: elapsed, idx: i });
   });
+
+  if (!loaded) return <SafeAreaView style={styles.root} edges={['top']} />;
 
   return (
     <SafeAreaView style={styles.root} edges={['top']}>
@@ -60,7 +94,10 @@ export default function EscalationScreen() {
           </View>
         )}
 
-        <Text style={styles.secLabel}>What happens if no one responds</Text>
+        <View style={styles.secRow}>
+          <Text style={styles.secLabel}>What happens if no one responds</Text>
+          {gold && <GoldBadge />}
+        </View>
         <View style={styles.card}>
           {timeline.map((t, i) => (
             <View key={i} style={[styles.row, i === timeline.length - 1 && { borderBottomWidth: 0 }]}>
@@ -70,10 +107,28 @@ export default function EscalationScreen() {
                 </Text>
               </View>
               <View style={styles.dotCol}>
-                <View style={[styles.dot, t.first && styles.dotFirst]} />
+                <View style={[styles.dot, t.first && styles.dotFirst, gold && !t.first && { backgroundColor: GOLD }]} />
                 {i < timeline.length - 1 && <View style={styles.dotLine} />}
               </View>
-              <Text style={styles.rowLabel}>{t.label}</Text>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.rowLabel}>{t.label}</Text>
+                {gold && t.idx !== undefined && (
+                  <View style={styles.editRow}>
+                    <Pressable style={styles.waitPill} onPress={() => cycleWait(t.idx!)}>
+                      <Ionicons name="time-outline" size={12} color={Beacon.muted} />
+                      <Text style={styles.waitText}>
+                        {schedule[t.idx!]} min after the previous text
+                      </Text>
+                      <Ionicons name="chevron-forward" size={12} color={Beacon.faint} />
+                    </Pressable>
+                    {schedule.length > 1 && (
+                      <Pressable onPress={() => removeRound(t.idx!)} hitSlop={8} style={styles.trash}>
+                        <Ionicons name="trash-outline" size={15} color={Beacon.faint} />
+                      </Pressable>
+                    )}
+                  </View>
+                )}
+              </View>
             </View>
           ))}
         </View>
@@ -81,13 +136,28 @@ export default function EscalationScreen() {
           The moment a responder taps “I’m on my way,” the reminders stop — no one is texted again.
         </Text>
 
-        <View style={styles.upsell}>
-          <Ionicons name="sparkles-outline" size={16} color={Beacon.amber} />
-          <Text style={styles.upsellText}>
-            <Text style={{ color: Beacon.text, fontWeight: '700' }}>Silver &amp; Gold: </Text>
-            set your own reminder times and how many — coming with subscriptions.
-          </Text>
-        </View>
+        {gold ? (
+          <View style={styles.goldControls}>
+            <PillButton
+              title={schedule.length >= MAX_GOLD_ROUNDS ? `Max ${MAX_GOLD_ROUNDS} reminders` : '+ Add another reminder'}
+              kind="dark"
+              onPress={addRound}
+              disabled={schedule.length >= MAX_GOLD_ROUNDS}
+              style={{ flex: 1 }}
+            />
+            <Pressable style={styles.resetBtn} onPress={resetDefault} hitSlop={6}>
+              <Ionicons name="refresh" size={16} color={Beacon.muted} />
+              <Text style={styles.resetText}>Default</Text>
+            </Pressable>
+          </View>
+        ) : (
+          <View style={{ marginTop: 18 }}>
+            <GoldUpsell
+              title="Set your own timing"
+              body={`Free uses a fixed schedule: another text after ${DEFAULT_SCHEDULE.join(', then ')} minutes (${MAX_FREE_ROUNDS} reminders). With Gold you choose exactly when your circle is re-texted, and how many times.`}
+            />
+          </View>
+        )}
 
         <Callout>
           Reminders only ever go to people already in your safety circle, and always include your
@@ -115,14 +185,13 @@ const styles = StyleSheet.create({
   },
   emptyText: { color: Beacon.muted, fontSize: 13, textAlign: 'center', lineHeight: 19 },
 
+  secRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 12, marginBottom: 8 },
   secLabel: {
     fontSize: 10.5,
     fontWeight: '700',
     letterSpacing: 1,
     textTransform: 'uppercase',
     color: Beacon.faint,
-    marginTop: 12,
-    marginBottom: 8,
   },
   card: {
     backgroundColor: Beacon.surface,
@@ -138,19 +207,34 @@ const styles = StyleSheet.create({
   dot: { width: 10, height: 10, borderRadius: 5, backgroundColor: Beacon.faint, marginTop: 3 },
   dotFirst: { backgroundColor: Beacon.beacon },
   dotLine: { width: 2, flex: 1, backgroundColor: Beacon.line, marginTop: 2 },
-  rowLabel: { flex: 1, fontSize: 13.5, color: Beacon.text, lineHeight: 18, paddingLeft: 4 },
+  rowLabel: { fontSize: 13.5, color: Beacon.text, lineHeight: 18, paddingLeft: 4 },
+  editRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 8, paddingLeft: 4 },
+  waitPill: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: Beacon.surface2,
+    borderWidth: 1,
+    borderColor: '#4a3c14',
+    borderRadius: RADIUS.pill,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+  },
+  waitText: { flex: 1, color: Beacon.muted, fontSize: 12 },
+  trash: { padding: 4 },
   note: { fontSize: 12, color: Beacon.faint, lineHeight: 17, marginTop: 10, paddingHorizontal: 2 },
 
-  upsell: {
+  goldControls: { flexDirection: 'row', alignItems: 'center', gap: 10, marginTop: 14 },
+  resetBtn: {
     flexDirection: 'row',
-    gap: 9,
-    alignItems: 'flex-start',
-    backgroundColor: '#1e1a12',
+    alignItems: 'center',
+    gap: 5,
+    paddingHorizontal: 12,
+    paddingVertical: 12,
     borderWidth: 1,
-    borderColor: '#3a3016',
-    borderRadius: RADIUS.card,
-    padding: 13,
-    marginTop: 18,
+    borderColor: Beacon.line,
+    borderRadius: 999,
   },
-  upsellText: { flex: 1, color: Beacon.muted, fontSize: 12.5, lineHeight: 18 },
+  resetText: { color: Beacon.muted, fontSize: 12.5, fontWeight: '600' },
 });

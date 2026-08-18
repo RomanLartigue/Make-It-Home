@@ -26,6 +26,7 @@ import { Beacon } from '@/constants/beacon';
 import { PillButton } from '@/components/beacon/kit';
 import { ESCALATION_SCHEDULE_KEY, DEFAULT_SCHEDULE, normalizeSchedule } from '@/constants/escalation';
 import { startBackgroundLocation, stopBackgroundLocation } from '@/tasks/backgroundLocation';
+import { isGold } from '@/utils/gold';
 import { startBackgroundAudio, stopBackgroundAudio } from '@/utils/backgroundAudio';
 
 // Shown when a permission isn't granted. If it was previously blocked, the OS
@@ -120,7 +121,12 @@ async function getEscalationTiers(): Promise<
   const circle: any[] = rawCircle ? JSON.parse(rawCircle) : [];
   const phones = circle.map(c => c.phone).filter(Boolean);
   if (!phones.length) return null;
-  const schedule = normalizeSchedule(rawSchedule ? JSON.parse(rawSchedule) : DEFAULT_SCHEDULE);
+  // Custom timing is a Gold feature: free users always run the fixed default
+  // schedule, even if a custom one is on disk (e.g. Gold lapsed).
+  const gold = await isGold();
+  const schedule = gold
+    ? normalizeSchedule(rawSchedule ? JSON.parse(rawSchedule) : DEFAULT_SCHEDULE)
+    : DEFAULT_SCHEDULE;
   const rounds = [{ name: 'Alert', waitMinutes: 0, phones }];
   schedule.forEach((wait, i) => {
     rounds.push({ name: `Reminder ${i + 1}`, waitMinutes: wait, phones });
@@ -359,8 +365,17 @@ export default function HomeScreen() {
     // Tie the recording to its session so the responder's live page can offer a
     // "Download recording" link once it lands.
     if (sessionId) formData.append('sessionId', sessionId);
+    // Gold: keep this recording in cloud history (90 days) with a bit of context.
+    const gold = await isGold();
+    if (gold) {
+      if (coords) {
+        formData.append('latitude', String(coords.latitude));
+        formData.append('longitude', String(coords.longitude));
+      }
+      formData.append('durationSec', String(recordDurationSecRef.current));
+    }
     try {
-      const res = await fetchWithAuth(`${serverUrl}/upload`, { method: 'POST', body: formData });
+      const res = await fetchWithAuth(`${serverUrl}/upload${gold ? '?gold=1' : ''}`, { method: 'POST', body: formData });
       if (res.ok) setNotifyStatus('uploaded');
       else {
         console.error('Upload error:', await res.json().catch(() => ({})));

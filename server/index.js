@@ -225,13 +225,33 @@ const MEDIA_TOKEN_PREFIX = 'mediatoken:';
 const MEDIA_TOKEN_TTL = 24 * 60 * 60; // 24 hours in seconds
 const mediaTokenStore = new Map(); // token → filename (in-memory fallback)
 
-async function saveMediaToken(token, filename, ownerToken) {
+// Gold "cloud recording history": recordings are kept for 90 days instead of 24h.
+const GOLD_MEDIA_TTL = 90 * 24 * 60 * 60; // seconds
+const HISTORY_PREFIX = 'history:';        // history:<deviceToken> → [{...}, ...] (newest first)
+const HISTORY_MAX = 200;
+const historyStore = new Map();           // in-memory fallback
+
+async function saveMediaToken(token, filename, ownerToken, ttlSeconds = MEDIA_TOKEN_TTL) {
   if (redis) {
-    await redisSet(`${MEDIA_TOKEN_PREFIX}${token}`, { filename, ownerToken }, MEDIA_TOKEN_TTL);
+    await redisSet(`${MEDIA_TOKEN_PREFIX}${token}`, { filename, ownerToken, expiresAt: Date.now() + ttlSeconds * 1000 }, ttlSeconds);
   } else {
-    mediaTokenStore.set(token, { filename, ownerToken });
-    setTimeout(() => mediaTokenStore.delete(token), MEDIA_TOKEN_TTL * 1000);
+    mediaTokenStore.set(token, { filename, ownerToken, expiresAt: Date.now() + ttlSeconds * 1000 });
+    setTimeout(() => mediaTokenStore.delete(token), ttlSeconds * 1000);
   }
+}
+
+async function getHistory(ownerToken) {
+  if (redis) return (await redisGet(`${HISTORY_PREFIX}${ownerToken}`)) || [];
+  return historyStore.get(ownerToken) || [];
+}
+async function setHistory(ownerToken, list) {
+  const trimmed = list.slice(0, HISTORY_MAX);
+  if (redis) await redisSet(`${HISTORY_PREFIX}${ownerToken}`, trimmed, GOLD_MEDIA_TTL);
+  else historyStore.set(ownerToken, trimmed);
+}
+async function addHistoryEntry(ownerToken, entry) {
+  const list = await getHistory(ownerToken);
+  await setHistory(ownerToken, [entry, ...list.filter(e => e.id !== entry.id)]);
 }
 
 async function resolveMediaToken(token) {
@@ -530,7 +550,11 @@ if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
 
 const storage = multer.diskStorage({
   destination: uploadDir,
-  filename: (req, file, cb) => cb(null, `${Date.now()}-recording.mp4`),
+  // Gold uploads (query ?gold=1) get a "gold-" prefix so the sweeper keeps them
+  // for the long Gold retention instead of 24h. (multer runs before body fields
+  // are parsed, so the flag rides on the query string.)
+  filename: (req, file, cb) =>
+    cb(null, `${req.query?.gold === '1' ? 'gold-' : ''}${Date.now()}-recording.mp4`),
 });
 
 function videoFileFilter(req, file, cb) {
@@ -552,14 +576,17 @@ const upload = multer({
 // strand recordings on disk forever.
 // TODO (production): recordings should live in object storage (S3/R2) behind
 // short-lived signed URLs, not on this container's ephemeral disk.
+// Gold recordings are named "gold-<ts>-recording.mp4" and kept for GOLD_MEDIA_TTL;
+// everything else expires at MEDIA_TOKEN_TTL.
 function sweepOldUploads() {
-  const cutoff = Date.now() - MEDIA_TOKEN_TTL * 1000;
+  const now = Date.now();
   fs.readdir(uploadDir, (err, files) => {
     if (err) return;
     for (const f of files) {
       const fp = path.join(uploadDir, f);
+      const ttl = f.startsWith('gold-') ? GOLD_MEDIA_TTL : MEDIA_TOKEN_TTL;
       fs.stat(fp, (e, st) => {
-        if (!e && st.isFile() && st.mtimeMs < cutoff) fs.unlink(fp, () => {});
+        if (!e && st.isFile() && st.mtimeMs < now - ttl * 1000) fs.unlink(fp, () => {});
       });
     }
   });
@@ -621,9 +648,12 @@ app.post('/upload', (req, res, next) => {
   if (!SERVER_URL) return res.status(500).json({ error: 'SERVER_URL is not configured.' });
   if (!twilioClient) return res.status(503).json({ error: 'Twilio not configured on the server.' });
 
-  // Generate a signed token so Twilio can download the file without auth headers
+  // Generate a signed token so Twilio can download the file without auth headers.
+  // Gold: the recording (and its link) live for 90 days instead of 24h.
+  const isGoldUpload = req.query?.gold === '1';
+  const ownerToken = String(req.headers['x-mih-key'] || '');
   const mediaToken = crypto.randomBytes(24).toString('hex');
-  await saveMediaToken(mediaToken, req.file.filename, String(req.headers['x-mih-key'] || ''));
+  await saveMediaToken(mediaToken, req.file.filename, ownerToken, isGoldUpload ? GOLD_MEDIA_TTL : MEDIA_TOKEN_TTL);
   const mediaUrl = `${SERVER_URL}/media/${req.file.filename}?token=${mediaToken}`;
   const body = '🎥 Safety recording from your safety circle. Reply STOP to opt out.';
 
@@ -646,13 +676,30 @@ app.post('/upload', (req, res, next) => {
   // Attach the recording to its session so the responder's live page can offer a
   // "Download recording" link (the user already has a local copy in their roll).
   const sessionId = req.body.sessionId;
+  let sessionMeta = null;
   if (sessionId) {
-    const token = String(req.headers['x-mih-key'] || '');
     const session = await sessionGet(sessionId);
-    if (session && (!session.ownerToken || session.ownerToken === token)) {
+    if (session && (!session.ownerToken || session.ownerToken === ownerToken)) {
       session.recordingUrl = mediaUrl;
       await sessionSet(sessionId, session);
+      sessionMeta = session;
     }
+  }
+
+  // Gold cloud history: remember this recording for the device so it can be
+  // listed/downloaded/deleted later from the History screen.
+  if (isGoldUpload) {
+    await addHistoryEntry(ownerToken, {
+      id: req.file.filename,
+      sessionId: sessionId || null,
+      createdAt: Date.now(),
+      expiresAt: Date.now() + GOLD_MEDIA_TTL * 1000,
+      sizeBytes: req.file.size || null,
+      mediaUrl,
+      latitude: sessionMeta?.latitude ?? (req.body.latitude != null ? Number(req.body.latitude) : null),
+      longitude: sessionMeta?.longitude ?? (req.body.longitude != null ? Number(req.body.longitude) : null),
+      durationSec: req.body.durationSec != null ? Number(req.body.durationSec) : null,
+    });
   }
 
   // Cleanup is handled by delete-on-fetch (the /media route) plus the boot sweep,
@@ -1250,10 +1297,132 @@ app.post('/account/delete', async (req, res) => {
   await deleteSessionsOwnedBy(token);
   await deleteCheckInsOwnedBy(token);
   await deleteMediaOwnedBy(token);
+  // Gold history: remove entries + files.
+  for (const e of await getHistory(token)) fs.unlink(path.join(uploadDir, e.id), () => {});
+  if (redis) await redisDel(`${HISTORY_PREFIX}${token}`); else historyStore.delete(token);
   await deleteCircleFor(token);
   await deleteToken(token); // last — we needed it to find the above
   console.log('[/account/delete] Purged all data for a device.');
   res.json({ deleted: true });
+});
+
+// ── Gold cloud recording history ──────────────────────────────────────────────
+// GET  /history          → this device's recordings (newest first), sans expired
+// POST /history/delete   → { id } removes one entry + its file (user-deletable)
+// Authenticated by X-MIH-Key; entries are always scoped to the calling device.
+app.get('/history', async (req, res) => {
+  const ownerToken = String(req.headers['x-mih-key'] || '');
+  const now = Date.now();
+  const list = (await getHistory(ownerToken)).filter(e => !e.expiresAt || e.expiresAt > now);
+  res.json({ items: list });
+});
+
+app.post('/history/delete', async (req, res) => {
+  const ownerToken = String(req.headers['x-mih-key'] || '');
+  const { id } = req.body || {};
+  if (!id || typeof id !== 'string' || !/^[\w.-]+$/.test(id)) {
+    return res.status(400).json({ error: 'id is required.' });
+  }
+  const list = await getHistory(ownerToken);
+  const entry = list.find(e => e.id === id);
+  if (!entry) return res.status(404).json({ error: 'Not found.' });
+  await setHistory(ownerToken, list.filter(e => e.id !== id));
+  fs.unlink(path.join(uploadDir, id), () => {});
+  console.log('[/history/delete] Removed a Gold recording for a device.');
+  res.json({ deleted: true });
+});
+
+// ── Gold: nearby emergency services ───────────────────────────────────────────
+// GET /nearby?lat=..&lng=..  → nearest police stations, hospitals, fire stations
+// Data: OpenStreetMap via the Overpass API (free, no key, worldwide). Proxied so
+// the app never talks to a third party directly, results are cached briefly, and
+// coordinates are validated. "Useful data, nothing critical" — the app always
+// tells users to call their local emergency number in a real emergency.
+const NEARBY_CACHE = new Map(); // key → { at, data }
+const NEARBY_CACHE_TTL = 10 * 60 * 1000;
+const NEARBY_RADIUS_M = 8000;
+// Primary + a fallback mirror. kumi.systems was dropped: it hangs on this query.
+const OVERPASS_URLS = [
+  'https://overpass-api.de/api/interpreter',
+  'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
+];
+const OVERPASS_TIMEOUT_MS = 40000;
+
+function haversineKm(lat1, lon1, lat2, lon2) {
+  const R = 6371, toRad = d => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1), dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+app.get('/nearby', async (req, res) => {
+  const lat = Number(req.query.lat), lng = Number(req.query.lng);
+  const coordErr = validateCoords(lat, lng);
+  if (coordErr || !Number.isFinite(lat) || !Number.isFinite(lng)) {
+    return res.status(400).json({ error: 'lat and lng are required.' });
+  }
+  // Cache on a ~500m grid so nearby users share results.
+  const key = `${lat.toFixed(2)},${lng.toFixed(2)}`;
+  const cached = NEARBY_CACHE.get(key);
+  if (cached && Date.now() - cached.at < NEARBY_CACHE_TTL) return res.json(cached.data);
+
+  const q = `[out:json][timeout:35];
+(
+  nwr(around:${NEARBY_RADIUS_M},${lat},${lng})["amenity"="police"];
+  nwr(around:${NEARBY_RADIUS_M},${lat},${lng})["amenity"="hospital"];
+  nwr(around:${NEARBY_RADIUS_M},${lat},${lng})["amenity"="fire_station"];
+);
+out center tags;`;
+
+  let json = null, lastErr = null;
+  for (const url of OVERPASS_URLS) {
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), OVERPASS_TIMEOUT_MS);
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'MakeItHome/1.0 (safety app)' },
+        body: 'data=' + encodeURIComponent(q),
+        signal: ctrl.signal,
+      });
+      clearTimeout(t);
+      if (!r.ok) throw new Error(`Overpass HTTP ${r.status}`);
+      json = await r.json();
+      break;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  if (!json) {
+    console.warn('[/nearby] Overpass unavailable:', lastErr?.message || lastErr);
+    return res.status(503).json({ error: 'Nearby data is temporarily unavailable.' });
+  }
+
+  const byType = { police: [], hospital: [], fire_station: [] };
+  for (const el of json.elements || []) {
+    const tags = el.tags || {};
+    const type = tags.amenity;
+    if (!byType[type]) continue;
+    const plat = el.lat ?? el.center?.lat, plng = el.lon ?? el.center?.lon;
+    if (plat == null || plng == null) continue;
+    const addr = [tags['addr:housenumber'], tags['addr:street']].filter(Boolean).join(' ') || tags['addr:full'] || null;
+    byType[type].push({
+      name: tags.name || (type === 'police' ? 'Police station' : type === 'hospital' ? 'Hospital' : 'Fire station'),
+      lat: plat,
+      lng: plng,
+      distanceKm: Math.round(haversineKm(lat, lng, plat, plng) * 10) / 10,
+      phone: tags.phone || tags['contact:phone'] || null,
+      address: addr,
+      emergency: tags.emergency === 'yes' || undefined,
+    });
+  }
+  for (const k of Object.keys(byType)) {
+    byType[k].sort((a, b) => a.distanceKm - b.distanceKm);
+    byType[k] = byType[k].slice(0, 5);
+  }
+  const data = { at: Date.now(), radiusKm: NEARBY_RADIUS_M / 1000, ...byType };
+  NEARBY_CACHE.set(key, { at: Date.now(), data });
+  res.json(data);
 });
 
 // ── POST /circle/sync ─────────────────────────────────────────────────────────
