@@ -85,9 +85,15 @@ export default function GoldTab() {
           <Text style={styles.thanks}>Thanks for keeping the safety button free for everyone. ♥</Text>
         )}
 
-        <Text style={styles.secLabel}>{gold ? 'Your Gold features' : 'What Gold adds'}</Text>
+        <Text style={styles.secLabel}>{gold ? 'Your Gold features' : 'What you get'}</Text>
         {ITEMS.map(it => (
-          <Pressable key={it.route} style={styles.item} onPress={() => router.push(it.route as any)}>
+          // Free: the rows are a showcase — any tap leads to the Gold info screen
+          // (the "Get Gold" button is the real CTA). Gold: rows open the feature.
+          <Pressable
+            key={it.route}
+            style={styles.item}
+            onPress={() => router.push((gold ? it.route : '/gold') as any)}
+          >
             <View style={[styles.itemIcon, { backgroundColor: it.color + '1f', borderColor: it.color + '55' }]}>
               <Ionicons name={it.icon} size={19} color={it.color} />
             </View>
@@ -95,10 +101,20 @@ export default function GoldTab() {
               <Text style={styles.itemTitle}>{it.title}</Text>
               <Text style={styles.itemBody}>{it.body}</Text>
             </View>
-            {!gold && <Ionicons name="lock-closed-outline" size={15} color={Beacon.faint} style={{ marginRight: 2 }} />}
-            <Ionicons name="chevron-forward" size={17} color={Beacon.faint} />
+            {gold ? (
+              <Ionicons name="chevron-forward" size={17} color={Beacon.faint} />
+            ) : (
+              <Ionicons name="lock-closed" size={15} color={Beacon.faint} />
+            )}
           </Pressable>
         ))}
+
+        {!gold && (
+          <Pressable style={styles.getBtn} onPress={() => router.push('/gold')}>
+            <Ionicons name="star" size={16} color="#1a1200" />
+            <Text style={styles.getBtnText}>Get Make It Home Gold</Text>
+          </Pressable>
+        )}
 
         <View style={styles.note}>
           <Ionicons name="heart-outline" size={14} color={Beacon.muted} />
@@ -164,6 +180,19 @@ const styles = StyleSheet.create({
   itemIcon: { width: 40, height: 40, borderRadius: 12, borderWidth: 1, alignItems: 'center', justifyContent: 'center' },
   itemTitle: { color: Beacon.text, fontSize: 14.5, fontWeight: '700' },
   itemBody: { color: Beacon.muted, fontSize: 12.5, lineHeight: 17, marginTop: 2 },
+
+  getBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 7,
+    backgroundColor: GOLD,
+    borderRadius: 999,
+    paddingVertical: 14,
+    marginTop: 6,
+    marginBottom: 4,
+  },
+  getBtnText: { color: '#1a1200', fontSize: 15.5, fontWeight: '800' },
 
   note: { flexDirection: 'row', gap: 8, alignItems: 'flex-start', paddingHorizontal: 4, marginTop: 8 },
   noteText: { flex: 1, color: Beacon.muted, fontSize: 12, lineHeight: 17 },

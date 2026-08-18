@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { View, Text, StyleSheet, ScrollView, Pressable } from 'react-native';
+import { View, Text, StyleSheet, ScrollView, Pressable, TextInput } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
 import Ionicons from '@expo/vector-icons/Ionicons';
@@ -12,18 +12,20 @@ import { useGold } from '@/utils/gold';
 import {
   ESCALATION_SCHEDULE_KEY,
   DEFAULT_SCHEDULE,
-  WAIT_OPTIONS,
   MAX_FREE_ROUNDS,
   normalizeSchedule,
 } from '@/constants/escalation';
 
 const CIRCLE_KEY = '@makeithome_safety_circle';
 const MAX_GOLD_ROUNDS = 8;
+const MAX_WAIT_MIN = 120;
 
 export default function EscalationScreen() {
   const router = useRouter();
   const gold = useGold();
   const [schedule, setSchedule] = useState<number[]>(DEFAULT_SCHEDULE);
+  // Text drafts mirror the schedule so typing feels natural (can be empty mid-edit).
+  const [drafts, setDrafts] = useState<string[]>(DEFAULT_SCHEDULE.map(String));
   const [circleCount, setCircleCount] = useState(0);
   const [loaded, setLoaded] = useState(false);
 
@@ -33,7 +35,9 @@ export default function EscalationScreen() {
         AsyncStorage.getItem(ESCALATION_SCHEDULE_KEY),
         AsyncStorage.getItem(CIRCLE_KEY),
       ]);
-      setSchedule(normalizeSchedule(rawSchedule ? JSON.parse(rawSchedule) : null));
+      const sched = normalizeSchedule(rawSchedule ? JSON.parse(rawSchedule) : null);
+      setSchedule(sched);
+      setDrafts(sched.map(String));
       setCircleCount(rawCircle ? JSON.parse(rawCircle).length : 0);
       setLoaded(true);
     })();
@@ -47,17 +51,31 @@ export default function EscalationScreen() {
     setSchedule(next);
     AsyncStorage.setItem(ESCALATION_SCHEDULE_KEY, JSON.stringify(next)).catch(() => {});
   };
-  const cycleWait = (i: number) =>
-    persist(schedule.map((w, idx) => (idx === i ? WAIT_OPTIONS[(WAIT_OPTIONS.indexOf(w) + 1) % WAIT_OPTIONS.length] : w)));
+  // Live-edit a reminder's minutes: keep only digits in the draft.
+  const editDraft = (i: number, text: string) =>
+    setDrafts(d => d.map((v, idx) => (idx === i ? text.replace(/[^0-9]/g, '').slice(0, 3) : v)));
+  // Commit on blur: clamp 1..120; empty/zero reverts to the current value.
+  const commitDraft = (i: number) => {
+    const parsed = parseInt(drafts[i], 10);
+    const val = Number.isFinite(parsed) && parsed > 0 ? Math.min(MAX_WAIT_MIN, parsed) : schedule[i];
+    persist(schedule.map((w, idx) => (idx === i ? val : w)));
+    setDrafts(d => d.map((v, idx) => (idx === i ? String(val) : v)));
+  };
   const addRound = () => {
     if (schedule.length >= MAX_GOLD_ROUNDS) return;
-    persist([...schedule, schedule[schedule.length - 1] ?? 5]);
+    const val = schedule[schedule.length - 1] ?? 5;
+    persist([...schedule, val]);
+    setDrafts(d => [...d, String(val)]);
   };
   const removeRound = (i: number) => {
     if (schedule.length <= 1) return;
     persist(schedule.filter((_, idx) => idx !== i));
+    setDrafts(d => d.filter((_, idx) => idx !== i));
   };
-  const resetDefault = () => persist(DEFAULT_SCHEDULE);
+  const resetDefault = () => {
+    persist(DEFAULT_SCHEDULE);
+    setDrafts(DEFAULT_SCHEDULE.map(String));
+  };
 
   // Timeline: immediate alert, then a reminder after each wait (cumulative).
   const timeline: { label: string; at: number; first?: boolean; idx?: number }[] = [
@@ -114,13 +132,21 @@ export default function EscalationScreen() {
                 <Text style={styles.rowLabel}>{t.label}</Text>
                 {gold && t.idx !== undefined && (
                   <View style={styles.editRow}>
-                    <Pressable style={styles.waitPill} onPress={() => cycleWait(t.idx!)}>
-                      <Ionicons name="time-outline" size={12} color={Beacon.muted} />
-                      <Text style={styles.waitText}>
-                        {schedule[t.idx!]} min after the previous text
-                      </Text>
-                      <Ionicons name="chevron-forward" size={12} color={Beacon.faint} />
-                    </Pressable>
+                    <View style={styles.waitPill}>
+                      <Ionicons name="time-outline" size={13} color={Beacon.muted} />
+                      <TextInput
+                        style={styles.waitInput}
+                        value={drafts[t.idx!]}
+                        onChangeText={text => editDraft(t.idx!, text)}
+                        onEndEditing={() => commitDraft(t.idx!)}
+                        onBlur={() => commitDraft(t.idx!)}
+                        keyboardType="number-pad"
+                        returnKeyType="done"
+                        maxLength={3}
+                        selectTextOnFocus
+                      />
+                      <Text style={styles.waitSuffix}>min after the previous text</Text>
+                    </View>
                     {schedule.length > 1 && (
                       <Pressable onPress={() => removeRound(t.idx!)} hitSlop={8} style={styles.trash}>
                         <Ionicons name="trash-outline" size={15} color={Beacon.faint} />
@@ -219,9 +245,23 @@ const styles = StyleSheet.create({
     borderColor: '#4a3c14',
     borderRadius: RADIUS.pill,
     paddingHorizontal: 10,
-    paddingVertical: 7,
+    paddingVertical: 6,
   },
-  waitText: { flex: 1, color: Beacon.muted, fontSize: 12 },
+  waitInput: {
+    minWidth: 34,
+    color: Beacon.text,
+    fontSize: 15,
+    fontWeight: '800',
+    fontVariant: ['tabular-nums'],
+    paddingVertical: 0,
+    textAlign: 'center',
+    backgroundColor: Beacon.night,
+    borderWidth: 1,
+    borderColor: GOLD,
+    borderRadius: 8,
+    paddingHorizontal: 4,
+  },
+  waitSuffix: { flex: 1, color: Beacon.muted, fontSize: 12 },
   trash: { padding: 4 },
   note: { fontSize: 12, color: Beacon.faint, lineHeight: 17, marginTop: 10, paddingHorizontal: 2 },
 
