@@ -1181,6 +1181,39 @@ async function escalationSweep() {
     // climb — only the USER ends alerts, by marking safe (which ends the
     // session). `ended` is the single off switch.
     if (!s || !Array.isArray(s.tiers) || s.ended) continue;
+
+    // Swipe-closing the app = "I'm safe" (product decision). A killed app can
+    // run no code, so this is detected by silence: the app heartbeats
+    // /session/update every 15s while alive (foreground AND background), and
+    // each heartbeat refreshes updatedAt. ~2 min of silence ⇒ the app was
+    // closed ⇒ end the session and tell the circle the user is safe, exactly
+    // as if they'd pressed the button. (Trade-off, accepted: a dead battery is
+    // indistinguishable from a swipe-close and also reads as safe.)
+    const lastSeen = Number(s.updatedAt || s.startedAt || 0);
+    if (lastSeen && now - lastSeen > 2 * 60 * 1000) {
+      const fresh = await sessionGet(sessionId);
+      if (!fresh || fresh.ended) continue;
+      await sessionSet(sessionId, { ...fresh, ended: true, endedAt: Date.now(), endedBy: 'app-closed' });
+      liveFrames.delete(sessionId);
+      const phones = [...new Set((s.tiers || []).flatMap(t => t.phones || []))];
+      const nm = cleanName(s.name) || 'Your contact';
+      if (phones.length && twilioClient) {
+        sendSmsToAll(phones, `✅ ${nm} is safe. Reply STOP to opt out.`)
+          .then(r => console.log(`[liveness] ${sessionId}: app closed — safe notice sent ${r.sent}/${phones.length}.`))
+          .catch(() => {});
+      }
+      // Finalize the recording like a normal end would.
+      if (s.livekit && EGRESS_ENABLED) {
+        const coords =
+          s.latitude != null && s.longitude != null
+            ? { latitude: s.latitude, longitude: s.longitude }
+            : null;
+        stopAndRegisterEgress(sessionId, s.ownerToken, s.name, coords).catch(() => {});
+      }
+      console.log(`[liveness] ${sessionId}: no heartbeat for ${Math.round((now - lastSeen) / 1000)}s — ended as safe (app closed).`);
+      continue;
+    }
+
     let lastAlerted = -1;
     for (let i = 0; i < s.tiers.length; i++) if (s.tiers[i].alertedAt) lastAlerted = i;
     if (lastAlerted < 0) continue;
