@@ -30,6 +30,32 @@ try {
   }
 } catch (e) {}
 
+// WeakRef / FinalizationRegistry shims — this Hermes build doesn't provide
+// them, and a dependency references WeakRef at module-eval (crashed build 37 at
+// launch: "Property 'WeakRef' doesn't exist"). The shim holds a strong
+// reference (slightly leaky semantics, fully functional for metadata caches);
+// FinalizationRegistry is a no-op. Both are safe everywhere and are ignored
+// wherever the real globals exist.
+try {
+  if (typeof global.WeakRef === 'undefined') {
+    global.WeakRef = class WeakRef {
+      constructor(target) {
+        this._t = target;
+      }
+      deref() {
+        return this._t;
+      }
+    };
+  }
+  if (typeof global.FinalizationRegistry === 'undefined') {
+    global.FinalizationRegistry = class FinalizationRegistry {
+      constructor() {}
+      register() {}
+      unregister() {}
+    };
+  }
+} catch (e) {}
+
 const LAST_ERROR_KEY = '@makeithome_last_startup_error';
 
 function describe(error) {
