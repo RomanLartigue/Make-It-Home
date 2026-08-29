@@ -25,7 +25,7 @@ const FEATURES: { icon: keyof typeof Ionicons.glyphMap; title: string; body: str
     icon: 'notifications-outline',
     title: 'Escalation',
     body:
-      'If no one taps “I’m on my way,” we text your whole circle again — after 5 minutes, then 10, then 15 — until someone responds. (Silver & Gold can set their own timing.)',
+      'Your whole circle is texted again at ⅓, ⅔ and the full time of your slider — and if you still haven’t marked yourself safe after that, every 5 minutes until you do. Only you can stop the alerts. (Gold can set its own timing.)',
   },
   {
     icon: 'videocam-outline',

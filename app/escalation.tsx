@@ -12,7 +12,6 @@ import { useGold } from '@/utils/gold';
 import {
   ESCALATION_SCHEDULE_KEY,
   DEFAULT_SCHEDULE,
-  MAX_FREE_ROUNDS,
   normalizeSchedule,
 } from '@/constants/escalation';
 
@@ -35,10 +34,24 @@ export default function EscalationScreen() {
         AsyncStorage.getItem(ESCALATION_SCHEDULE_KEY),
         AsyncStorage.getItem(CIRCLE_KEY),
       ]);
-      const sched = normalizeSchedule(rawSchedule ? JSON.parse(rawSchedule) : null);
+      // Guarded parses: a corrupt value must not strand the screen on a blank
+      // view (loaded must ALWAYS become true).
+      let sched;
+      try {
+        sched = normalizeSchedule(rawSchedule ? JSON.parse(rawSchedule) : null);
+      } catch {
+        sched = normalizeSchedule(null);
+      }
+      let count = 0;
+      try {
+        const c = rawCircle ? JSON.parse(rawCircle) : [];
+        count = Array.isArray(c) ? c.length : 0;
+      } catch {
+        count = 0;
+      }
       setSchedule(sched);
       setDrafts(sched.map(String));
-      setCircleCount(rawCircle ? JSON.parse(rawCircle).length : 0);
+      setCircleCount(count);
       setLoaded(true);
     })();
   }, []);
@@ -188,7 +201,7 @@ export default function EscalationScreen() {
           <View style={{ marginTop: 18 }}>
             <GoldUpsell
               title="Set your own timing"
-              body={`Free uses a fixed schedule: another text after ${DEFAULT_SCHEDULE.join(', then ')} minutes (${MAX_FREE_ROUNDS} reminders). With Gold you choose exactly when your circle is re-texted, and how many times.`}
+              body="Free re-texts your circle at ⅓, ⅔ and the full time of your slider. With Gold you choose exactly when your circle is re-texted, and how many times."
             />
           </View>
         )}

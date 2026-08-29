@@ -57,8 +57,10 @@ export default function NearbyScreen() {
         setState('noloc');
         return;
       }
+      // Only accept a cached fix if it's fresh — an hours-old position would
+      // list police/hospitals near where the user WAS, not where they are.
       const loc =
-        (await Location.getLastKnownPositionAsync().catch(() => null)) ??
+        (await Location.getLastKnownPositionAsync({ maxAge: 60_000 }).catch(() => null)) ??
         (await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }));
       setState('loading');
       const serverUrl = await getServerUrl();
@@ -160,7 +162,7 @@ export default function NearbyScreen() {
                           </Text>
                         </View>
                         {p.phone && (
-                          <Pressable style={styles.iconBtn} hitSlop={6} onPress={() => Linking.openURL(`tel:${p.phone}`)}>
+                          <Pressable style={styles.iconBtn} hitSlop={6} onPress={() => Linking.openURL(`tel:${p.phone}`).catch(() => {})}>
                             <Ionicons name="call-outline" size={17} color={Beacon.text} />
                           </Pressable>
                         )}

@@ -58,9 +58,21 @@ export default function CircleScreen() {
   const [smsConsent, setSmsConsent] = useState(false);
   const [actionFor, setActionFor] = useState<SafetyContact | null>(null);
 
+  // One corrupt stored value must not brick the circle screen (loaded would
+  // stay false → contacts never persist again = silent data loss).
+  const parseCircle = (raw: string | null): SafetyContact[] => {
+    if (!raw) return [];
+    try {
+      const p = JSON.parse(raw);
+      return Array.isArray(p) ? p : [];
+    } catch {
+      return [];
+    }
+  };
+
   useEffect(() => {
     AsyncStorage.getItem(STORAGE_KEY).then(raw => {
-      setCircle(raw ? JSON.parse(raw) : []);
+      setCircle(parseCircle(raw));
       setLoaded(true);
     });
   }, []);
@@ -78,8 +90,9 @@ export default function CircleScreen() {
   useFocusEffect(
     useCallback(() => {
       AsyncStorage.getItem(STORAGE_KEY).then(raw => {
-        setCircle(raw ? JSON.parse(raw) : []);
+        setCircle(parseCircle(raw));
       });
+      // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []),
   );
 
@@ -299,7 +312,7 @@ export default function CircleScreen() {
                           {smsConsent && <Ionicons name="checkmark" size={14} color={Beacon.night} />}
                         </View>
                         <Text style={styles.consent}>
-                          I confirm this person has agreed to receive emergency safety text messages
+                          I confirm this person has agreed to receive safety alert text messages
                           from Make It Home. Message frequency varies. Msg &amp; data rates may apply.
                           Reply STOP to opt out.
                         </Text>

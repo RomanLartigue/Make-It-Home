@@ -85,6 +85,7 @@ export function isBackgroundAudioActive(): boolean {
 // app when it's backgrounded). Each finished clip is handed to onChunk for
 // upload; the server stitches them into the one full-session audio at the end.
 let chunkActive = false;
+let chunkLoopDone: Promise<void> | null = null;
 
 export async function startChunkedAudio(
   onChunk: (uri: string) => void,
@@ -106,7 +107,7 @@ export async function startChunkedAudio(
     });
     chunkActive = true;
     let errored = false;
-    (async () => {
+    chunkLoopDone = (async () => {
       while (chunkActive) {
         let rec: any = null;
         try {
@@ -127,7 +128,9 @@ export async function startChunkedAudio(
         try {
           await rec.stopAndUnloadAsync();
           const uri: string | null = rec.getURI?.() ?? null;
-          if (uri && chunkActive) onChunk(uri);
+          // Deliver even after stop was requested — the FINAL ~5s of a session
+          // can be the most important seconds of the whole record.
+          if (uri) onChunk(uri);
         } catch {
           // lost chunk — the next one starts immediately
         }
@@ -144,6 +147,12 @@ export async function startChunkedAudio(
   }
 }
 
-export function stopChunkedAudio(): void {
+/**
+ * Stops the chunk loop. Returns a promise resolving once the in-flight final
+ * chunk has been stopped and handed to onChunk — await it before merging, so
+ * the last clip makes it into the stitched session audio.
+ */
+export function stopChunkedAudio(): Promise<void> {
   chunkActive = false;
+  return chunkLoopDone ?? Promise.resolve();
 }

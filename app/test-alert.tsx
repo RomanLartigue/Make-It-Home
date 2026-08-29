@@ -23,8 +23,14 @@ export default function TestAlertScreen() {
 
   useEffect(() => {
     AsyncStorage.getItem(CIRCLE_KEY).then(raw => {
-      const circle = raw ? JSON.parse(raw) : [];
-      setPhones(circle.map((c: any) => c.phone).filter(Boolean));
+      let circle: any[] = [];
+      try {
+        const p = raw ? JSON.parse(raw) : [];
+        circle = Array.isArray(p) ? p : [];
+      } catch {
+        circle = [];
+      }
+      setPhones(circle.map((c: any) => c?.phone).filter(Boolean));
     });
   }, []);
 

@@ -581,7 +581,7 @@ function buildAlertBody(name, latitude, longitude) {
     latitude != null && longitude != null
       ? `\n\nLast known location: https://maps.google.com/?q=${latitude},${longitude}`
       : '';
-  return `🚨 EMERGENCY — ${who} missed their check-in! Open Make It Home NOW.${mapsLink} Reply STOP to opt out.`;
+  return `⏰ Make It Home: ${who} missed their check-in. Please check on them.${mapsLink} Reply STOP to opt out.`;
 }
 
 function scheduleAlert(id, entry, delayMs) {
@@ -1065,9 +1065,8 @@ async function sessionDel(sessionId) {
 // ── Staged escalation ─────────────────────────────────────────────────────────
 // A session carries an ordered list of tiers, each { name, waitMinutes, phones,
 // alertedAt }. Tier 0 is alerted at /session/start; a background sweep climbs to
-// each later tier once (previous tier's alertedAt + waitMinutes) has elapsed and
-// no one has acknowledged. A responder tapping "I'm on my way" acks the session,
-// which halts the climb.
+// each later tier on schedule, then cycles every 5 min. Only the USER marking
+// safe (session.ended) stops the alerts — a responder's ack is informational.
 function clampWait(m) {
   const n = Number(m);
   if (!Number.isFinite(n) || n < 0) return 0;
@@ -1077,13 +1076,15 @@ function cleanTierName(s) {
   const t = String(s ?? '').trim().slice(0, 40);
   return t || 'Responders';
 }
+// Tone: Make It Home is a digital witness, not a 911 replacement — the texts
+// ask the circle to CHECK ON the user, they don't scream emergency.
 function sessionBody(name, liveLink) {
-  const who = name ? `${name} needs help` : 'Someone needs help';
-  return `🚨 EMERGENCY — ${who}! Open Make It Home NOW.\n\nTrack live: ${liveLink}\n\nReply STOP to opt out.`;
+  const who = name || 'Your contact';
+  return `🏠 Make It Home: ${who} started a safety session and wants you to keep an eye on them.\n\nWatch live: ${liveLink}\n\nReply STOP to opt out.`;
 }
 function sessionBodyEscalated(name, liveLink) {
-  const who = name ? `${name} still needs help` : 'Someone still needs help';
-  return `🚨 EMERGENCY — ${who} — no one has responded yet. Open Make It Home NOW.\n\nTrack live: ${liveLink}\n\nReply STOP to opt out.`;
+  const who = name || 'Your contact';
+  return `🔔 ${who}'s safety session is still going and they haven't marked themselves safe yet. Please check on them.\n\nWatch live: ${liveLink}\n\nReply STOP to opt out.`;
 }
 
 // Validate the client's tier grouping against the device's stored circle, drop
@@ -1159,6 +1160,19 @@ async function endSessionsOwnedBy(token) {
 // One pass over live sessions, alerting the next due tier of any unacknowledged
 // session. Idempotent per tier (guarded by alertedAt). Survives restarts because
 // session state (including alertedAt) lives in redis.
+// Merge sweep-owned progress (alertedAt / cycleAt) onto a FRESH read of the
+// session before writing back. The Twilio sends take seconds; writing the stale
+// pre-send object whole would silently revert anything that landed meanwhile —
+// most catastrophically the user's `ended: true` (session alerts forever) or a
+// location update. The sweep only ever owns its own progress fields.
+async function commitSweepProgress(sessionId, mutate) {
+  const fresh = await sessionGet(sessionId);
+  if (!fresh) return false;
+  mutate(fresh);
+  await sessionSet(sessionId, fresh);
+  return true;
+}
+
 async function escalationSweep() {
   const sessions = await allSessions();
   const now = Date.now();
@@ -1178,10 +1192,16 @@ async function escalationSweep() {
       const next = s.tiers[nextIdx];
       const dueAt = (prev.alertedAt || now) + (Number(next.waitMinutes) || 0) * 60000;
       if (now < dueAt) continue;
+      // Re-check just before sending: the user may have marked safe since the
+      // batch read at the top of the sweep.
+      const pre = await sessionGet(sessionId);
+      if (!pre || pre.ended) continue;
       const liveLink = `${SERVER_URL}/live/${sessionId}`;
       const result = await sendSmsToAll(next.phones, sessionBodyEscalated(s.name, liveLink));
-      next.alertedAt = Date.now();
-      await sessionSet(sessionId, s);
+      const at = Date.now();
+      await commitSweepProgress(sessionId, fresh => {
+        if (Array.isArray(fresh.tiers) && fresh.tiers[nextIdx]) fresh.tiers[nextIdx].alertedAt = at;
+      });
       console.log(
         `[escalation] ${sessionId}: alerted tier ${nextIdx + 1} "${next.name}" ${result.sent}/${next.phones.length}.`,
       );
@@ -1197,14 +1217,16 @@ async function escalationSweep() {
     if (!lastAt || now - lastAt < 5 * 60 * 1000) continue;
     const phones = [...new Set(s.tiers.flatMap(t => t.phones || []))];
     if (!phones.length) continue;
+    const pre = await sessionGet(sessionId);
+    if (!pre || pre.ended) continue;
     const liveLink = `${SERVER_URL}/live/${sessionId}`;
     const nm = cleanName(s.name) || 'Your contact';
     const result = await sendSmsToAll(
       phones,
-      `🔴 URGENT: ${nm} has NOT confirmed they're safe. Live location & recording: ${liveLink} Reply STOP to opt out.`,
+      `⏰ ${nm}'s check-in time has passed and they haven't marked themselves safe. Please check on them.\n\nLive location & video: ${liveLink}\n\nReply STOP to opt out.`,
     );
-    s.cycleAt = Date.now();
-    await sessionSet(sessionId, s);
+    const at = Date.now();
+    await commitSweepProgress(sessionId, fresh => { fresh.cycleAt = at; });
     console.log(`[escalation] ${sessionId}: overdue cycle alert ${result.sent}/${phones.length}.`);
   }
 }
@@ -1228,8 +1250,10 @@ setInterval(async () => {
 // POST /session/start
 app.post('/session/start', async (req, res) => {
   const { sessionId, phones, name, latitude, longitude, tiers: clientTiers, livekit } = req.body;
-  if (!sessionId) {
-    return res.status(400).json({ error: 'sessionId is required.' });
+  // Strict id shape: it's embedded in SMS links and the live page's markup, so
+  // never let an attacker-shaped id exist in the first place.
+  if (!sessionId || !/^[\w-]{8,64}$/.test(String(sessionId))) {
+    return res.status(400).json({ error: 'Valid sessionId required.' });
   }
   const coordErr = validateCoords(latitude, longitude);
   if (coordErr) return res.status(400).json({ error: coordErr });
@@ -1608,12 +1632,33 @@ app.get('/r2media/:token', async (req, res) => {
 
 // The go-live phone asks for a PUBLISHER token (authenticated device). Room =
 // sessionId. Returns the wss URL too so the client needs no hardcoded config.
+//
+// SECURITY: the sessionId is NOT secret (it's in the SMS live link), and this
+// is called BEFORE /session/start creates the session — so ownership can't be
+// checked against the session. Instead the FIRST caller reserves the room for
+// its device token; any other device asking to publish into the same room is
+// refused. The legit phone always reserves before the SMS goes out, so a
+// responder can never hijack the stream.
+const PUBLISHER_PREFIX = 'publisher:';
+const publisherMemory = new Map();
 app.post('/livekit/publish-token', async (req, res) => {
   if (!LIVEKIT_ENABLED || !LiveKit) return res.status(503).json({ error: 'LiveKit not configured.' });
   const { sessionId } = req.body || {};
   if (!sessionId || !/^[\w-]+$/.test(sessionId)) return res.status(400).json({ error: 'Valid sessionId required.' });
-  const token = await mintLiveKitToken(`host-${sessionId}`.slice(0, 60), sessionId, { publish: true });
-  res.json({ url: LIVEKIT_URL, token });
+  const token = String(req.headers['x-mih-key'] || '');
+  const claimed = redis ? await redisGet(`${PUBLISHER_PREFIX}${sessionId}`) : publisherMemory.get(sessionId);
+  if (claimed && claimed !== token) {
+    console.log(`[livekit] publish-token REFUSED for ${sessionId}: room already claimed by another device.`);
+    return res.status(403).json({ error: 'Forbidden.' });
+  }
+  const session = await sessionGet(sessionId);
+  if (session && ((session.ownerToken && session.ownerToken !== token) || session.ended)) {
+    return res.status(403).json({ error: 'Forbidden.' });
+  }
+  if (redis) await redisSet(`${PUBLISHER_PREFIX}${sessionId}`, token, SESSION_TTL);
+  else publisherMemory.set(sessionId, token);
+  const lkToken = await mintLiveKitToken(`host-${sessionId}`.slice(0, 60), sessionId, { publish: true });
+  res.json({ url: LIVEKIT_URL, token: lkToken });
 });
 
 // The phone calls this once it has CONNECTED and started publishing, so the
@@ -1666,15 +1711,17 @@ app.get('/live/:sessionId/state', async (req, res) => {
 });
 
 // POST /ack/:sessionId
-// A responder tapping "I'm on my way" on the live page acknowledges the session,
-// which halts the escalation climb (no further tiers are alerted). Public (no
+// A responder tapping "I'm on my way" acknowledges the session — informational
+// ONLY (alerts continue until the user marks safe). Public (no
 // auth) — it's reached from the live link, guarded only by knowing the
 // unguessable sessionId. A POST (form submit), never a GET, so SMS/link-preview
 // prefetchers can't acknowledge by accident.
 app.post('/ack/:sessionId', async (req, res) => {
   const sessionId = req.params.sessionId;
   const session = await sessionGet(sessionId);
-  if (session && !session.acknowledged) {
+  // Ended sessions are kept for recording delivery — a stale tab's "on my way"
+  // must not text the whole circle about a finished session.
+  if (session && !session.acknowledged && !session.ended) {
     session.acknowledged = true;
     session.ackedAt = Date.now();
     await sessionSet(sessionId, session);
@@ -1722,7 +1769,9 @@ app.get('/live/:sessionId', async (req, res) => {
     ? `${Number(latitude).toFixed(5)}, ${Number(longitude).toFixed(5)}`
     : 'Location pending…';
   const ackPath = `/ack/${encodeURIComponent(sessionId)}`;
-  const sidJson = JSON.stringify(sessionId);
+  // JSON.stringify doesn't escape "</script>"; < does, defusing markup
+  // breakout even if an unexpected id ever reaches this page.
+  const sidJson = JSON.stringify(sessionId).replace(/</g, '\\u003c');
 
   // When acknowledged, later responders see it's handled and the button is gone.
   const respondBlock = session.ended
@@ -1742,10 +1791,14 @@ app.get('/live/:sessionId', async (req, res) => {
   // served from our own origin. Only widen the policy for LiveKit sessions.
   const lkConnect = isLiveKit ? ' https://*.livekit.cloud wss://*.livekit.cloud' : '';
   const lkWorker = isLiveKit ? " worker-src 'self' blob:;" : '';
+  // Egress recordings play via /r2media/<token>, which 302s to a presigned R2
+  // URL — CSP checks the redirect TARGET too, so the R2 host must be allowed
+  // in media-src or the inline <video> player silently fails for the circle.
+  const r2Media = EGRESS_ENABLED ? ' https://*.r2.cloudflarestorage.com' : '';
   res.setHeader(
     'Content-Security-Policy',
     `default-src 'self'; script-src 'nonce-${nonce}' 'self'; style-src 'unsafe-inline'; ` +
-      `img-src 'self' data:; connect-src 'self'${lkConnect}; media-src 'self' blob:;${lkWorker} ` +
+      `img-src 'self' data:; connect-src 'self'${lkConnect}; media-src 'self' blob:${r2Media};${lkWorker} ` +
       `frame-src 'none'; object-src 'none'`,
   );
 
@@ -1791,7 +1844,7 @@ app.get('/live/:sessionId', async (req, res) => {
     ? `<button id="lkmute" class="listen">🔊 Tap to unmute</button>`
     : `<button id="listen" class="listen">🔊 Listen live</button>`}
   <div class="name">${displayName}</div>
-  <div class="sub">needs help — tap to navigate</div>
+  <div class="sub">started a safety session — keep an eye on them</div>
   <a id="maps" class="btn" href="${mapsUrl}">Open in Maps</a>
   <div id="respond">${respondBlock}</div>
   <div id="dlwrap"></div>

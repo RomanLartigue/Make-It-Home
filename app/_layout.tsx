@@ -16,7 +16,6 @@ import { Beacon } from '@/constants/beacon';
 // only registers a handler — it starts nothing until a session goes live.
 import '@/tasks/backgroundLocation';
 
-const ACTIVE_SESSION_KEY = '@makeithome_active_session';
 const SAFETY_CIRCLE_KEY = '@makeithome_safety_circle';
 
 export default function RootLayout() {
@@ -28,18 +27,23 @@ export default function RootLayout() {
       await getDeviceToken().catch(() => {});
       const raw = await AsyncStorage.getItem(SAFETY_CIRCLE_KEY);
       if (!raw) return;
-      const phones = JSON.parse(raw).map((c: any) => c.phone).filter(Boolean);
+      // Guard the parse: one corrupt value must not silently kill circle sync
+      // (the server only texts a device's synced circle).
+      let phones: string[] = [];
+      try {
+        const parsed = JSON.parse(raw);
+        phones = Array.isArray(parsed) ? parsed.map((c: any) => c?.phone).filter(Boolean) : [];
+      } catch {
+        phones = [];
+      }
       if (phones.length) syncCircle(phones);
     })();
   }, []);
 
-  // Clear a session left behind by a force-kill so the UI doesn't think one is
-  // still live. (Foreground-only tracking, so nothing native to stop.)
-  useEffect(() => {
-    AsyncStorage.getItem(ACTIVE_SESSION_KEY).then(sessionId => {
-      if (sessionId) AsyncStorage.removeItem(ACTIVE_SESSION_KEY);
-    });
-  }, []);
+  // NOTE: a session left behind by a force-kill is cleaned up by the Home
+  // screen's resume effect (app/(tabs)/index.tsx) — it must end the server
+  // session and stop the background-location task, not just drop the key, so
+  // the cleanup lives there and is NOT duplicated here.
 
   // Make It Home is a dark-only "beacon" experience — no light variant.
   // On web we constrain the app to a centered phone-width column so it doesn't

@@ -205,7 +205,6 @@ export default function HomeScreen() {
   const isRecordingRef = useRef(false);
   const goLiveFallbackRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const recordEndTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const lastAudioUriRef = useRef<string | null>(null); // background audio from the last session
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null); // session/start retry
   const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null); // mid-session server watchdog
   const lastServerOkRef = useRef(0); // last time the server answered us during a session
@@ -301,27 +300,45 @@ export default function HomeScreen() {
   // Flush it now (and end the orphaned server session so escalations stop).
   useEffect(() => {
     (async () => {
+      // An ACTIVE_SESSION_KEY at launch means the app was KILLED mid-session
+      // (force-quit, dead battery, iOS terminated it). This cleanup must run
+      // for EVERY such session — LiveKit sessions and pre-first-segment camera
+      // sessions leave no pending media, but still have a live server session
+      // (escalations firing) and a running background-location task.
+      const orphanSession = await AsyncStorage.getItem(ACTIVE_SESSION_KEY).catch(() => null);
       const raw = await AsyncStorage.getItem(PENDING_MEDIA_KEY).catch(() => null);
-      if (!raw) return;
       let parsed: { sessionId: string | null; items: any[] } | null = null;
-      try { parsed = JSON.parse(raw); } catch { parsed = null; }
-      if (!parsed || !Array.isArray(parsed.items) || parsed.items.length === 0) {
-        AsyncStorage.removeItem(PENDING_MEDIA_KEY).catch(() => {});
+      if (raw) {
+        try { parsed = JSON.parse(raw); } catch { parsed = null; }
+      }
+      const hasMedia = !!(parsed && Array.isArray(parsed.items) && parsed.items.length > 0);
+      if (!orphanSession && !hasMedia) {
+        if (raw) AsyncStorage.removeItem(PENDING_MEDIA_KEY).catch(() => {});
         return;
       }
-      // Reaching this line means the app was KILLED mid-session (force-quit,
-      // battery, or iOS terminated it in the background) — a normal End clears
-      // the queue before the app ever closes.
-      trace(`relaunch-flush: ${parsed.items.length} item(s) from ${parsed.sessionId}`);
-      pendingMediaRef.current = parsed.items;
-      await flushPending(parsed.sessionId);
-      // End the session that was left open when the app died.
-      if (parsed.sessionId) {
+
+      // 1) Stop the native background-location task — it survives relaunch and
+      //    would otherwise keep GPS (and the blue indicator) running forever.
+      if (!IS_WEB) stopBackgroundLocation().catch(() => {});
+
+      // 2) Upload any held recordings from the dead session.
+      if (hasMedia && parsed) {
+        trace(`relaunch-flush: ${parsed.items.length} item(s) from ${parsed.sessionId}`);
+        pendingMediaRef.current = parsed.items;
+        await flushPending(parsed.sessionId);
+      } else if (raw) {
+        AsyncStorage.removeItem(PENDING_MEDIA_KEY).catch(() => {});
+      }
+
+      // 3) End the orphaned server session so escalations stop.
+      const sid = (parsed && parsed.sessionId) || orphanSession;
+      if (sid) {
+        trace(`relaunch-cleanup: ending orphan ${sid}`);
         const serverUrl = await getServerUrl();
         fetchWithAuth(`${serverUrl}/session/end`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sessionId: parsed.sessionId }),
+          body: JSON.stringify({ sessionId: sid }),
         }).catch(() => {});
       }
       AsyncStorage.removeItem(ACTIVE_SESSION_KEY).catch(() => {});
@@ -620,7 +637,10 @@ export default function HomeScreen() {
         }
         if (res.status === 404 && !recreatedRef.current) {
           recreatedRef.current = true;
-          startSession(coordsRef.current as any);
+          // Preserve the live-stream flag on re-creation, or the responder
+          // page silently downgrades to snapshot mode (which LiveKit sessions
+          // don't feed) — a dead live link mid-session.
+          startSession(coordsRef.current as any, liveKitModeRef.current);
           return;
         }
       } catch {
@@ -993,6 +1013,14 @@ export default function HomeScreen() {
       }
     };
 
+    // Show the "Going live…" screen BEFORE any session work starts — if
+    // beginSessionOnce resolved first, its setLiveMode('livekit'|'camera')
+    // would be clobbered back to 'deciding' below, stranding the user on the
+    // spinner forever with no camera and no I'm-safe button.
+    hWarning();
+    setLiveMode('deciding'); // don't mount camera until the mode is chosen
+    setShowCamera(true);
+
     // 1) Seed immediately from the last known fix, if the OS has one cached.
     const lastKnown = await Location.getLastKnownPositionAsync().catch(() => null);
     if (lastKnown) {
@@ -1019,10 +1047,6 @@ export default function HomeScreen() {
     goLiveFallbackRef.current = setTimeout(() => {
       if (!notifiedRef.current) beginSessionOnce(null);
     }, 8000);
-
-    hWarning();
-    setLiveMode('deciding'); // don't mount camera until the mode is chosen
-    setShowCamera(true);
   };
 
   // Saves the finished recording to the phone's photo library (camera roll) so
@@ -1051,10 +1075,10 @@ export default function HomeScreen() {
     }
   };
 
-  // (Live-snapshot capture during recording was removed: on iOS, taking a still
-  // on the shared AVCaptureSession mid-recording finalizes the movie file early
-  // — the recording is the evidence and takes priority. Responders still get
-  // live location and the "Download recording" link on the live page.)
+  // (Live frames DO run during camera-mode recording — see startFrameLoop:
+  // takePictureAsync is safe once recordAsync has settled; the 4s hold-off
+  // there keeps captures away from the movie-output attach window that used to
+  // abort recordings.)
 
   // Resolves when the app is back in the foreground (or the deadline passes).
   const waitForForeground = (deadline: number) =>
@@ -1194,10 +1218,10 @@ export default function HomeScreen() {
     setIsRecording(true);
     // Capture the session id now — handleEnd clears it before recordAsync resolves.
     const sessionId = sessionIdRef.current;
-    // NOTE: the live-snapshot loop is intentionally NOT started while recording.
-    // On iOS, takePictureAsync during recordAsync can abort the recording (no
-    // video file at all). The recording is the evidence — it takes priority.
-    // Responders still get live location + the "Download recording" link.
+    // NOTE: live frames (startFrameLoop's takePictureAsync) run alongside the
+    // recording — safe because the loop holds off 4s after each recordAsync
+    // start, keeping captures clear of the movie-output attach window that
+    // used to abort recordings.
 
     // At the chosen check-in time the session does NOT end — it enters the
     // overdue "Are you safe?" cycle, and recording continues until the user
@@ -1383,7 +1407,6 @@ export default function HomeScreen() {
     locationSub.current?.remove();
     locationSub.current = null;
     const doneWaiter = loopDoneRef.current;
-    const lastCoords = coords ? { latitude: coords.latitude, longitude: coords.longitude } : null;
 
     // Do the heavy work off the UI path: wait for the loop's final segment, stop
     // background systems, hold the last audio, then upload EVERYTHING held.
@@ -1399,7 +1422,11 @@ export default function HomeScreen() {
       if (doneWaiter) {
         await Promise.race([doneWaiter, new Promise(r => setTimeout(r, 4000))]);
       }
-      if (!IS_WEB) stopChunkedAudio(); // the uploaded chunks are stitched server-side
+      if (!IS_WEB) {
+        // Wait (bounded) for the FINAL in-flight audio chunk to upload before
+        // merging — it holds the last seconds of the session.
+        await Promise.race([stopChunkedAudio(), new Promise(r => setTimeout(r, 7000))]);
+      }
       await flushPending(endedSessionId);
     })().catch(() => {});
 
@@ -1587,7 +1614,10 @@ export default function HomeScreen() {
           ackByCircle={ackByCircle}
           onEnd={() => finishSession('manual')}
           onConnected={() => {
-            setNotifyStatus('notified');
+            // Deliberately does NOT touch notifyStatus: the WebRTC connection
+            // succeeding says nothing about whether the circle was texted —
+            // startSession owns that status, and overwriting a 'reconnecting'/
+            // 'error' here would show "Circle alerted" when no texts went out.
             trace('livekit-connected');
             // Ask the server to record the room. The room + published tracks need
             // a moment to fully register in LiveKit before egress can attach, so

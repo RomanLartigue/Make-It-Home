@@ -188,14 +188,14 @@ export default function HistoryScreen() {
                   </View>
                 </View>
                 <View style={styles.actions}>
-                  <Pressable style={styles.action} onPress={() => Linking.openURL(item.mediaUrl)}>
+                  <Pressable style={styles.action} onPress={() => Linking.openURL(item.mediaUrl).catch(() => {})}>
                     <Ionicons name="download-outline" size={16} color={Beacon.text} />
                     <Text style={styles.actionText}>Download</Text>
                   </Pressable>
                   {item.latitude != null && item.longitude != null && (
                     <Pressable
                       style={styles.action}
-                      onPress={() => Linking.openURL(`https://maps.google.com/?q=${item.latitude},${item.longitude}`)}
+                      onPress={() => Linking.openURL(`https://maps.google.com/?q=${item.latitude},${item.longitude}`).catch(() => {})}
                     >
                       <Ionicons name="location-outline" size={16} color={Beacon.text} />
                       <Text style={styles.actionText}>Where</Text>

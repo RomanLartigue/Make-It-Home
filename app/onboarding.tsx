@@ -120,8 +120,8 @@ export default function OnboardingScreen() {
             <Dots active={2} />
             <Text style={styles.h2}>Turn on location</Text>
             <Text style={styles.p}>
-              Make It Home shares where you are with your circle in an emergency — it&apos;s the core
-              of keeping you safe, so we ask up front.
+              Make It Home shares where you are with your circle during a safety session — it&apos;s
+              the core of keeping you looked after, so we ask up front.
             </Text>
             <View style={[styles.locStat, locGranted && styles.locStatOk]}>
               <Text style={{ color: locGranted ? Beacon.safe : Beacon.muted, fontSize: 12.5 }}>

@@ -13,7 +13,8 @@ import { hSuccess } from '@/utils/haptics';
 import * as Location from 'expo-location';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
-import { getUserName, setUserName, getServerUrl, fetchWithAuth } from '@/utils/serverUrl';
+import { getUserName, setUserName, getServerUrl, fetchWithAuth, syncCircle } from '@/utils/serverUrl';
+import { setGold } from '@/utils/gold';
 import { confirmDestructive } from '@/utils/confirm';
 import { Beacon } from '@/constants/beacon';
 import { Card, SectionLabel, SRow, PillButton } from '@/components/beacon/kit';
@@ -37,7 +38,8 @@ export default function SettingsScreen() {
   );
 
   const handleSave = async () => {
-    await setUserName(name);
+    if (!name.trim()) return; // never silently wipe the stored name
+    await setUserName(name.trim());
     setSaved(true);
     hSuccess();
     setTimeout(() => setSaved(false), 1600);
@@ -66,11 +68,17 @@ export default function SettingsScreen() {
       'This erases your name, safety circle, and check-in state from this device and signs it out. This cannot be undone.',
       'Delete everything',
       async () => {
-        // Best-effort server-side deletion (endpoint may not exist yet).
+        // Clear the server-side circle first, then purge the account.
+        try {
+          await syncCircle([]);
+        } catch {}
         try {
           const serverUrl = await getServerUrl();
           await fetchWithAuth(`${serverUrl}/account/delete`, { method: 'POST' });
         } catch {}
+        // Reset the in-memory Gold cache too — wiping only the stored flag
+        // leaves Gold active until the next app restart.
+        await setGold(false).catch(() => {});
         const keys = await AsyncStorage.getAllKeys();
         const mine = keys.filter(k => k.startsWith('@makeithome'));
         if (mine.length) await AsyncStorage.multiRemove(mine);
@@ -87,7 +95,7 @@ export default function SettingsScreen() {
         <SectionLabel>Account</SectionLabel>
         <Card style={{ paddingVertical: 12 }}>
           <Text style={styles.fieldLabel}>Your name</Text>
-          <Text style={styles.fieldHint}>Shown in the alert so your circle knows who needs help.</Text>
+          <Text style={styles.fieldHint}>Shown in the alert so your circle knows whose session it is.</Text>
           <TextInput
             style={styles.input}
             value={name}

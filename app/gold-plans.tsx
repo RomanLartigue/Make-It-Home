@@ -16,7 +16,7 @@ const FEATURES: { icon: keyof typeof Ionicons.glyphMap; title: string; body: str
   {
     icon: 'notifications-outline',
     title: 'Your own escalation timing',
-    body: 'Choose exactly when your circle is re-texted if no one responds — and how many times. Free uses a fixed 5 / 10 / 15 minute schedule.',
+    body: 'Choose exactly when your circle is re-texted — and how many times. Free re-texts at ⅓, ⅔ and the full time of your slider.',
   },
   {
     icon: 'cloud-outline',
