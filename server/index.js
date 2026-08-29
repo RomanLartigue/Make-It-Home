@@ -1,6 +1,12 @@
 require('dotenv').config();
 
 const crypto = require('crypto');
+const { spawn } = require('child_process');
+let LiveKit = null;
+try { LiveKit = require('livekit-server-sdk'); } catch { LiveKit = null; }
+// Prebuilt ffmpeg binary — Railway's build image has no system ffmpeg.
+let FFMPEG_PATH = null;
+try { FFMPEG_PATH = require('ffmpeg-static'); } catch { FFMPEG_PATH = null; }
 const express = require('express');
 const helmet = require('helmet');
 const twilio = require('twilio');
@@ -20,8 +26,22 @@ const {
   REGISTRATION_SECRET,
   ALLOWED_ORIGINS,
   REDIS_URL,
+  // LiveKit (real-time video). Optional — when unset, the app falls back to the
+  // snapshot live view. LIVEKIT_URL is the wss:// project URL.
+  LIVEKIT_URL,
+  LIVEKIT_API_KEY,
+  LIVEKIT_API_SECRET,
+  // Cloudflare R2 (S3-compatible) — where LiveKit egress writes the recording of
+  // a live session. Optional: without it, live sessions stream but aren't saved.
+  R2_ENDPOINT,
+  R2_ACCESS_KEY_ID,
+  R2_SECRET_ACCESS_KEY,
+  R2_BUCKET,
   PORT = 3000,
 } = process.env;
+
+const LIVEKIT_ENABLED = !!(LIVEKIT_URL && LIVEKIT_API_KEY && LIVEKIT_API_SECRET);
+const EGRESS_ENABLED = !!(LIVEKIT_ENABLED && R2_ENDPOINT && R2_ACCESS_KEY_ID && R2_SECRET_ACCESS_KEY && R2_BUCKET);
 
 // ── Required config check (fail fast) ─────────────────────────────────────────
 // Runs before the Twilio client is constructed so a missing credential produces
@@ -86,11 +106,19 @@ const allowedOrigins = ALLOWED_ORIGINS
 
 app.use(cors({
   origin(origin, callback) {
-    // Mobile app requests have no Origin header — always allow.
-    if (!origin) return callback(null, true);
-    // Allow explicitly listed origins.
+    // Mobile app requests have no Origin header; iOS in-app browsers (Messages
+    // link previews etc.) send the literal string "null" — allow both, or the
+    // live page's "I'm on my way" form 500s from inside the SMS app.
+    if (!origin || origin === 'null') return callback(null, true);
     if (allowedOrigins.includes(origin)) return callback(null, true);
-    callback(new Error(`CORS: origin ${origin} is not allowed.`));
+    // The server's own pages (live tracking) post back to the same origin.
+    try {
+      if (SERVER_URL && origin === new URL(SERVER_URL).origin) return callback(null, true);
+    } catch {}
+    // Unknown origin: send no CORS headers (browser JS can't read the response)
+    // but do NOT error the request — plain form POSTs aren't CORS-gated, and
+    // throwing here turned them into "internal error" pages.
+    callback(null, false);
   },
   methods: ['GET', 'POST'],
   allowedHeaders: ['Content-Type', 'X-MIH-Key', 'X-MIH-Registration-Secret'],
@@ -110,6 +138,11 @@ app.use((req, res, next) => {
 // with no visible message). Public + unauthenticated on purpose — it only logs.
 app.post('/clientlog', (req, res) => {
   const b = req.body || {};
+  // Session lifecycle breadcrumbs (background/foreground/upload) — one line each.
+  if (b.phase === 'session-trace') {
+    console.log(`[trace] ${b.name || '?'} — ${b.message || ''}`);
+    return res.json({ ok: true });
+  }
   console.log('[clientlog] ===== CLIENT STARTUP ERROR =====');
   console.log('[clientlog] phase   =', b.phase);
   console.log('[clientlog] isFatal =', b.isFatal);
@@ -254,6 +287,31 @@ async function addHistoryEntry(ownerToken, entry) {
   await setHistory(ownerToken, [entry, ...list.filter(e => e.id !== entry.id)]);
 }
 
+// Per-session list of uploaded segment files (video AND audio), so /merge can
+// stitch each kind into ONE continuous file at session end. 24h bookkeeping.
+const SESSUPLOAD_PREFIX = 'sessup:';
+const sessUploadMemory = new Map();
+async function sessUploadAdd(sessionId, ownerToken, filename, kind) {
+  if (redis) {
+    const key = `${SESSUPLOAD_PREFIX}${sessionId}`;
+    const rec = (await redisGet(key)) || { ownerToken, files: [] };
+    rec.files.push({ name: filename, kind });
+    await redisSet(key, rec, 86400);
+  } else {
+    const rec = sessUploadMemory.get(sessionId) || { ownerToken, files: [] };
+    rec.files.push({ name: filename, kind });
+    sessUploadMemory.set(sessionId, rec);
+  }
+}
+async function sessUploadGet(sessionId) {
+  if (redis) return redisGet(`${SESSUPLOAD_PREFIX}${sessionId}`);
+  return sessUploadMemory.get(sessionId) ?? null;
+}
+async function sessUploadDel(sessionId) {
+  if (redis) await redisDel(`${SESSUPLOAD_PREFIX}${sessionId}`);
+  else sessUploadMemory.delete(sessionId);
+}
+
 async function resolveMediaToken(token) {
   if (redis) {
     const val = await redisGet(`${MEDIA_TOKEN_PREFIX}${token}`);
@@ -288,7 +346,9 @@ async function getCircle(token) {
 }
 
 // ── Per-device daily message cap ──────────────────────────────────────────────
-const DAILY_CAP = 50; // messages per device per day
+// Abuse guard on Twilio spend. Generous enough for heavy testing/demo days — a
+// hit cap silently blocking a real alert is worse than a few dollars of SMS.
+const DAILY_CAP = 250; // messages per device per day
 const msgCounts = new Map(); // `${token}:${yyyy-mm-dd}` → count (in-memory fallback)
 
 async function incrDailyCount(token, n) {
@@ -367,6 +427,17 @@ app.use('/test', smsLimiter);
 const publicDir = path.join(__dirname, 'public');
 app.get('/privacy', (req, res) => res.sendFile(path.join(publicDir, 'privacy.html')));
 app.get('/terms', (req, res) => res.sendFile(path.join(publicDir, 'terms.html')));
+// LiveKit browser SDK for the live viewer page (served from our own origin so
+// the strict CSP can allow it). Long-cache — it's a versioned vendor bundle.
+// Direct filesystem path — livekit-client's "exports" map blocks require.resolve
+// of the dist subpath.
+const LIVEKIT_UMD_PATH = path.join(__dirname, 'node_modules', 'livekit-client', 'dist', 'livekit-client.umd.js');
+app.get('/livekit-client.js', (req, res) => {
+  if (!fs.existsSync(LIVEKIT_UMD_PATH)) return res.status(404).send('// livekit-client not installed');
+  res.set('Cache-Control', 'public, max-age=86400');
+  res.type('application/javascript');
+  res.sendFile(LIVEKIT_UMD_PATH);
+});
 app.use(express.static(publicDir));
 
 // ── Hosted web app (Expo web export) ──────────────────────────────────────────
@@ -414,7 +485,10 @@ app.use(async (req, res, next) => {
     req.path.startsWith('/media/') ||
     req.path.startsWith('/live/') ||
     req.path.startsWith('/ack/') ||
-    (req.method === 'GET' && req.path.startsWith('/frame/'))
+    (req.method === 'GET' && req.path.startsWith('/frame/')) ||
+    (req.method === 'GET' && req.path.startsWith('/audiochunk/')) ||
+    (req.method === 'GET' && req.path.startsWith('/livekit/view-token/')) ||
+    (req.method === 'GET' && req.path.startsWith('/r2media/'))
   ) return next();
   const token = req.headers['x-mih-key'];
   if (!token) return res.status(401).json({ error: 'Unauthorized.' });
@@ -553,21 +627,31 @@ const storage = multer.diskStorage({
   // Gold uploads (query ?gold=1) get a "gold-" prefix so the sweeper keeps them
   // for the long Gold retention instead of 24h. (multer runs before body fields
   // are parsed, so the flag rides on the query string.)
-  filename: (req, file, cb) =>
-    cb(null, `${req.query?.gold === '1' ? 'gold-' : ''}${Date.now()}-recording.mp4`),
+  filename: (req, file, cb) => {
+    const mime = String(file.mimetype || '');
+    const ext = /audio/.test(mime) ? 'm4a' : mime === 'video/quicktime' ? 'mov' : 'mp4';
+    cb(null, `${req.query?.gold === '1' ? 'gold-' : ''}${Date.now()}-recording.${ext}`);
+  },
 });
 
+// Accepts the recorded video (mp4) and — when video can't run (e.g. the phone
+// was locked mid-session) — the background audio (m4a) as fallback evidence.
+// iOS records QuickTime (video/quicktime .mov) and the RN uploader sometimes
+// substitutes its own mime for the declared one — so accept any video/* or
+// audio/* type from our own app rather than pinning exact strings.
 function videoFileFilter(req, file, cb) {
-  if (file.mimetype === 'video/mp4') {
+  const t = String(file.mimetype || '');
+  if (t.startsWith('video/') || t.startsWith('audio/')) {
     cb(null, true);
   } else {
-    cb(Object.assign(new Error('Only video/mp4 files are accepted.'), { status: 415 }), false);
+    cb(Object.assign(new Error(`Only video or audio files are accepted (got ${t || 'unknown'}).`), { status: 415 }), false);
   }
 }
 
 const upload = multer({
   storage,
-  limits: { fileSize: 100 * 1024 * 1024 }, // 100 MB
+  // Recordings are minutes long now (15-60 min sessions), so files run large.
+  limits: { fileSize: 2 * 1024 * 1024 * 1024 }, // 2 GB
   fileFilter: videoFileFilter,
 });
 
@@ -629,55 +713,81 @@ app.post('/upload', (req, res, next) => {
   upload.single('video')(req, res, err => {
     if (err) {
       const status = err.status || (err.code === 'LIMIT_FILE_SIZE' ? 413 : 400);
+      console.error(`[/upload] Rejected (${status}): ${err.message}`);
       return res.status(status).json({ error: err.message });
     }
     next();
   });
 }, async (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'No video file received.' });
-
-  let phones;
-  try {
-    phones = JSON.parse(req.body.phones || '[]');
-  } catch {
-    return res.status(400).json({ error: 'phones must be a JSON array.' });
+  if (!req.file) {
+    console.error('[/upload] Rejected (400): no file in request.');
+    return res.status(400).json({ error: 'No file received.' });
   }
-  const r = await recipientsFor(req, phones);
-  if (r.error) return res.status(r.status).json({ error: r.error });
-  const recipients = r.recipients;
   if (!SERVER_URL) return res.status(500).json({ error: 'SERVER_URL is not configured.' });
-  if (!twilioClient) return res.status(503).json({ error: 'Twilio not configured on the server.' });
 
-  // Generate a signed token so Twilio can download the file without auth headers.
-  // Gold: the recording (and its link) live for 90 days instead of 24h.
   const isGoldUpload = req.query?.gold === '1';
+  // historyOnly = store + (Gold) add to cloud history, but DON'T MMS the circle.
+  // Used for the background-audio fallback when no video was captured.
+  const historyOnly = req.query?.historyOnly === '1';
+  const kind = /audio/.test(req.file.mimetype) ? 'audio' : 'video';
   const ownerToken = String(req.headers['x-mih-key'] || '');
+
+  // Signed token so the file can be fetched without auth headers (Twilio / links).
   const mediaToken = crypto.randomBytes(24).toString('hex');
   await saveMediaToken(mediaToken, req.file.filename, ownerToken, isGoldUpload ? GOLD_MEDIA_TTL : MEDIA_TOKEN_TTL);
   const mediaUrl = `${SERVER_URL}/media/${req.file.filename}?token=${mediaToken}`;
-  const body = '🎥 Safety recording from your safety circle. Reply STOP to opt out.';
 
-  const results = await Promise.allSettled(
-    // Promise.resolve().then(...) so a synchronous throw can't escape allSettled.
-    recipients.map(to =>
-      Promise.resolve().then(() =>
-        twilioClient.messages.create({ body, from: TWILIO_PHONE_NUMBER, to, mediaUrl: [mediaUrl] }),
+  let sent = 0, failed = 0;
+  if (!historyOnly) {
+    let phones;
+    try {
+      phones = JSON.parse(req.body.phones || '[]');
+    } catch {
+      return res.status(400).json({ error: 'phones must be a JSON array.' });
+    }
+    const r = await recipientsFor(req, phones);
+    if (r.error) {
+      console.error(`[/upload] Rejected (${r.status}): ${r.error}`);
+      return res.status(r.status).json({ error: r.error });
+    }
+    const recipients = r.recipients;
+    if (!twilioClient) return res.status(503).json({ error: 'Twilio not configured on the server.' });
+
+    // Twilio caps MMS media around 5 MB. Attach small clips directly; for
+    // anything bigger, text a watch/download link instead (the signed media URL
+    // works in any browser).
+    const attach = (req.file.size || 0) <= 4.5 * 1024 * 1024;
+    const body = attach
+      ? '🎥 Safety recording from your safety circle. Reply STOP to opt out.'
+      : `🎥 Safety recording from your safety circle — watch or download it here: ${mediaUrl}\nReply STOP to opt out.`;
+    const results = await Promise.allSettled(
+      recipients.map(to =>
+        Promise.resolve().then(() =>
+          twilioClient.messages.create({
+            body,
+            from: TWILIO_PHONE_NUMBER,
+            to,
+            ...(attach ? { mediaUrl: [mediaUrl] } : {}),
+          }),
+        ),
       ),
-    ),
-  );
-  const sent = results.filter(x => x.status === 'fulfilled').length;
-  const failed = results.length - sent;
-  if (sent === 0) {
-    console.error('[/upload] All MMS sends failed.');
-    return res.status(500).json({ error: 'Could not reach any contact.', failed });
+    );
+    sent = results.filter(x => x.status === 'fulfilled').length;
+    failed = results.length - sent;
+    if (sent === 0) {
+      console.error('[/upload] All MMS sends failed.');
+      return res.status(500).json({ error: 'Could not reach any contact.', failed });
+    }
+    console.log(`[/upload] Sent MMS ${sent}/${recipients.length}, ${failed} failed. Media: ${mediaUrl}`);
+  } else {
+    console.log(`[/upload] History-only ${kind} stored: ${mediaUrl}`);
   }
-  console.log(`[/upload] Sent MMS ${sent}/${recipients.length}, ${failed} failed. Media: ${mediaUrl}`);
 
   // Attach the recording to its session so the responder's live page can offer a
   // "Download recording" link (the user already has a local copy in their roll).
   const sessionId = req.body.sessionId;
   let sessionMeta = null;
-  if (sessionId) {
+  if (sessionId && kind === 'video') {
     const session = await sessionGet(sessionId);
     if (session && (!session.ownerToken || session.ownerToken === ownerToken)) {
       session.recordingUrl = mediaUrl;
@@ -691,6 +801,7 @@ app.post('/upload', (req, res, next) => {
   if (isGoldUpload) {
     await addHistoryEntry(ownerToken, {
       id: req.file.filename,
+      kind, // 'video' | 'audio'
       sessionId: sessionId || null,
       createdAt: Date.now(),
       expiresAt: Date.now() + GOLD_MEDIA_TTL * 1000,
@@ -702,9 +813,134 @@ app.post('/upload', (req, res, next) => {
     });
   }
 
-  // Cleanup is handled by delete-on-fetch (the /media route) plus the boot sweep,
-  // which survive a restart — the old per-file setTimeout did not.
-  res.json({ sent, failed, mediaUrl });
+  // Track segments per session so /merge can stitch each kind into one file.
+  if (sessionId) {
+    await sessUploadAdd(sessionId, ownerToken, req.file.filename, kind);
+  }
+
+  res.json({ sent, failed, mediaUrl, kind });
+});
+
+// ── POST /merge ───────────────────────────────────────────────────────────────
+// Stitch a session's video segments (created because iOS force-finalizes the
+// movie file whenever the app is backgrounded) into ONE continuous video, so the
+// user sees a single recording per session instead of a pile of clips. Uses
+// ffmpeg's concat demuxer with stream copy — same device + settings, so no
+// re-encode. On any failure the individual segments are simply kept.
+// Concat same-codec segments with stream copy. Returns {outName, size} or null.
+async function ffmpegConcat(sessionId, files, ext, gold) {
+  if (!FFMPEG_PATH) {
+    console.error(`[merge] ${sessionId}: ffmpeg binary unavailable.`);
+    return null;
+  }
+  const outName = `${gold ? 'gold-' : ''}${Date.now()}-recording-full.${ext}`;
+  const outPath = path.join(uploadDir, outName);
+  const listPath = path.join(uploadDir, `concat-${Date.now()}-${Math.floor(Math.random() * 1e6)}.txt`);
+  fs.writeFileSync(listPath, files.map(f => `file '${path.join(uploadDir, f)}'`).join('\n'));
+  try {
+    await new Promise((resolve, reject) => {
+      const p = spawn(FFMPEG_PATH, ['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-c', 'copy', outPath]);
+      let err = '';
+      p.stderr.on('data', d => { err += d; });
+      p.on('error', reject);
+      p.on('close', code => (code === 0 ? resolve(null) : reject(new Error(`ffmpeg exit ${code}: ${err.slice(-300)}`))));
+    });
+    fs.unlink(listPath, () => {});
+    return { outName, size: fs.statSync(outPath).size };
+  } catch (e) {
+    fs.unlink(listPath, () => {});
+    fs.unlink(outPath, () => {});
+    console.error(`[merge] ${sessionId}: concat failed — keeping segments. ${e.message}`);
+    return null;
+  }
+}
+
+app.post('/merge', async (req, res) => {
+  const { sessionId, gold: goldReq } = req.body || {};
+  if (!sessionId) return res.status(400).json({ error: 'sessionId is required.' });
+  const token = String(req.headers['x-mih-key'] || '');
+  const rec = await sessUploadGet(sessionId);
+  if (!rec || !Array.isArray(rec.files)) return res.json({ merged: false });
+  if (rec.ownerToken && rec.ownerToken !== token) return res.status(403).json({ error: 'Forbidden.' });
+
+  // Normalize (older records stored bare filename strings = video segments).
+  const entries = rec.files
+    .map(f => (typeof f === 'string' ? { name: f, kind: 'video' } : f))
+    .filter(f => f && /^[\w.-]+$/.test(f.name) && fs.existsSync(path.join(uploadDir, f.name)));
+
+  // Merge one kind's segments into one file and swap the Gold-history entries.
+  // Audio merges even from ONE chunk (live-audio chunk files never enter history
+  // on their own — the merged file is their only route in); video needs 2+.
+  const mergeKind = async kind => {
+    const files = entries.filter(f => f.kind === kind).map(f => f.name);
+    if (files.length < (kind === 'audio' ? 1 : 2)) return null;
+    // Chunk files carry no gold- prefix, so the client states its Gold status.
+    const gold = goldReq === true || files.some(f => f.startsWith('gold-'));
+    const ext = kind === 'audio' ? 'm4a' : (path.extname(files[0]) || '.mov').slice(1);
+    let out;
+    if (files.length === 1) {
+      // Single file — nothing to concat; promote it as-is.
+      out = { outName: files[0], size: fs.statSync(path.join(uploadDir, files[0])).size, single: true };
+    } else {
+      out = await ffmpegConcat(sessionId, files, ext, gold);
+      if (!out) return null;
+    }
+    const mediaToken = crypto.randomBytes(24).toString('hex');
+    await saveMediaToken(mediaToken, out.outName, token, gold ? GOLD_MEDIA_TTL : MEDIA_TOKEN_TTL);
+    const mediaUrl = `${SERVER_URL}/media/${out.outName}?token=${mediaToken}`;
+    if (gold) {
+      const list = await getHistory(token);
+      const seg = new Set(files);
+      const removed = list.filter(e => seg.has(e.id));
+      const kept = list.filter(e => !seg.has(e.id));
+      const first = removed[removed.length - 1] || {};
+      const totalDur = removed.reduce((a, e) => a + (Number(e.durationSec) || 0), 0);
+      kept.unshift({
+        id: out.outName,
+        kind,
+        sessionId,
+        createdAt: first.createdAt || Date.now(),
+        expiresAt: Date.now() + GOLD_MEDIA_TTL * 1000,
+        sizeBytes: out.size,
+        mediaUrl,
+        latitude: first.latitude ?? null,
+        longitude: first.longitude ?? null,
+        durationSec: totalDur || null,
+      });
+      await setHistory(token, kept);
+    }
+    if (!out.single) for (const f of files) fs.unlink(path.join(uploadDir, f), () => {});
+    console.log(`[merge] ${sessionId}: ${files.length} ${kind} segment(s) -> ${out.outName} (${Math.round(out.size / 1e6)}MB)`);
+    return mediaUrl;
+  };
+
+  const videoUrl = await mergeKind('video');
+  const audioUrl = await mergeKind('audio');
+
+  // Point the live page's player/download at the full video.
+  if (videoUrl) {
+    const session = await sessionGet(sessionId);
+    if (session && (!session.ownerToken || session.ownerToken === token)) {
+      session.recordingUrl = videoUrl;
+      await sessionSet(sessionId, session);
+    }
+  }
+  await sessUploadDel(sessionId);
+  liveAudio.delete(sessionId);
+  res.json({ merged: !!(videoUrl || audioUrl), videoUrl, audioUrl });
+});
+
+// ── POST /history/clear ───────────────────────────────────────────────────────
+// Delete the calling device's ENTIRE recording history (files included).
+app.post('/history/clear', async (req, res) => {
+  const token = String(req.headers['x-mih-key'] || '');
+  const list = await getHistory(token);
+  for (const e of list) {
+    if (e.id && /^[\w.-]+$/.test(e.id)) fs.unlink(path.join(uploadDir, e.id), () => {});
+  }
+  await setHistory(token, []);
+  console.log(`[/history/clear] Removed ${list.length} entries.`);
+  res.json({ ok: true, removed: list.length });
 });
 
 // ── POST /checkin/start ───────────────────────────────────────────────────────
@@ -903,6 +1139,23 @@ async function allSessions() {
   return out;
 }
 
+// End every live session owned by a device. Marking `ended` (rather than
+// deleting) keeps the responder's live page + recording delivery working while
+// stopping ALL further alerts — scheduled rounds and the overdue cycle alike.
+// Used when the user marks safe, so alerts stop even if the /session/end call
+// never reached us. Only the USER's own actions route here.
+async function endSessionsOwnedBy(token) {
+  if (!token) return 0;
+  let n = 0;
+  for (const [sid, s] of await allSessions()) {
+    if (s && s.ownerToken === token && !s.ended) {
+      await sessionSet(sid, { ...s, ended: true, endedAt: Date.now() });
+      n++;
+    }
+  }
+  return n;
+}
+
 // One pass over live sessions, alerting the next due tier of any unacknowledged
 // session. Idempotent per tier (guarded by alertedAt). Survives restarts because
 // session state (including alertedAt) lives in redis.
@@ -910,31 +1163,61 @@ async function escalationSweep() {
   const sessions = await allSessions();
   const now = Date.now();
   for (const [sessionId, s] of sessions) {
-    if (!s || !Array.isArray(s.tiers) || s.acknowledged) continue;
+    // NOTE: a responder's "I'm on my way" (acknowledged) does NOT stop the
+    // climb — only the USER ends alerts, by marking safe (which ends the
+    // session). `ended` is the single off switch.
+    if (!s || !Array.isArray(s.tiers) || s.ended) continue;
     let lastAlerted = -1;
     for (let i = 0; i < s.tiers.length; i++) if (s.tiers[i].alertedAt) lastAlerted = i;
+    if (lastAlerted < 0) continue;
     const nextIdx = lastAlerted + 1;
-    if (lastAlerted < 0 || nextIdx >= s.tiers.length) continue;
-    const prev = s.tiers[lastAlerted];
-    const next = s.tiers[nextIdx];
-    const dueAt = (prev.alertedAt || now) + (Number(next.waitMinutes) || 0) * 60000;
-    if (now < dueAt) continue;
 
+    if (nextIdx < s.tiers.length) {
+      // Still climbing the scheduled rounds (0 / ⅓ / ⅔ / 3-3 of the timer).
+      const prev = s.tiers[lastAlerted];
+      const next = s.tiers[nextIdx];
+      const dueAt = (prev.alertedAt || now) + (Number(next.waitMinutes) || 0) * 60000;
+      if (now < dueAt) continue;
+      const liveLink = `${SERVER_URL}/live/${sessionId}`;
+      const result = await sendSmsToAll(next.phones, sessionBodyEscalated(s.name, liveLink));
+      next.alertedAt = Date.now();
+      await sessionSet(sessionId, s);
+      console.log(
+        `[escalation] ${sessionId}: alerted tier ${nextIdx + 1} "${next.name}" ${result.sent}/${next.phones.length}.`,
+      );
+      continue;
+    }
+
+    // All scheduled rounds fired and the user STILL hasn't marked safe: the
+    // overdue cycle. Re-alert the whole circle every 5 minutes — with the live
+    // link (current location + stream/recording) — forever, until the user is
+    // safe. Only the user can stop this.
+    const lastTier = s.tiers[s.tiers.length - 1];
+    const lastAt = Number(s.cycleAt || lastTier.alertedAt || 0);
+    if (!lastAt || now - lastAt < 5 * 60 * 1000) continue;
+    const phones = [...new Set(s.tiers.flatMap(t => t.phones || []))];
+    if (!phones.length) continue;
     const liveLink = `${SERVER_URL}/live/${sessionId}`;
-    const result = await sendSmsToAll(next.phones, sessionBodyEscalated(s.name, liveLink));
-    next.alertedAt = Date.now();
-    await sessionSet(sessionId, s);
-    console.log(
-      `[escalation] ${sessionId}: alerted tier ${nextIdx + 1} "${next.name}" ${result.sent}/${next.phones.length}.`,
+    const nm = cleanName(s.name) || 'Your contact';
+    const result = await sendSmsToAll(
+      phones,
+      `🔴 URGENT: ${nm} has NOT confirmed they're safe. Live location & recording: ${liveLink} Reply STOP to opt out.`,
     );
+    s.cycleAt = Date.now();
+    await sessionSet(sessionId, s);
+    console.log(`[escalation] ${sessionId}: overdue cycle alert ${result.sent}/${phones.length}.`);
   }
 }
 
 let sweepRunning = false;
 setInterval(async () => {
-  // Drop live frames from sessions that ended or went quiet (>3 min stale).
+  // Drop live frames/audio from sessions that ended or went quiet (>3 min stale).
   const cutoff = Date.now() - 3 * 60 * 1000;
   for (const [sid, f] of liveFrames) if (f.at < cutoff) liveFrames.delete(sid);
+  for (const [sid, e] of liveAudio) {
+    const last = e.chunks[e.chunks.length - 1];
+    if (!last || last.at < cutoff) liveAudio.delete(sid);
+  }
 
   if (sweepRunning) return;
   sweepRunning = true;
@@ -944,7 +1227,7 @@ setInterval(async () => {
 
 // POST /session/start
 app.post('/session/start', async (req, res) => {
-  const { sessionId, phones, name, latitude, longitude, tiers: clientTiers } = req.body;
+  const { sessionId, phones, name, latitude, longitude, tiers: clientTiers, livekit } = req.body;
   if (!sessionId) {
     return res.status(400).json({ error: 'sessionId is required.' });
   }
@@ -953,7 +1236,12 @@ app.post('/session/start', async (req, res) => {
 
   // Build validated, tier-grouped recipients (falls back to one all-at-once tier).
   const built = await buildTiers(req, clientTiers, phones);
-  if (built.error) return res.status(built.status).json({ error: built.error });
+  if (built.error) {
+    // ALWAYS log alert rejections — a silently failing panic alert is the worst
+    // possible failure mode (this exact gap hid a daily-cap outage).
+    console.error(`[/session/start] REJECTED ${sessionId} (${built.status}): ${built.error}`);
+    return res.status(built.status).json({ error: built.error });
+  }
   const tiers = built.tiers;
   const nm = cleanName(name);
 
@@ -971,6 +1259,7 @@ app.post('/session/start', async (req, res) => {
     tiers,
     acknowledged: false,
     ackedAt: null,
+    livekit: LIVEKIT_ENABLED && livekit === true,
   });
 
   // In-memory fallback: expire after 24h
@@ -1001,10 +1290,16 @@ app.post('/session/update', async (req, res) => {
     return res.status(403).json({ error: 'Forbidden.' });
   }
   await sessionSet(sessionId, { ...session, latitude: latitude ?? null, longitude: longitude ?? null, updatedAt: Date.now() });
-  res.json({ ok: true });
+  // acknowledged lets the user's app show "someone is on their way" (it never
+  // affects the alerting — that runs until the user marks safe).
+  res.json({ ok: true, acknowledged: !!session.acknowledged });
 });
 
 // POST /session/end
+// Marks the session ended rather than deleting it: the recording uploads +
+// merge finish AFTER this call, and the circle's live page must still be able
+// to receive the final video (it stays watchable/downloadable until the
+// session's 24h TTL expires). Escalation stops via the `ended` flag.
 app.post('/session/end', async (req, res) => {
   const { sessionId } = req.body;
   if (!sessionId) return res.status(400).json({ error: 'sessionId is required.' });
@@ -1014,9 +1309,19 @@ app.post('/session/end', async (req, res) => {
   if (session && session.ownerToken && session.ownerToken !== token) {
     return res.status(403).json({ error: 'Forbidden.' });
   }
-  await sessionDel(sessionId);
+  if (session) {
+    await sessionSet(sessionId, { ...session, ended: true, endedAt: Date.now() });
+    // LiveKit session: stop recording and (async) register the finished MP4.
+    if (session.livekit && EGRESS_ENABLED) {
+      const coords =
+        session.latitude != null && session.longitude != null
+          ? { latitude: session.latitude, longitude: session.longitude }
+          : null;
+      stopAndRegisterEgress(sessionId, session.ownerToken, session.name, coords).catch(() => {});
+    }
+  }
   liveFrames.delete(sessionId);
-  console.log(`[/session/end] Ended session ${sessionId}.`);
+  console.log(`[/session/end] Ended session ${sessionId} (kept for recording delivery).`);
   res.json({ ended: true });
 });
 
@@ -1051,6 +1356,297 @@ app.get('/frame/:sessionId', (req, res) => {
   res.send(f.buf);
 });
 
+// ── Live audio chunks ─────────────────────────────────────────────────────────
+// The go-live device records rolling ~5s audio clips for the WHOLE session and
+// POSTs each one; the live page fetches them in sequence so the responder can
+// LISTEN live (a few seconds behind). Chunks are also tracked per session so
+// /merge stitches them into the one full-session audio in Gold history.
+const liveAudio = new Map(); // sessionId → { seq, chunks: [{seq, name, at}] }
+const chunkStorage = multer.diskStorage({
+  destination: uploadDir,
+  filename: (req, file, cb) => cb(null, `chunk-${Date.now()}-${Math.floor(Math.random() * 1e6)}.m4a`),
+});
+const chunkUpload = multer({
+  storage: chunkStorage,
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (rq, f, cb) => cb(null, /audio|octet/.test(String(f.mimetype || ''))),
+});
+
+app.post('/audiochunk/:sessionId', chunkUpload.single('chunk'), async (req, res) => {
+  const sessionId = req.params.sessionId;
+  const session = await sessionGet(sessionId);
+  if (!session) return res.status(404).json({ error: 'Session not found.' });
+  const token = String(req.headers['x-mih-key'] || '');
+  if (session.ownerToken && session.ownerToken !== token) {
+    return res.status(403).json({ error: 'Forbidden.' });
+  }
+  if (!req.file) return res.status(400).json({ error: 'No chunk received.' });
+  let entry = liveAudio.get(sessionId);
+  if (!entry) {
+    entry = { seq: 0, chunks: [] };
+    liveAudio.set(sessionId, entry);
+  }
+  entry.seq += 1;
+  entry.chunks.push({ seq: entry.seq, name: req.file.filename, at: Date.now() });
+  while (entry.chunks.length > 24) entry.chunks.shift(); // live window ~2 min; files stay for /merge
+  await sessUploadAdd(sessionId, token, req.file.filename, 'audio');
+  res.json({ ok: true, seq: entry.seq });
+});
+
+// Next chunk after ?after=<seq>. Public like GET /frame — guarded by the
+// unguessable session id.
+app.get('/audiochunk/:sessionId', (req, res) => {
+  const entry = liveAudio.get(req.params.sessionId);
+  const after = Number(req.query.after || 0);
+  const next = entry?.chunks.find(c => c.seq > after);
+  if (!next) return res.status(204).end();
+  res.set('X-Chunk-Seq', String(next.seq));
+  res.set('Cache-Control', 'no-store');
+  res.set('Content-Type', 'audio/mp4');
+  res.sendFile(path.join(uploadDir, next.name));
+});
+
+// ── Reverse geocoding (OpenStreetMap Nominatim, free/keyless) ────────────────
+// Turns coordinates into a human address for the live page. Cached on a ~110m
+// grid for 30 min so polling never hammers Nominatim (their limit is 1 req/s).
+const geoCache = new Map(); // "lat,lng" 3dp → { addr, at }
+async function reverseGeocode(lat, lng) {
+  if (lat == null || lng == null) return null;
+  const key = `${Number(lat).toFixed(3)},${Number(lng).toFixed(3)}`;
+  const hit = geoCache.get(key);
+  if (hit && Date.now() - hit.at < 30 * 60 * 1000) return hit.addr;
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 5000);
+    const r = await fetch(
+      `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lng)}&zoom=17`,
+      { headers: { 'User-Agent': 'MakeItHome-Safety-App/1.0' }, signal: ctrl.signal },
+    );
+    clearTimeout(t);
+    if (!r.ok) return hit?.addr ?? null;
+    const j = await r.json();
+    // display_name is long ("12 Main St, Springfield, County, State, Zip, USA")
+    // — keep the useful front half.
+    const addr = j?.display_name ? String(j.display_name).split(',').slice(0, 4).join(',').trim() : null;
+    geoCache.set(key, { addr, at: Date.now() });
+    if (geoCache.size > 500) geoCache.delete(geoCache.keys().next().value);
+    return addr;
+  } catch {
+    return hit?.addr ?? null;
+  }
+}
+
+// ── LiveKit egress (recording) → Cloudflare R2 ────────────────────────────────
+// A live session is recorded server-side by LiveKit egress writing an MP4 to R2.
+// We start egress when the host publishes, stop it at session end, then (on a
+// short poll) presign the R2 object and register it as the session's recording.
+const httpLiveKitUrl = LIVEKIT_URL ? LIVEKIT_URL.replace(/^wss:/, 'https:').replace(/^ws:/, 'http:') : '';
+let egressClient = null;
+let s3Client = null;
+let getSignedUrl = null;
+let GetObjectCommand = null;
+if (EGRESS_ENABLED && LiveKit) {
+  try {
+    egressClient = new LiveKit.EgressClient(httpLiveKitUrl, LIVEKIT_API_KEY, LIVEKIT_API_SECRET);
+    const { S3Client, GetObjectCommand: GOC } = require('@aws-sdk/client-s3');
+    ({ getSignedUrl } = require('@aws-sdk/s3-request-presigner'));
+    GetObjectCommand = GOC;
+    s3Client = new S3Client({
+      region: 'auto',
+      endpoint: R2_ENDPOINT,
+      credentials: { accessKeyId: R2_ACCESS_KEY_ID, secretAccessKey: R2_SECRET_ACCESS_KEY },
+    });
+    console.log('[egress] enabled — recordings will be saved to R2.');
+  } catch (e) {
+    console.error('[egress] init failed:', e.message);
+    egressClient = null;
+  }
+}
+
+const EGRESS_PREFIX = 'egress:'; // egress:<sessionId> → { egressId, key }
+
+// Start recording a live session. filename key is deterministic per session so
+// we can find it in R2 afterward. Room composite = whatever the host publishes.
+async function startEgress(sessionId) {
+  if (!egressClient) return null;
+  const key = `recordings/${sessionId}.mp4`;
+  try {
+    const output = new LiveKit.EncodedFileOutput({
+      fileType: LiveKit.EncodedFileType.MP4,
+      filepath: key,
+      output: {
+        case: 's3',
+        value: new LiveKit.S3Upload({
+          accessKey: R2_ACCESS_KEY_ID,
+          secret: R2_SECRET_ACCESS_KEY,
+          bucket: R2_BUCKET,
+          endpoint: R2_ENDPOINT,
+          region: 'auto',
+          forcePathStyle: true,
+        }),
+      },
+    });
+    const info = await egressClient.startRoomCompositeEgress(sessionId, output, { layout: 'speaker' });
+    const rec = { egressId: info.egressId, key };
+    if (redis) await redisSet(`${EGRESS_PREFIX}${sessionId}`, rec, SESSION_TTL);
+    else egressMemory.set(sessionId, rec);
+    console.log(`[egress] started ${info.egressId} for ${sessionId} -> ${key}`);
+    return rec;
+  } catch (e) {
+    console.error(`[egress] start failed for ${sessionId}: ${e.message}`);
+    return null;
+  }
+}
+const egressMemory = new Map();
+async function getEgress(sessionId) {
+  if (redis) return redisGet(`${EGRESS_PREFIX}${sessionId}`);
+  return egressMemory.get(sessionId) ?? null;
+}
+
+// Presign a GET URL for an R2 object. S3 SigV4 caps expiry at 7 days, so these
+// are SHORT-lived — long-lived access goes through /r2media/<token> below,
+// which redirects to a fresh presigned URL each time.
+async function presignRecording(key, expiresIn = 3600) {
+  if (!s3Client || !getSignedUrl || !GetObjectCommand) return null;
+  try {
+    return await getSignedUrl(s3Client, new GetObjectCommand({ Bucket: R2_BUCKET, Key: key }), {
+      expiresIn,
+    });
+  } catch (e) {
+    console.error(`[egress] presign failed: ${e.message}`);
+    return null;
+  }
+}
+
+// Long-lived recording access: our own signed token (90d, same store as /media)
+// maps to the R2 key; each GET mints a fresh 1h presigned URL and redirects.
+async function registerRecordingUrl(key, ownerToken) {
+  const mediaToken = crypto.randomBytes(24).toString('hex');
+  await saveMediaToken(mediaToken, `r2:${key}`, ownerToken, GOLD_MEDIA_TTL);
+  return `${SERVER_URL}/r2media/${mediaToken}`;
+}
+
+// Stop egress at session end, then poll until the MP4 is finalized in R2 and
+// register it as the session's recording (live page + Gold history).
+async function stopAndRegisterEgress(sessionId, ownerToken, name, coords) {
+  const rec = await getEgress(sessionId);
+  if (!rec || !egressClient) return;
+  try { await egressClient.stopEgress(rec.egressId); } catch (e) { /* may already be stopping */ }
+  // Poll egress status until complete (bounded ~2 min for typical clips).
+  for (let i = 0; i < 40; i++) {
+    await new Promise(r => setTimeout(r, 3000));
+    let info;
+    try {
+      const list = await egressClient.listEgress({ egressId: rec.egressId });
+      info = Array.isArray(list) ? list[0] : list;
+    } catch { continue; }
+    if (!info) continue;
+    const status = info.status;
+    // 3 = EGRESS_COMPLETE in the enum; also accept the string form.
+    const done = status === 3 || status === 'EGRESS_COMPLETE';
+    const failed = status === 4 || status === 5 || status === 'EGRESS_FAILED' || status === 'EGRESS_ABORTED';
+    if (failed) { console.error(`[egress] ${sessionId} failed (status ${status}).`); return; }
+    if (!done) continue;
+    // Finalized — presign and register.
+    const fileResult = info.fileResults?.[0] || info.file;
+    const key = fileResult?.filename || rec.key;
+    const sizeBytes = Number(fileResult?.size) || null;
+    const durationSec = fileResult?.duration ? Math.round(Number(fileResult.duration) / 1e9) : null;
+    const url = await registerRecordingUrl(key, ownerToken);
+    if (!url) return;
+    const session = await sessionGet(sessionId);
+    if (session) await sessionSet(sessionId, { ...session, recordingUrl: url });
+    await addHistoryEntry(ownerToken, {
+      id: `egress-${sessionId}`,
+      kind: 'video',
+      sessionId,
+      createdAt: Date.now(),
+      expiresAt: Date.now() + GOLD_MEDIA_TTL * 1000,
+      sizeBytes,
+      mediaUrl: url,
+      latitude: coords?.latitude ?? null,
+      longitude: coords?.longitude ?? null,
+      durationSec,
+    });
+    if (redis) await redisDel(`${EGRESS_PREFIX}${sessionId}`);
+    else egressMemory.delete(sessionId);
+    console.log(`[egress] ${sessionId} complete -> registered recording (${durationSec || '?'}s).`);
+    return;
+  }
+  console.error(`[egress] ${sessionId} did not finalize in time.`);
+}
+
+// ── LiveKit tokens ────────────────────────────────────────────────────────────
+// Mint a short-lived JWT granting access to a room named after the sessionId.
+async function mintLiveKitToken(identity, room, { publish }) {
+  const at = new LiveKit.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
+    identity,
+    ttl: '4h',
+  });
+  at.addGrant({
+    room,
+    roomJoin: true,
+    canPublish: !!publish,
+    canSubscribe: true,
+    canPublishData: !!publish,
+  });
+  return at.toJwt();
+}
+
+// Long-lived recording link: our signed token (90d) → fresh presigned R2 URL.
+// Public like /media — the unguessable token IS the auth (Twilio-less browser
+// access for the circle). Guarded to recordings/ keys only.
+app.get('/r2media/:token', async (req, res) => {
+  const stored = await resolveMediaToken(String(req.params.token || ''));
+  if (!stored || !stored.startsWith('r2:')) return res.status(404).json({ error: 'Not found or expired.' });
+  const key = stored.slice(3);
+  if (!key.startsWith('recordings/')) return res.status(404).json({ error: 'Not found.' });
+  const url = await presignRecording(key, 3600);
+  if (!url) return res.status(503).json({ error: 'Recording storage unavailable.' });
+  res.redirect(302, url);
+});
+
+// The go-live phone asks for a PUBLISHER token (authenticated device). Room =
+// sessionId. Returns the wss URL too so the client needs no hardcoded config.
+app.post('/livekit/publish-token', async (req, res) => {
+  if (!LIVEKIT_ENABLED || !LiveKit) return res.status(503).json({ error: 'LiveKit not configured.' });
+  const { sessionId } = req.body || {};
+  if (!sessionId || !/^[\w-]+$/.test(sessionId)) return res.status(400).json({ error: 'Valid sessionId required.' });
+  const token = await mintLiveKitToken(`host-${sessionId}`.slice(0, 60), sessionId, { publish: true });
+  res.json({ url: LIVEKIT_URL, token });
+});
+
+// The phone calls this once it has CONNECTED and started publishing, so the
+// room exists when egress attaches. Authenticated (owning device only).
+app.post('/livekit/start-egress', async (req, res) => {
+  if (!EGRESS_ENABLED) { console.log('[egress] start-egress: not enabled'); return res.json({ recording: false }); }
+  const { sessionId } = req.body || {};
+  if (!sessionId || !/^[\w-]+$/.test(sessionId)) return res.status(400).json({ error: 'Valid sessionId required.' });
+  const session = await sessionGet(sessionId);
+  const token = String(req.headers['x-mih-key'] || '');
+  if (!session) { console.log(`[egress] start-egress: session ${sessionId} not found`); return res.status(404).json({ error: 'Session not found.' }); }
+  if (session.ownerToken && session.ownerToken !== token) {
+    console.log(`[egress] start-egress: owner mismatch for ${sessionId}`);
+    return res.status(403).json({ error: 'Forbidden.' });
+  }
+  if (await getEgress(sessionId)) return res.json({ recording: true }); // already recording
+  const rec = await startEgress(sessionId);
+  res.json({ recording: !!rec });
+});
+
+// The responder's browser gets a SUBSCRIBE-ONLY token. Public — reached from the
+// live link, guarded by the unguessable sessionId (same trust model as /frame).
+// A viewer can never publish. Only issued while the session exists and is live.
+app.get('/livekit/view-token/:sessionId', async (req, res) => {
+  if (!LIVEKIT_ENABLED || !LiveKit) return res.status(503).json({ error: 'LiveKit not configured.' });
+  const sessionId = req.params.sessionId;
+  const s = await sessionGet(sessionId);
+  if (!s || s.ended) return res.status(404).json({ error: 'gone' });
+  const viewer = `viewer-${crypto.randomBytes(6).toString('hex')}`;
+  const token = await mintLiveKitToken(viewer, sessionId, { publish: false });
+  res.json({ url: LIVEKIT_URL, token });
+});
+
 // JSON state for the live page's polling: location, ack, recording, live frame.
 app.get('/live/:sessionId/state', async (req, res) => {
   const s = await sessionGet(req.params.sessionId);
@@ -1058,10 +1654,14 @@ app.get('/live/:sessionId/state', async (req, res) => {
   res.json({
     lat: s.latitude ?? null,
     lng: s.longitude ?? null,
+    address: await reverseGeocode(s.latitude, s.longitude),
     updatedAt: s.updatedAt ?? null,
     acknowledged: !!s.acknowledged,
+    ended: !!s.ended,
     recordingUrl: s.recordingUrl || null,
     hasFrame: liveFrames.has(req.params.sessionId),
+    // Tells the live page whether to use the WebRTC player or the snapshot feed.
+    livekit: LIVEKIT_ENABLED && !!s.livekit,
   });
 });
 
@@ -1078,7 +1678,21 @@ app.post('/ack/:sessionId', async (req, res) => {
     session.acknowledged = true;
     session.ackedAt = Date.now();
     await sessionSet(sessionId, session);
-    console.log(`[ack] ${sessionId} acknowledged — escalation halted.`);
+    console.log(`[ack] ${sessionId} acknowledged (informational — alerts continue until the user is safe).`);
+    // Tell the circle someone is heading over. Purely informational: it does
+    // NOT stop the alerts — only the user marking safe does. Sent once
+    // (guarded by the acknowledged flag). The user's app surfaces it too, via
+    // the acknowledged flag in /session/update responses.
+    const phones = [...new Set((session.tiers || []).flatMap(t => t.phones || []))];
+    if (phones.length && twilioClient) {
+      const nm = cleanName(session.name) || 'your contact';
+      sendSmsToAll(
+        phones,
+        `🟢 Someone from ${nm}'s safety circle is on their way to them. Reply STOP to opt out.`,
+      )
+        .then(r => console.log(`[ack] ${sessionId}: on-my-way notice sent ${r.sent}/${phones.length}.`))
+        .catch(() => {});
+    }
   }
   res.redirect(303, `/live/${sessionId}`);
 });
@@ -1094,6 +1708,7 @@ app.get('/live/:sessionId', async (req, res) => {
   }
 
   const { name, latitude, longitude, updatedAt, acknowledged } = session;
+  const isLiveKit = LIVEKIT_ENABLED && !!session.livekit; // real-time video session
   const safeName = escapeHtml(name || '');
   const displayName = safeName || 'Your contact';
   const displayTitle = safeName || 'Someone';
@@ -1110,11 +1725,29 @@ app.get('/live/:sessionId', async (req, res) => {
   const sidJson = JSON.stringify(sessionId);
 
   // When acknowledged, later responders see it's handled and the button is gone.
-  const respondBlock = acknowledged
-    ? `<div class="acked">✓ Someone is on their way</div>`
-    : `<form method="POST" action="${ackPath}" style="margin-top:14px">
-    <button class="ack" type="submit">I&#x27;m on my way — stop alerting others</button>
+  const respondBlock = session.ended
+    ? `<div class="acked">Session ended</div>`
+    : acknowledged
+      ? `<div class="acked">✓ Someone is on their way</div>`
+      : `<form method="POST" action="${ackPath}" style="margin-top:14px">
+    <button class="ack" type="submit">I&#x27;m on my way</button>
   </form>`;
+
+  // The global helmet CSP is script-src 'none' — correct for every other page,
+  // but it silenced THIS page's own script (live frames, location refresh, ack
+  // banner, recording player never ran). Allow exactly our inline script via a
+  // per-response nonce; everything else stays locked down.
+  const nonce = crypto.randomBytes(16).toString('base64');
+  // LiveKit needs the signaling websocket (wss) + a web worker; the SDK is
+  // served from our own origin. Only widen the policy for LiveKit sessions.
+  const lkConnect = isLiveKit ? ' https://*.livekit.cloud wss://*.livekit.cloud' : '';
+  const lkWorker = isLiveKit ? " worker-src 'self' blob:;" : '';
+  res.setHeader(
+    'Content-Security-Policy',
+    `default-src 'self'; script-src 'nonce-${nonce}' 'self'; style-src 'unsafe-inline'; ` +
+      `img-src 'self' data:; connect-src 'self'${lkConnect}; media-src 'self' blob:;${lkWorker} ` +
+      `frame-src 'none'; object-src 'none'`,
+  );
 
   res.send(`<!DOCTYPE html>
 <html>
@@ -1138,33 +1771,97 @@ app.get('/live/:sessionId', async (req, res) => {
     .ack:active{opacity:.85}
     .acked{margin-top:14px;color:#4ade80;font-size:16px;font-weight:700;background:rgba(22,101,52,0.18);border:1px solid #166534;padding:14px 22px;border-radius:12px}
     .dl{display:inline-block;margin-top:14px;background:#1f2937;color:#fff;text-decoration:none;padding:14px 24px;border-radius:12px;font-size:15px;font-weight:600;border:1px solid #374151}
-    .meta{color:#444;font-size:11px;margin-top:22px;line-height:1.8;font-variant-numeric:tabular-nums}
+    .rec{margin-top:16px;width:100%;max-width:520px;border-radius:14px;border:1px solid #374151;background:#000;display:block}
+    .reclabel{margin-top:14px;color:#cbd5e1;font-size:14px;font-weight:600}
+    .addr{color:#9aa4b2;font-size:13.5px;font-weight:600;margin-top:20px;max-width:360px;line-height:1.5}
+    .listen{background:#1f2937;color:#fff;border:1px solid #374151;border-radius:999px;padding:11px 22px;font-size:14px;font-weight:700;cursor:pointer;margin-bottom:18px}
+    .listen.on{background:rgba(22,101,52,0.25);border-color:#166534;color:#4ade80}
+    .meta{color:#444;font-size:11px;margin-top:8px;line-height:1.8;font-variant-numeric:tabular-nums}
   </style>
 </head>
 <body>
-  <div class="live"><span class="dot"></span>LIVE</div>
+  <div class="live" id="livehdr"><span class="dot"></span>LIVE</div>
   <div class="videowrap">
-    <img id="frame" alt="">
-    <div id="waiting">Recording in progress…<br>The video will be available to download here when it ends.</div>
+    ${isLiveKit
+      ? `<video id="lkvideo" autoplay playsinline muted style="width:100%;height:100%;object-fit:cover;display:block;background:#000"></video>`
+      : `<img id="frame" alt="">`}
+    <div id="waiting">Connecting to the live camera…<br>${isLiveKit ? 'Tap “Unmute” below to hear live audio.' : 'The full video can be watched and downloaded here when the session ends.'}</div>
   </div>
+  ${isLiveKit
+    ? `<button id="lkmute" class="listen">🔊 Tap to unmute</button>`
+    : `<button id="listen" class="listen">🔊 Listen live</button>`}
   <div class="name">${displayName}</div>
   <div class="sub">needs help — tap to navigate</div>
   <a id="maps" class="btn" href="${mapsUrl}">Open in Maps</a>
   <div id="respond">${respondBlock}</div>
   <div id="dlwrap"></div>
+  <div class="addr" id="addr"></div>
   <div class="meta">
     <span id="coords">${coordsText}</span><br>
-    <span id="ago">Updated ${agoText}</span> &middot; live
+    <span id="ago">Updated ${agoText}</span>
   </div>
-  <script>
+  ${isLiveKit ? `<script nonce="${nonce}" src="/livekit-client.js"></script>` : ''}
+  <script nonce="${nonce}">
     var SID = ${sidJson};
-    var img = document.getElementById('frame');
+    var IS_LK = ${isLiveKit};
     var waiting = document.getElementById('waiting');
-    img.onload = function(){ if (img.naturalWidth > 0) waiting.style.display = 'none'; };
-    img.onerror = function(){ waiting.style.display = 'flex'; };
-    function frameTick(){ img.src = '/frame/' + encodeURIComponent(SID) + '?t=' + Date.now(); }
-    frameTick();
-    setInterval(frameTick, 2000);
+    var gotFrame = false;
+    var isEnded = false;
+    var stopMedia = function(){};
+
+    if (IS_LK) {
+      // ── Real-time WebRTC viewer (LiveKit) ──
+      var video = document.getElementById('lkvideo');
+      var muteBtn = document.getElementById('lkmute');
+      var lkRoom = null;
+      muteBtn.onclick = function(){
+        video.muted = !video.muted;
+        muteBtn.textContent = video.muted ? '🔊 Tap to unmute' : '🔇 Audio on (tap to mute)';
+        muteBtn.classList.toggle('on', !video.muted);
+        video.play().catch(function(){});
+      };
+      fetch('/livekit/view-token/' + encodeURIComponent(SID)).then(function(r){ return r.ok ? r.json() : null; }).then(function(cfg){
+        if (!cfg || !window.LivekitClient) { waiting.textContent = 'Live stream unavailable.'; return; }
+        lkRoom = new LivekitClient.Room({ adaptiveStream: true });
+        lkRoom.on(LivekitClient.RoomEvent.TrackSubscribed, function(track){
+          track.attach(video); // both camera + mic feed the one <video> element
+          if (track.kind === 'video'){ gotFrame = true; waiting.style.display = 'none'; }
+        });
+        lkRoom.on(LivekitClient.RoomEvent.TrackMuted, function(){ /* host backgrounded — video freezes */ });
+        lkRoom.connect(cfg.url, cfg.token).catch(function(){ waiting.textContent = 'Could not connect to the live stream.'; });
+      }).catch(function(){ waiting.textContent = 'Could not connect to the live stream.'; });
+      stopMedia = function(){ if (lkRoom) { try { lkRoom.disconnect(); } catch(e){} } };
+    } else {
+      // ── Snapshot viewer + rolling live audio ──
+      var img = document.getElementById('frame');
+      img.onload = function(){ if (img.naturalWidth > 0){ gotFrame = true; waiting.style.display = 'none'; } };
+      img.onerror = function(){ if (!gotFrame) waiting.style.display = 'flex'; };
+      var frameTimer = setInterval(function(){ if (!isEnded) img.src = '/frame/' + encodeURIComponent(SID) + '?t=' + Date.now(); }, 1200);
+      img.src = '/frame/' + encodeURIComponent(SID) + '?t=' + Date.now();
+      var audioSeq = 0, listening = false;
+      var player = new Audio();
+      var listenBtn = document.getElementById('listen');
+      var pump = function(){
+        if (!listening || isEnded) return;
+        fetch('/audiochunk/' + encodeURIComponent(SID) + '?after=' + audioSeq).then(function(r){
+          if (!r.ok || r.status === 204){ setTimeout(pump, 1200); return null; }
+          audioSeq = Number(r.headers.get('X-Chunk-Seq') || (audioSeq + 1));
+          return r.blob();
+        }).then(function(b){
+          if (!b) return;
+          var url = URL.createObjectURL(b);
+          player.src = url;
+          player.onended = function(){ URL.revokeObjectURL(url); pump(); };
+          player.play().catch(function(){ URL.revokeObjectURL(url); setTimeout(pump, 1500); });
+        }).catch(function(){ setTimeout(pump, 2000); });
+      };
+      listenBtn.onclick = function(){
+        if (listening){ listening = false; player.pause(); listenBtn.classList.remove('on'); listenBtn.textContent = '🔊 Listen live'; return; }
+        listening = true; listenBtn.classList.add('on'); listenBtn.textContent = '🔊 Listening… (tap to stop)';
+        pump();
+      };
+      stopMedia = function(){ clearInterval(frameTimer); listening = false; player.pause(); listenBtn.style.display = 'none'; };
+    }
 
     function fmtAgo(ms){ var s = Math.round((Date.now() - ms) / 1000); return s < 60 ? s + 's ago' : Math.round(s/60) + 'm ago'; }
     function stateTick(){
@@ -1174,11 +1871,33 @@ app.get('/live/:sessionId', async (req, res) => {
           document.getElementById('coords').textContent = Number(s.lat).toFixed(5) + ', ' + Number(s.lng).toFixed(5);
           document.getElementById('maps').href = 'https://maps.google.com/?q=' + s.lat + ',' + s.lng;
         }
+        if (s.address) document.getElementById('addr').textContent = '📍 ' + s.address;
         if (s.updatedAt) document.getElementById('ago').textContent = 'Updated ' + fmtAgo(s.updatedAt);
-        if (s.acknowledged) document.getElementById('respond').innerHTML = '<div class="acked">✓ Someone is on their way</div>';
+        if (s.ended && !isEnded){
+          isEnded = true;
+          stopMedia();
+          var mb = document.getElementById('lkmute'); if (mb) mb.style.display = 'none';
+          document.getElementById('livehdr').textContent = 'SESSION ENDED';
+          document.getElementById('livehdr').style.color = '#9aa4b2';
+          document.getElementById('respond').innerHTML = '<div class="acked">Session ended</div>';
+          if (!gotFrame) waiting.innerHTML = IS_LK
+            ? 'Session ended. The live stream has stopped.'
+            : 'Session ended.<br>The recording appears below when it finishes uploading.';
+        }
+        if (s.acknowledged && !isEnded) document.getElementById('respond').innerHTML = '<div class="acked">✓ Someone is on their way</div>';
         var dl = document.getElementById('dlwrap');
         if (s.recordingUrl && !dl.dataset.set){
           dl.dataset.set = '1';
+          // Inline player so the circle can WATCH + HEAR the recording right
+          // here, plus a download link to save it.
+          var lbl = document.createElement('div');
+          lbl.className = 'reclabel'; lbl.textContent = 'Safety recording';
+          dl.appendChild(lbl);
+          var v = document.createElement('video');
+          v.className = 'rec'; v.src = s.recordingUrl;
+          v.setAttribute('controls', ''); v.setAttribute('playsinline', '');
+          v.setAttribute('preload', 'metadata');
+          dl.appendChild(v);
           var a = document.createElement('a');
           a.className = 'dl'; a.href = s.recordingUrl; a.textContent = '⬇ Download recording';
           a.setAttribute('download', ''); a.setAttribute('target', '_blank');
@@ -1196,11 +1915,16 @@ app.get('/live/:sessionId', async (req, res) => {
 // ── POST /safe ────────────────────────────────────────────────────────────────
 app.post('/safe', async (req, res) => {
   const { phones, name } = req.body;
+  // Marking safe MUST halt escalation, even if /session/end never reached us
+  // (dropped connection, app killed). Acknowledge every session this device owns.
+  const ownerToken = String(req.headers['x-mih-key'] || '');
+  const halted = await endSessionsOwnedBy(ownerToken);
+  if (halted) console.log(`[/safe] Halted escalation on ${halted} session(s).`);
   const r = await recipientsFor(req, phones);
   if (r.error) return res.status(r.status).json({ error: r.error });
   const recipients = r.recipients;
   const who = cleanName(name) || 'Your contact';
-  const result = await sendSmsToAll(recipients, `✅ ${who} is safe — false alarm. Reply STOP to opt out.`);
+  const result = await sendSmsToAll(recipients, `✅ ${who} is safe. Reply STOP to opt out.`);
   if (result.sent === 0) {
     console.error('[/safe] All sends failed:', result.errors.join('; '));
     return res.status(500).json({ error: 'Could not reach any contact.', failed: result.failed });

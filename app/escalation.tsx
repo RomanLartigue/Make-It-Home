@@ -43,9 +43,10 @@ export default function EscalationScreen() {
     })();
   }, []);
 
-  // Free users always run the fixed default schedule, even if a stale custom
-  // one is on disk (e.g. Gold lapsed). Gold users run whatever they've set.
-  const effective = gold ? schedule : DEFAULT_SCHEDULE;
+  // Free users' schedule is thirds of whatever they slide to (shown here with a
+  // 30-minute example: alerts at 10 / 20 / 30). Gold users run whatever they've
+  // set, regardless of the slide.
+  const effective = gold ? schedule : [10, 10, 10];
 
   const persist = (next: number[]) => {
     setSchedule(next);
@@ -77,14 +78,20 @@ export default function EscalationScreen() {
     setDrafts(DEFAULT_SCHEDULE.map(String));
   };
 
-  // Timeline: immediate alert, then a reminder after each wait (cumulative).
-  const timeline: { label: string; at: number; first?: boolean; idx?: number }[] = [
+  // Timeline: immediate alert, then a reminder after each wait (cumulative),
+  // then the forever 5-minute overdue cycle until the user marks safe.
+  const timeline: { label: string; at: number; first?: boolean; idx?: number; cycle?: boolean }[] = [
     { label: 'You go live — everyone is alerted', at: 0, first: true },
   ];
   let elapsed = 0;
   effective.forEach((wait, i) => {
     elapsed += wait;
     timeline.push({ label: `Everyone is texted again (reminder ${i + 1})`, at: elapsed, idx: i });
+  });
+  timeline.push({
+    label: 'Still not marked safe? Everyone is re-alerted every 5 minutes — until you are',
+    at: elapsed + 5,
+    cycle: true,
   });
 
   if (!loaded) return <SafeAreaView style={styles.root} edges={['top']} />;
@@ -94,8 +101,9 @@ export default function EscalationScreen() {
       <View style={{ paddingHorizontal: 20 }}>
         <DetailHeader title="Escalation" onBack={() => router.back()} />
         <Text style={styles.subttl}>
-          If no one taps “I’m on my way,” Make It Home keeps texting your whole circle on a schedule
-          until someone responds — so a missed message doesn’t mean missed help.
+          {gold
+            ? 'Your circle is texted the moment you go live, then re-texted on your custom schedule — and only YOU can stop the alerts, by marking yourself safe.'
+            : 'Your circle is texted the moment you go live, then again at ⅓, ⅔ and the full time of your slider (slide 30 min → alerts at 10, 20 and 30). If you still haven’t marked safe after that, everyone is re-alerted every 5 minutes until you do. Only you can stop the alerts.'}
         </Text>
       </View>
 
@@ -113,7 +121,7 @@ export default function EscalationScreen() {
         )}
 
         <View style={styles.secRow}>
-          <Text style={styles.secLabel}>What happens if no one responds</Text>
+          <Text style={styles.secLabel}>{gold ? 'Your schedule' : 'Example — a 30-minute slide'}</Text>
           {gold && <GoldBadge />}
         </View>
         <View style={styles.card}>

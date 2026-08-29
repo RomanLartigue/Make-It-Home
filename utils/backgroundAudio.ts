@@ -13,6 +13,20 @@
 let recording: any = null;
 let starting: Promise<boolean> | null = null;
 
+/**
+ * Ask for the mic permission while the app is in the FOREGROUND. Permission
+ * prompts can't be shown once backgrounded — asking there just returns denied
+ * (seen in the field as bg-audio-DENIED). Call at go-live.
+ */
+export async function warmUpBackgroundAudio(): Promise<void> {
+  try {
+    const { Audio } = await import('expo-av');
+    await Audio.requestPermissionsAsync();
+  } catch {
+    // best-effort
+  }
+}
+
 export async function startBackgroundAudio(): Promise<boolean> {
   if (recording) return true;
   if (starting) return starting;
@@ -63,4 +77,73 @@ export async function stopBackgroundAudio(): Promise<string | null> {
 
 export function isBackgroundAudioActive(): boolean {
   return !!recording;
+}
+
+// ── Chunked live audio ────────────────────────────────────────────────────────
+// Records rolling ~5s clips for the WHOLE session (foreground and background —
+// the continuously-active recording is also what keeps iOS from suspending the
+// app when it's backgrounded). Each finished clip is handed to onChunk for
+// upload; the server stitches them into the one full-session audio at the end.
+let chunkActive = false;
+
+export async function startChunkedAudio(
+  onChunk: (uri: string) => void,
+  onError?: (msg: string) => void,
+  chunkMs = 5000,
+): Promise<boolean> {
+  if (chunkActive) return true;
+  try {
+    const { Audio } = await import('expo-av');
+    const perm = await Audio.requestPermissionsAsync();
+    if (!perm.granted) {
+      onError?.('mic permission denied');
+      return false;
+    }
+    await Audio.setAudioModeAsync({
+      allowsRecordingIOS: true,
+      playsInSilentModeIOS: true,
+      staysActiveInBackground: true,
+    });
+    chunkActive = true;
+    let errored = false;
+    (async () => {
+      while (chunkActive) {
+        let rec: any = null;
+        try {
+          const r = await Audio.Recording.createAsync(Audio.RecordingOptionsPresets.LOW_QUALITY);
+          rec = r.recording;
+          errored = false;
+        } catch (e: any) {
+          // The camera may hold the mic exclusively on some devices — report
+          // once, keep retrying (the camera releases it when backgrounded).
+          if (!errored) {
+            errored = true;
+            onError?.(String(e?.message ?? e));
+          }
+          await new Promise(res => setTimeout(res, 2000));
+          continue;
+        }
+        await new Promise(res => setTimeout(res, chunkMs));
+        try {
+          await rec.stopAndUnloadAsync();
+          const uri: string | null = rec.getURI?.() ?? null;
+          if (uri && chunkActive) onChunk(uri);
+        } catch {
+          // lost chunk — the next one starts immediately
+        }
+      }
+      try {
+        const { Audio: A } = await import('expo-av');
+        await A.setAudioModeAsync({ allowsRecordingIOS: false, staysActiveInBackground: false });
+      } catch {}
+    })();
+    return true;
+  } catch (e: any) {
+    onError?.(String(e?.message ?? e));
+    return false;
+  }
+}
+
+export function stopChunkedAudio(): void {
+  chunkActive = false;
 }

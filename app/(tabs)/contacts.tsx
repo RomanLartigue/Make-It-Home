@@ -20,6 +20,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 
 import { toE164 } from '@/utils/phoneNumber';
 import { syncCircle } from '@/utils/serverUrl';
+import { hTap, hSuccess } from '@/utils/haptics';
 import { confirmDestructive } from '@/utils/confirm';
 import { Beacon, AVATAR_COLORS, initials } from '@/constants/beacon';
 import { PillButton } from '@/components/beacon/kit';
@@ -85,6 +86,7 @@ export default function CircleScreen() {
   const closeSheet = () => setMode('closed');
 
   const openAdd = () => {
+    hTap();
     setEditId(null);
     setName('');
     setPhone('');
@@ -93,6 +95,7 @@ export default function CircleScreen() {
   };
 
   const openActions = (c: SafetyContact) => {
+    hTap();
     setActionFor(c);
     setMode('action');
   };
@@ -125,6 +128,7 @@ export default function CircleScreen() {
     } else {
       setCircle(prev => [...prev, { id: String(Date.now()), name: n, phone: e164 }]);
     }
+    hSuccess();
     closeSheet();
   };
 
@@ -145,19 +149,27 @@ export default function CircleScreen() {
   // Opens the OS's native contact picker (like other apps). No custom list and
   // no full contacts-permission prompt needed — the user picks one contact.
   const pickFromContacts = async () => {
+    hTap();
     try {
       const contact = await Contacts.presentContactPickerAsync();
       if (!contact) return; // cancelled
+      // iOS often returns firstName/lastName without a composed `name` field —
+      // build one ourselves so the picked person isn't labeled "Unknown".
+      const pickedName =
+        contact.name ||
+        [contact.firstName, contact.middleName, contact.lastName].filter(Boolean).join(' ') ||
+        contact.company ||
+        '';
       const raw = contact.phoneNumbers?.[0]?.number ?? '';
       const e164 = toE164(raw);
       if (!e164) {
         Alert.alert(
           'No usable number',
-          `${contact.name ?? 'That contact'} doesn't have a number we can use — pick another, or type it in above.`,
+          `${pickedName || 'That contact'} doesn't have a number we can use — pick another, or type it in above.`,
         );
         return;
       }
-      setName(contact.name ?? 'Unknown');
+      setName(pickedName);
       setPhone(e164);
     } catch {
       Alert.alert('Couldn’t open contacts', 'Try again, or just type the number in above.');
@@ -280,7 +292,7 @@ export default function CircleScreen() {
                     {!editId && (
                       <Pressable
                         style={styles.consentRow}
-                        onPress={() => setSmsConsent(v => !v)}
+                        onPress={() => { hTap(); setSmsConsent(v => !v); }}
                         accessibilityRole="checkbox"
                         accessibilityState={{ checked: smsConsent }}>
                         <View style={[styles.checkbox, smsConsent && styles.checkboxOn]}>

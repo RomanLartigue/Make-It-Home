@@ -12,6 +12,24 @@
 import { AppRegistry, Alert } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
+// Minimal, dependency-free DOMException shim. Hermes has no DOMException global,
+// and livekit-client references it at module-eval — if it evaluates before
+// @livekit/react-native's own polyfill runs, the app crashes at launch with
+// "Property 'DOMException' doesn't exist". Defining a basic version here (before
+// any app module loads) makes that impossible, and pulls in NO native code, so
+// it's safe in Expo Go too. The real SDK's richer polyfill still overrides it.
+try {
+  if (typeof global.DOMException === 'undefined') {
+    global.DOMException = class DOMException extends Error {
+      constructor(message, name) {
+        super(message);
+        this.name = name || 'Error';
+        this.code = 0;
+      }
+    };
+  }
+} catch (e) {}
+
 const LAST_ERROR_KEY = '@makeithome_last_startup_error';
 
 function describe(error) {

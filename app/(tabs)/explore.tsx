@@ -9,7 +9,7 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect, useRouter } from 'expo-router';
-import * as Haptics from 'expo-haptics';
+import { hSuccess } from '@/utils/haptics';
 import * as Location from 'expo-location';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
@@ -39,7 +39,7 @@ export default function SettingsScreen() {
   const handleSave = async () => {
     await setUserName(name);
     setSaved(true);
-    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    hSuccess();
     setTimeout(() => setSaved(false), 1600);
   };
 

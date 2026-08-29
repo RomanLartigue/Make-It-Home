@@ -12,6 +12,7 @@ import { getServerUrl, fetchWithAuth } from '@/utils/serverUrl';
 
 interface HistoryItem {
   id: string;
+  kind?: 'video' | 'audio';
   sessionId: string | null;
   createdAt: number;
   expiresAt: number;
@@ -33,6 +34,11 @@ function fmtSize(b: number | null) {
 }
 function daysLeft(expiresAt: number) {
   return Math.max(0, Math.ceil((expiresAt - Date.now()) / 86400000));
+}
+function fmtDur(sec: number | null) {
+  if (!sec) return '';
+  if (sec < 90) return `${sec}s`;
+  return `${Math.round(sec / 60)} min`;
 }
 
 export default function HistoryScreen() {
@@ -90,6 +96,32 @@ export default function HistoryScreen() {
     ]);
   };
 
+  const removeAll = () => {
+    const n = items?.length ?? 0;
+    if (!n) return;
+    Alert.alert(
+      'Delete ALL recordings?',
+      `This permanently removes all ${n} recording${n === 1 ? '' : 's'} from your cloud history. Copies already in your camera roll or Files stay on your phone.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete all',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              const serverUrl = await getServerUrl();
+              const res = await fetchWithAuth(`${serverUrl}/history/clear`, { method: 'POST' });
+              if (res.ok) setItems([]);
+              else Alert.alert('Couldn’t delete', 'Please try again.');
+            } catch {
+              Alert.alert('Couldn’t delete', 'Please try again.');
+            }
+          },
+        },
+      ],
+    );
+  };
+
   return (
     <SafeAreaView style={styles.root} edges={['top']}>
       <View style={{ paddingHorizontal: 20 }}>
@@ -110,7 +142,15 @@ export default function HistoryScreen() {
         >
           <View style={styles.secRow}>
             <Text style={styles.secLabel}>Kept for 90 days</Text>
-            <GoldBadge />
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+              {(items?.length ?? 0) > 0 && (
+                <Pressable style={styles.clearBtn} onPress={removeAll} hitSlop={6}>
+                  <Ionicons name="trash-outline" size={13} color="#f87171" />
+                  <Text style={styles.clearBtnText}>Delete all</Text>
+                </Pressable>
+              )}
+              <GoldBadge />
+            </View>
           </View>
 
           {items === null ? (
@@ -130,12 +170,18 @@ export default function HistoryScreen() {
               <View key={item.id} style={styles.card}>
                 <View style={styles.cardHead}>
                   <View style={styles.thumb}>
-                    <Ionicons name="videocam" size={18} color={Beacon.beacon} />
+                    {/* Audio-only stretches (recorded while the app was in the
+                        background) get a mic; video segments keep the camera. */}
+                    <Ionicons
+                      name={item.kind === 'audio' ? 'mic' : 'videocam'}
+                      size={18}
+                      color={Beacon.beacon}
+                    />
                   </View>
                   <View style={{ flex: 1 }}>
                     <Text style={styles.cardTitle}>{fmtDate(item.createdAt)}</Text>
                     <Text style={styles.cardMeta}>
-                      {item.durationSec ? `${Math.round(item.durationSec / 60)} min · ` : ''}
+                      {fmtDur(item.durationSec) ? `${fmtDur(item.durationSec)} · ` : ''}
                       {fmtSize(item.sizeBytes)}{fmtSize(item.sizeBytes) ? ' · ' : ''}
                       {daysLeft(item.expiresAt)}d left
                     </Text>
@@ -181,6 +227,17 @@ const styles = StyleSheet.create({
   body: { paddingHorizontal: 20, paddingBottom: 44, paddingTop: 6 },
   secRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 },
   secLabel: { fontSize: 10.5, fontWeight: '700', letterSpacing: 1, textTransform: 'uppercase', color: Beacon.faint },
+  clearBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    borderWidth: 1,
+    borderColor: 'rgba(248,113,113,0.4)',
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+  },
+  clearBtnText: { color: '#f87171', fontSize: 11.5, fontWeight: '700' },
   center: { paddingVertical: 40, alignItems: 'center' },
   emptyCard: {
     backgroundColor: Beacon.surface,

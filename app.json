@@ -22,6 +22,8 @@
         "NSMicrophoneUsageDescription": "Make It Home records audio during safety sessions so your safety circle receives a video of your surroundings.",
         "NSContactsUsageDescription": "Make It Home uses your contacts so you can add trusted people to your safety circle.",
         "ITSAppUsesNonExemptEncryption": false,
+        "UIFileSharingEnabled": true,
+        "LSSupportsOpeningDocumentsInPlace": true,
         "UIBackgroundModes": [
           "audio",
           "location"
@@ -87,7 +89,8 @@
         }
       ],
       "expo-font",
-      "expo-web-browser"
+      "expo-web-browser",
+      "@config-plugins/react-native-webrtc"
     ],
     "extra": {
       "router": {},

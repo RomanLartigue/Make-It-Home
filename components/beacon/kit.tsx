@@ -15,6 +15,12 @@ import {
   TextStyle,
 } from 'react-native';
 import { Beacon, RADIUS } from '@/constants/beacon';
+import { hTap } from '@/utils/haptics';
+
+// Wrap an onPress so every shared control gives the same firm tap. Safe when the
+// handler is undefined (non-interactive row).
+const withTap = (fn?: () => void) =>
+  fn ? () => { hTap(); fn(); } : undefined;
 
 /** Rounded surface card. */
 export function Card({
@@ -84,7 +90,7 @@ export function SRow({
   );
   if (onPress) {
     return (
-      <Pressable onPress={onPress} style={({ pressed }) => (pressed ? { opacity: 0.6 } : null)}>
+      <Pressable onPress={withTap(onPress)} style={({ pressed }) => (pressed ? { opacity: 0.6 } : null)}>
         {body}
       </Pressable>
     );
@@ -104,7 +110,7 @@ export function Toggle({ value, onToggle }: { value: boolean; onToggle?: () => v
     outputRange: [Beacon.line, Beacon.safe],
   });
   return (
-    <Pressable onPress={onToggle} hitSlop={8}>
+    <Pressable onPress={withTap(onToggle)} hitSlop={8}>
       <Animated.View style={[styles.tgl, { backgroundColor: bg }]}>
         <Animated.View style={[styles.tglKnob, { left }]} />
       </Animated.View>
@@ -134,7 +140,7 @@ export function PillButton({
   const color = '#fff';
   return (
     <Pressable
-      onPress={onPress}
+      onPress={withTap(onPress)}
       disabled={disabled}
       style={({ pressed }) => [
         styles.pill,
@@ -154,7 +160,7 @@ export function DetailHeader({ title, onBack }: { title: string; onBack?: () => 
   return (
     <View style={styles.detailHead}>
       {onBack && (
-        <Pressable onPress={onBack} style={styles.backBtn} hitSlop={8}>
+        <Pressable onPress={withTap(onBack)} style={styles.backBtn} hitSlop={8}>
           <Text style={styles.backChevron}>‹</Text>
         </Pressable>
       )}

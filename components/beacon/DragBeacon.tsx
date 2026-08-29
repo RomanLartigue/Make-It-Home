@@ -1,15 +1,14 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { View, Text, StyleSheet, Animated, Easing, Platform } from 'react-native';
+import { View, Text, StyleSheet, Animated, Easing } from 'react-native';
 import { GestureDetector, Gesture } from 'react-native-gesture-handler';
 import Ionicons from '@expo/vector-icons/Ionicons';
-import * as Haptics from 'expo-haptics';
 
 import { Beacon } from '@/constants/beacon';
+import { hArm, hTick, hConfirm } from '@/utils/haptics';
 
 const SIZE = 150;
 const MAX_DRAG = 78;
 const ARM_THRESHOLD = 46; // drag out this far to arm; release to confirm
-const IS_WEB = Platform.OS === 'web';
 
 /**
  * A hold-and-drag "joystick" beacon, matching the Home go-live control. Hold it,
@@ -44,6 +43,15 @@ export function DragBeacon({
   const [ready, setReady] = useState(false);
   const readyRef = useRef(false);
 
+  // The gesture is created ONCE (useRef below), so calling the onConfirm prop
+  // directly from it would freeze the first render's closure — where async
+  // state (like a contact list still loading) is empty, silently no-opping.
+  // Route through a ref that always holds the latest handler.
+  const onConfirmRef = useRef(onConfirm);
+  useEffect(() => {
+    onConfirmRef.current = onConfirm;
+  });
+
   // Idle breathing pulse (JS driver — the transform also carries xy, which must
   // be JS-driven; mixing drivers on one view throws).
   useEffect(() => {
@@ -70,7 +78,7 @@ export function DragBeacon({
         setArmed(true);
         readyRef.current = false;
         setReady(false);
-        if (!IS_WEB) Haptics.selectionAsync();
+        hTick();
       })
       .onUpdate(e => {
         const dx = e.translationX;
@@ -82,11 +90,14 @@ export function DragBeacon({
         if (nowReady !== readyRef.current) {
           readyRef.current = nowReady;
           setReady(nowReady);
-          if (!IS_WEB) Haptics.selectionAsync();
+          hArm(); // sharp tick when you cross into "release to send"
         }
       })
       .onEnd(() => {
-        if (readyRef.current) onConfirm();
+        if (readyRef.current) {
+          hConfirm(); // firm double-thump on commit
+          onConfirmRef.current();
+        }
       })
       .onFinalize(() => {
         setArmed(false);

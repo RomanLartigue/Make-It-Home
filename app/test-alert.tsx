@@ -4,6 +4,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
 import Ionicons from '@expo/vector-icons/Ionicons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { hSuccess, hError } from '@/utils/haptics';
 
 import { Beacon, RADIUS } from '@/constants/beacon';
 import { DetailHeader } from '@/components/beacon/kit';
@@ -41,11 +42,14 @@ export default function TestAlertScreen() {
       if (res.ok) {
         setResult(await res.json().catch(() => ({ sent: phones.length, failed: 0 })));
         setStatus('sent');
+        hSuccess();
       } else {
         setStatus('error');
+        hError();
       }
     } catch {
       setStatus('error');
+      hError();
     }
   };
 

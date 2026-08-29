@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, Suspense } from 'react';
 import {
   View,
   Text,
@@ -6,15 +6,27 @@ import {
   StyleSheet,
   Animated,
   Alert,
+  AppState,
   Easing,
   Platform,
   Linking,
+  ActivityIndicator,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import Constants from 'expo-constants';
+
+// Real-time broadcast screen is lazy-loaded: it pulls in react-native-webrtc,
+// which has no JS-only fallback — importing it eagerly would crash Expo Go and
+// the web build. Only loaded when a Gold LiveKit session actually starts.
+const LiveKitPublisher = React.lazy(() =>
+  import('@/components/beacon/LiveKitPublisher').then(m => ({ default: m.LiveKitPublisher })),
+);
+// Expo Go can't run the native WebRTC module, so LiveKit mode is disabled there.
+const IS_EXPO_GO = Constants.appOwnership === 'expo';
 import { GestureDetector, Gesture } from 'react-native-gesture-handler';
 import { useRouter, useFocusEffect } from 'expo-router';
 import Ionicons from '@expo/vector-icons/Ionicons';
-import * as Haptics from 'expo-haptics';
+import { hTick, hArm, hConfirm, hWarning, hSuccess, hTap } from '@/utils/haptics';
 import { CameraView, Camera } from 'expo-camera';
 import * as Location from 'expo-location';
 import * as MediaLibrary from 'expo-media-library';
@@ -25,9 +37,11 @@ import { getServerUrl, getUserName, fetchWithAuth, randomId, syncCircle } from '
 import { Beacon } from '@/constants/beacon';
 import { PillButton } from '@/components/beacon/kit';
 import { ESCALATION_SCHEDULE_KEY, DEFAULT_SCHEDULE, normalizeSchedule } from '@/constants/escalation';
+import * as FileSystem from 'expo-file-system/legacy';
+
 import { startBackgroundLocation, stopBackgroundLocation } from '@/tasks/backgroundLocation';
 import { isGold, useGold } from '@/utils/gold';
-import { startBackgroundAudio, stopBackgroundAudio } from '@/utils/backgroundAudio';
+import { startChunkedAudio, stopChunkedAudio } from '@/utils/backgroundAudio';
 
 // Shown when a permission isn't granted. If it was previously blocked, the OS
 // won't show its own dialog again (canAskAgain === false) — so offer a route to
@@ -52,6 +66,10 @@ const SAFETY_CIRCLE_KEY = '@makeithome_safety_circle';
 const CHECKIN_KEY = '@makeithome_checkin';
 const CHECKIN_NOTIF_KEY = '@makeithome_checkin_notif';
 const ACTIVE_SESSION_KEY = '@makeithome_active_session';
+// Recordings captured during a live session but not yet uploaded. Held here (and
+// mirrored to disk) so nothing uploads until the session actually ends — and so a
+// force-quit / dead battery mid-session still uploads on the next app launch.
+const PENDING_MEDIA_KEY = '@makeithome_pending_media';
 
 // Beacon swipe directions -> check-in duration. Matches the prototype's
 // 15 / 30 / 45 / 60-minute radial options.
@@ -109,9 +127,12 @@ async function getSafetyCirclePhones(): Promise<string[]> {
 }
 
 // Build the escalation rounds for a go-live: the whole circle is alerted now
-// (round 0), then re-texted after each scheduled wait until someone acknowledges.
+// (round 0), then re-texted after each scheduled wait until the USER marks safe.
 // Every round targets the SAME whole circle. Returns null when the circle is empty.
-async function getEscalationTiers(): Promise<
+//
+// Free schedule = thirds of the slide time (4 alerts total): slide 30 min →
+// alerts at 0 / 10 / 20 / 30. Gold keeps full custom control of the schedule.
+async function getEscalationTiers(slideSeconds: number): Promise<
   { name: string; waitMinutes: number; phones: string[] }[] | null
 > {
   const [rawCircle, rawSchedule] = await Promise.all([
@@ -121,12 +142,14 @@ async function getEscalationTiers(): Promise<
   const circle: any[] = rawCircle ? JSON.parse(rawCircle) : [];
   const phones = circle.map(c => c.phone).filter(Boolean);
   if (!phones.length) return null;
-  // Custom timing is a Gold feature: free users always run the fixed default
-  // schedule, even if a custom one is on disk (e.g. Gold lapsed).
   const gold = await isGold();
-  const schedule = gold
-    ? normalizeSchedule(rawSchedule ? JSON.parse(rawSchedule) : DEFAULT_SCHEDULE)
-    : DEFAULT_SCHEDULE;
+  let schedule: number[];
+  if (gold) {
+    schedule = normalizeSchedule(rawSchedule ? JSON.parse(rawSchedule) : DEFAULT_SCHEDULE);
+  } else {
+    const third = Math.max(1, Math.round(slideSeconds / 180)); // ⅓ of the slide, in minutes
+    schedule = [third, third, third];
+  }
   const rounds = [{ name: 'Alert', waitMinutes: 0, phones }];
   schedule.forEach((wait, i) => {
     rounds.push({ name: `Reminder ${i + 1}`, waitMinutes: wait, phones });
@@ -150,11 +173,27 @@ export default function HomeScreen() {
 
   // Session (go-live) state
   const [showCamera, setShowCamera] = useState(false);
+  // Which go-live surface to show. 'deciding' = we're still choosing LiveKit vs
+  // camera (must NOT mount the camera yet, or its recording path fires by
+  // mistake); 'livekit' = real-time stream; 'camera' = snapshot/segment fallback.
+  const [liveMode, setLiveMode] = useState<'deciding' | 'livekit' | 'camera'>('deciding');
+  // The slide time ran out without an "I'm safe" — the session KEEPS going and
+  // both sides cycle: the server re-alerts the circle every 5 min, the app
+  // re-asks the user "Are you safe?" every 5 min. Only "I'm safe" stops it.
+  const [overdue, setOverdue] = useState(false);
+  // Someone on the live page tapped "I'm on my way" (informational only — it
+  // never stops the alerts; only the user can).
+  const [ackByCircle, setAckByCircle] = useState(false);
+  // Set when the session runs as a LiveKit live stream. Holds the connection
+  // info for the publisher screen.
+  const [liveKit, setLiveKit] = useState<{ url: string; token: string } | null>(null);
+  const liveKitModeRef = useRef(false);
   const [isRecording, setIsRecording] = useState(false);
+  const [cameraPaused, setCameraPaused] = useState(false); // app backgrounded: camera off, audio+GPS on
   const [elapsed, setElapsed] = useState(0);
   const [coords, setCoords] = useState<Location.LocationObjectCoords | null>(null);
   const [notifyStatus, setNotifyStatus] = useState<
-    'idle' | 'notified' | 'saved' | 'uploading' | 'uploaded' | 'error'
+    'idle' | 'notified' | 'saved' | 'uploading' | 'uploaded' | 'error' | 'reconnecting' | 'resumed'
   >('idle');
 
   const cameraRef = useRef<CameraView>(null);
@@ -167,6 +206,21 @@ export default function HomeScreen() {
   const goLiveFallbackRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const recordEndTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastAudioUriRef = useRef<string | null>(null); // background audio from the last session
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null); // session/start retry
+  const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null); // mid-session server watchdog
+  const lastServerOkRef = useRef(0); // last time the server answered us during a session
+  const recreatedRef = useRef(false); // whether this session was re-created after the server lost it
+  const coordsRef = useRef<{ latitude: number; longitude: number } | null>(null); // latest fix, for the heartbeat
+  // Recordings held for upload-at-end (video segments + background-audio stretches).
+  const pendingMediaRef = useRef<{ uri: string; kind: 'video' | 'audio'; lat: number | null; lng: number | null; dur?: number }[]>([]);
+  const loopDoneRef = useRef<Promise<void> | null>(null); // resolves when the segment loop exits
+  const finishingRef = useRef(false); // guards finishSession against double-run (timer + manual)
+  const frameTimerRef = useRef<ReturnType<typeof setInterval> | null>(null); // live-frame loop
+  const cycleIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null); // 5-min "Are you safe?" cycle
+  const ackSeenRef = useRef(false); // already surfaced "someone is on their way"
+  const frameBusyRef = useRef(false); // skip a tick if the previous capture/upload is still going
+  const frameErrTracedRef = useRef(false); // trace the first capture error only (not one per tick)
+  const recordStartedAtRef = useRef(0); // when the current recordAsync began (frames wait for stability)
 
   // Check-in state
   const [checkInActive, setCheckInActive] = useState(false);
@@ -203,6 +257,77 @@ export default function HomeScreen() {
       };
     }, []),
   );
+
+  // Mirror the latest fix into a ref so the heartbeat interval (created once
+  // per session) always reads fresh coordinates, not a stale closure.
+  useEffect(() => {
+    coordsRef.current = coords ? { latitude: coords.latitude, longitude: coords.longitude } : null;
+  }, [coords]);
+
+  // Breadcrumbs to the server log for the background lifecycle — the ONLY way to
+  // see what actually happens on a phone once the app leaves the foreground.
+  const trace = (message: string) => {
+    getServerUrl()
+      .then(serverUrl =>
+        fetchWithAuth(`${serverUrl}/clientlog`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            phase: 'session-trace',
+            name: sessionIdRef.current || 'no-session',
+            message,
+          }),
+        }),
+      )
+      .catch(() => {});
+  };
+
+  // Background/foreground breadcrumbs during a session. The chunked audio
+  // recorder runs continuously from go-live (its always-active recording is
+  // what keeps iOS from suspending the app in the background), so nothing
+  // needs starting here anymore.
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', s => {
+      if (!sessionIdRef.current || IS_WEB) return;
+      if (s === 'background') trace('bg-enter');
+      else if (s === 'active') trace('fg-return');
+    });
+    return () => sub.remove();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Resume-on-launch: if a previous session was force-quit or the phone died
+  // mid-recording, its captured video/audio was held on disk but never uploaded.
+  // Flush it now (and end the orphaned server session so escalations stop).
+  useEffect(() => {
+    (async () => {
+      const raw = await AsyncStorage.getItem(PENDING_MEDIA_KEY).catch(() => null);
+      if (!raw) return;
+      let parsed: { sessionId: string | null; items: any[] } | null = null;
+      try { parsed = JSON.parse(raw); } catch { parsed = null; }
+      if (!parsed || !Array.isArray(parsed.items) || parsed.items.length === 0) {
+        AsyncStorage.removeItem(PENDING_MEDIA_KEY).catch(() => {});
+        return;
+      }
+      // Reaching this line means the app was KILLED mid-session (force-quit,
+      // battery, or iOS terminated it in the background) — a normal End clears
+      // the queue before the app ever closes.
+      trace(`relaunch-flush: ${parsed.items.length} item(s) from ${parsed.sessionId}`);
+      pendingMediaRef.current = parsed.items;
+      await flushPending(parsed.sessionId);
+      // End the session that was left open when the app died.
+      if (parsed.sessionId) {
+        const serverUrl = await getServerUrl();
+        fetchWithAuth(`${serverUrl}/session/end`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sessionId: parsed.sessionId }),
+        }).catch(() => {});
+      }
+      AsyncStorage.removeItem(ACTIVE_SESSION_KEY).catch(() => {});
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Idle beacon pulse
   useEffect(() => {
@@ -299,7 +424,7 @@ export default function HomeScreen() {
   }, []);
 
   // ── Backend calls (identical behavior to the original SafetyScreen) ────────
-  const startSession = async (loc: Location.LocationObjectCoords | null) => {
+  const startSession = async (loc: Location.LocationObjectCoords | null, livekit = false) => {
     const phones = await getSafetyCirclePhones();
     if (phones.length === 0) {
       Alert.alert('No safety circle', 'Add contacts to your Safety Circle so they can be notified.');
@@ -312,31 +437,71 @@ export default function HomeScreen() {
     const [serverUrl, name, tiers] = await Promise.all([
       getServerUrl(),
       getUserName(),
-      getEscalationTiers(),
+      getEscalationTiers(recordDurationSecRef.current),
     ]);
     const sessionId = sessionIdRef.current;
     lastLocationUpdateRef.current = Date.now();
-    try {
-      const res = await fetchWithAuth(`${serverUrl}/session/start`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sessionId,
-          phones,
-          // Staged escalation: first tier is alerted now, later tiers climb if
-          // no one responds. Null → server alerts the whole circle at once.
-          tiers,
-          name,
-          // May be null when we alert before a GPS fix — the live page shows
-          // "Location pending…" and updates as fixes arrive.
-          latitude: loc?.latitude ?? null,
-          longitude: loc?.longitude ?? null,
-        }),
-      });
-      setNotifyStatus(res.ok ? 'notified' : 'error');
-    } catch {
-      setNotifyStatus('error');
-    }
+    const body = JSON.stringify({
+      sessionId,
+      phones,
+      // Staged escalation: first tier is alerted now, later tiers climb if no one
+      // responds. Null → server alerts the whole circle at once.
+      tiers,
+      name,
+      // May be null when we alert before a GPS fix — the live page shows
+      // "Location pending…" and updates as fixes arrive.
+      latitude: loc?.latitude ?? null,
+      longitude: loc?.longitude ?? null,
+      // Tells the server (and the responder page) this is a real-time stream.
+      livekit,
+    });
+
+    // Keep trying to reach the server until the alert lands or the session ends —
+    // a dropped connection must reconnect, not silently give up. Backoff caps at 20s.
+    const attempt = async () => {
+      try {
+        const res = await fetchWithAuth(`${serverUrl}/session/start`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body,
+        });
+        if (res.ok) return 'ok';
+        // 4xx = the server REFUSED the alert (rate cap, bad circle…). Retrying
+        // the same request can never succeed — surface it LOUDLY instead. A
+        // silently-failing panic alert is the worst possible failure mode.
+        if (res.status >= 400 && res.status < 500) {
+          const msg = (await res.json().catch(() => null))?.error;
+          trace(`session-start-REFUSED (${res.status}): ${msg || ''}`);
+          Alert.alert(
+            '⚠️ Your circle was NOT alerted',
+            `${msg || `The server refused the alert (HTTP ${res.status}).`}\n\nNo texts were sent. Fix the issue and go live again.`,
+          );
+          return 'refused';
+        }
+        return 'retry';
+      } catch {
+        return 'retry'; // network drop — retry with backoff
+      }
+    };
+    let delay = 3000;
+    const loop = async () => {
+      if (sessionIdRef.current !== sessionId) return; // session ended — stop retrying
+      const outcome = await attempt();
+      if (sessionIdRef.current !== sessionId) return;
+      if (outcome === 'ok') {
+        setNotifyStatus('notified');
+        return;
+      }
+      if (outcome === 'refused') {
+        setNotifyStatus('error');
+        return; // do NOT retry — the user has been told
+      }
+      setNotifyStatus('reconnecting');
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = setTimeout(loop, delay);
+      delay = Math.min(Math.round(delay * 1.6), 20000);
+    };
+    await loop();
   };
 
   const updateLocation = (loc: Location.LocationObjectCoords) => {
@@ -350,41 +515,226 @@ export default function HomeScreen() {
           latitude: loc.latitude,
           longitude: loc.longitude,
         }),
-      }).catch(() => {});
+      })
+        .then(res => {
+          if (res.ok) {
+            lastServerOkRef.current = Date.now();
+            setNotifyStatus(s => (s === 'reconnecting' ? 'notified' : s));
+          }
+        })
+        .catch(() => {});
     });
   };
 
-  const uploadRecording = async (videoUri: string, sessionId?: string | null) => {
+  // Mid-session watchdog. The location watcher only POSTs when the phone MOVES
+  // (distanceInterval) — so a dropped connection, or simply standing still,
+  // would leave the responders' live page stale while the app still claims
+  // "tracking live". Every 15s this pings /session/update with the latest fix:
+  // failures flip the status to "reconnecting" and keep trying forever; success
+  // flips it back. If the server LOST the session (restart), it is re-created
+  // once — a repeat alert text beats a dead live link mid-emergency.
+  // Live view for responders: every ~3s, capture a REAL still from the camera
+  // (view/screen snapshots of a camera preview come back black on iOS — only
+  // the camera itself has the pixels). expo-camera keeps its photo output
+  // attached alongside the movie output in video mode, so stills during
+  // recording are natively supported — and iOS keeps them silent while video
+  // records. The one hazard is capturing while the movie output is still being
+  // attached (what aborted recordings long ago), so frames wait until the
+  // current recordAsync has been running for a few seconds.
+  const FRAME_MS = 1500;
+  const startFrameLoop = (sessionId: string) => {
+    if (frameTimerRef.current) clearInterval(frameTimerRef.current);
+    frameErrTracedRef.current = false;
+    frameTimerRef.current = setInterval(async () => {
+      if (sessionIdRef.current !== sessionId) return;
+      if (!isRecordingRef.current || AppState.currentState !== 'active') return;
+      if (Date.now() - recordStartedAtRef.current < 4000) return; // let recording stabilize
+      if (frameBusyRef.current) return;
+      frameBusyRef.current = true;
+      try {
+        const pic = await cameraRef.current?.takePictureAsync({
+          quality: 0.2,
+          base64: true,
+          shutterSound: false,
+        });
+        if (!pic?.base64 || sessionIdRef.current !== sessionId) return;
+        const serverUrl = await getServerUrl();
+        await fetchWithAuth(`${serverUrl}/frame/${sessionId}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain' },
+          body: pic.base64,
+        });
+      } catch (e: any) {
+        // best-effort — but surface the FIRST failure to the server log so a
+        // black live view is diagnosable instead of a mystery.
+        if (!frameErrTracedRef.current) {
+          frameErrTracedRef.current = true;
+          trace(`frame-capture-error: ${String(e?.message ?? e)}`);
+        }
+      } finally {
+        frameBusyRef.current = false;
+      }
+    }, FRAME_MS);
+  };
+
+  const HEARTBEAT_MS = 15_000;
+  const startHeartbeat = (sessionId: string) => {
+    lastServerOkRef.current = Date.now();
+    recreatedRef.current = false;
+    if (heartbeatRef.current) clearInterval(heartbeatRef.current);
+    heartbeatRef.current = setInterval(async () => {
+      if (sessionIdRef.current !== sessionId) return;
+      try {
+        const serverUrl = await getServerUrl();
+        const at = coordsRef.current;
+        const res = await fetchWithAuth(`${serverUrl}/session/update`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sessionId,
+            latitude: at?.latitude ?? null,
+            longitude: at?.longitude ?? null,
+          }),
+        });
+        if (sessionIdRef.current !== sessionId) return;
+        if (res.ok) {
+          lastServerOkRef.current = Date.now();
+          setNotifyStatus(s => (s === 'reconnecting' ? 'notified' : s));
+          // Surface "someone is on their way" to the USER too (once). It's
+          // informational only — alerts keep going until the user is safe.
+          const j = await res.json().catch(() => null);
+          if (j?.acknowledged && !ackSeenRef.current) {
+            ackSeenRef.current = true;
+            setAckByCircle(true);
+            hSuccess();
+            Notifications.scheduleNotificationAsync({
+              content: {
+                title: '🟢 Help is on the way',
+                body: 'Someone from your safety circle is coming to you.',
+                sound: true,
+              },
+              trigger: null,
+            }).catch(() => {});
+          }
+          return;
+        }
+        if (res.status === 404 && !recreatedRef.current) {
+          recreatedRef.current = true;
+          startSession(coordsRef.current as any);
+          return;
+        }
+      } catch {
+        // unreachable — handled by the staleness check below
+      }
+      if (Date.now() - lastServerOkRef.current > HEARTBEAT_MS + 5000) {
+        setNotifyStatus(s => (s === 'notified' || s === 'reconnecting' ? 'reconnecting' : s));
+      }
+    }, HEARTBEAT_MS);
+  };
+
+  const uploadRecording = async (
+    videoUri: string,
+    sessionId?: string | null,
+    at?: { latitude: number; longitude: number } | null,
+    // historyOnly: store on the server (+ Gold history) but don't text the
+    // circle — used for mid-session segments so re-records don't spam texts.
+    // durationSec: the segment's ACTUAL recorded length for the history label.
+    opts?: { historyOnly?: boolean; durationSec?: number },
+  ) => {
+    const historyOnly = !!opts?.historyOnly;
     const phones = await getSafetyCirclePhones();
-    if (phones.length === 0) return;
-    await syncCircle(phones); // guarantee the server has this circle under the current token
+    if (!historyOnly) {
+      if (phones.length === 0) return;
+      await syncCircle(phones); // guarantee the server has this circle under the current token
+    }
     setNotifyStatus('uploading');
     const serverUrl = await getServerUrl();
-    const formData = new FormData();
-    formData.append('video', { uri: videoUri, type: 'video/mp4', name: 'recording.mp4' } as any);
-    formData.append('phones', JSON.stringify(phones));
-    // Tie the recording to its session so the responder's live page can offer a
-    // "Download recording" link once it lands.
-    if (sessionId) formData.append('sessionId', sessionId);
-    // Gold: keep this recording in cloud history (90 days) with a bit of context.
     const gold = await isGold();
-    if (gold) {
-      if (coords) {
-        formData.append('latitude', String(coords.latitude));
-        formData.append('longitude', String(coords.longitude));
+    const qs = [gold ? 'gold=1' : '', historyOnly ? 'historyOnly=1' : ''].filter(Boolean).join('&');
+    // A FormData can't be replayed across fetches, so rebuild it for each attempt.
+    const buildForm = () => {
+      const fd = new FormData();
+      // iOS records QuickTime (.mov) — declare what the file actually is, since
+      // the native uploader sends the real type either way.
+      const isMov = /\.mov$/i.test(videoUri);
+      fd.append('video', {
+        uri: videoUri,
+        type: isMov ? 'video/quicktime' : 'video/mp4',
+        name: isMov ? 'recording.mov' : 'recording.mp4',
+      } as any);
+      fd.append('phones', JSON.stringify(phones));
+      if (sessionId) fd.append('sessionId', sessionId);
+      if (gold) {
+        if (at) {
+          fd.append('latitude', String(at.latitude));
+          fd.append('longitude', String(at.longitude));
+        }
+        if (opts?.durationSec != null) fd.append('durationSec', String(opts.durationSec));
       }
-      formData.append('durationSec', String(recordDurationSecRef.current));
+      return fd;
+    };
+    // Retry with backoff so a dropped connection doesn't lose the recording.
+    let delay = 4000;
+    for (let attempt = 0; attempt < 6; attempt++) {
+      try {
+        const res = await fetchWithAuth(`${serverUrl}/upload${qs ? `?${qs}` : ''}`, {
+          method: 'POST',
+          body: buildForm(),
+        });
+        if (res.ok) {
+          setNotifyStatus('uploaded');
+          return;
+        }
+        // 4xx = the server refused this file (too large, wrong type…) —
+        // retrying the same bytes can't succeed, so surface the reason instead.
+        if (res.status >= 400 && res.status < 500) {
+          const msg = (await res.json().catch(() => null))?.error;
+          setNotifyStatus('error');
+          Alert.alert(
+            'Recording upload failed',
+            `${msg || `The server rejected the recording (HTTP ${res.status}).`}\n\nIt's still saved in your camera roll.`,
+          );
+          return;
+        }
+      } catch {
+        // network drop — retry below
+      }
+      await new Promise(r => setTimeout(r, delay));
+      delay = Math.min(Math.round(delay * 1.6), 30000);
     }
-    try {
-      const res = await fetchWithAuth(`${serverUrl}/upload${gold ? '?gold=1' : ''}`, { method: 'POST', body: formData });
-      if (res.ok) setNotifyStatus('uploaded');
-      else {
-        console.error('Upload error:', await res.json().catch(() => ({})));
-        setNotifyStatus('error');
+    setNotifyStatus('error');
+  };
+
+  // Fallback evidence: when a session captured NO video (e.g. the phone was
+  // locked so iOS stopped the camera), push the background audio to Gold cloud
+  // history so there's still a record. History-only — never MMS'd to the circle.
+  const uploadAudioToHistory = async (
+    audioUri: string,
+    sessionId?: string | null,
+    at?: { latitude: number; longitude: number } | null,
+  ) => {
+    const serverUrl = await getServerUrl();
+    let delay = 4000;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const fd = new FormData();
+        fd.append('video', { uri: audioUri, type: 'audio/m4a', name: 'session-audio.m4a' } as any);
+        if (sessionId) fd.append('sessionId', sessionId);
+        if (at) {
+          fd.append('latitude', String(at.latitude));
+          fd.append('longitude', String(at.longitude));
+        }
+        const res = await fetchWithAuth(`${serverUrl}/upload?gold=1&historyOnly=1`, {
+          method: 'POST',
+          body: fd,
+        });
+        if (res.ok) return;
+        if (res.status >= 400 && res.status < 500) return; // refused — retrying can't help
+      } catch {
+        // retry below
       }
-    } catch (err) {
-      console.error('Upload fetch failed:', err);
-      setNotifyStatus('error');
+      await new Promise(r => setTimeout(r, delay));
+      delay = Math.min(Math.round(delay * 1.6), 30000);
     }
   };
 
@@ -435,7 +785,7 @@ export default function HomeScreen() {
       if (notifId) await AsyncStorage.setItem(CHECKIN_NOTIF_KEY, notifId);
       setCheckInRemaining(durationSeconds);
       setCheckInActive(true);
-      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+      hConfirm();
       // Read the expiry from the ref (not the captured `expiresAt`) so "+15 min"
       // — which updates checkInExpiresAt.current — is reflected in the countdown.
       checkInIntervalRef.current = setInterval(() => {
@@ -490,9 +840,31 @@ export default function HomeScreen() {
         checkInNotifId.current = notifId;
         if (notifId) await AsyncStorage.setItem(CHECKIN_NOTIF_KEY, notifId);
         else await AsyncStorage.removeItem(CHECKIN_NOTIF_KEY);
-        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+        hTap();
       }
     } catch {}
+  };
+
+  // Ask the server for a LiveKit publisher token. Returns null (→ snapshot mode)
+  // unless: real build (not Expo Go/web) and the server has LiveKit set up.
+  // Real-time streaming is on for EVERYONE (investor-demo requirement) — not
+  // gated to Gold. Any error falls back silently — live streaming must never
+  // block go-live.
+  const fetchLiveKitToken = async (sessionId: string): Promise<{ url: string; token: string } | null> => {
+    if (IS_WEB || IS_EXPO_GO) return null;
+    try {
+      const serverUrl = await getServerUrl();
+      const res = await fetchWithAuth(`${serverUrl}/livekit/publish-token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId }),
+      });
+      if (!res.ok) return null; // 503 = LiveKit not configured on the server
+      const j = await res.json().catch(() => null);
+      return j?.url && j?.token ? { url: j.url, token: j.token } : null;
+    } catch {
+      return null;
+    }
   };
 
   // ── Go live ────────────────────────────────────────────────────────────────
@@ -571,13 +943,53 @@ export default function HomeScreen() {
       const sessionId = randomId('session');
       sessionIdRef.current = sessionId;
       await AsyncStorage.setItem(ACTIVE_SESSION_KEY, sessionId);
-      await startSession(coords);
-      // Keep the session useful when the phone locks / app is switched away:
-      // iOS won't record video in the background, but location + audio may
-      // continue. Both are best-effort and never block going live.
+
+      // Decide live mode: real-time LiveKit stream (Gold + server + real build)
+      // or the snapshot/segment fallback. Best-effort — any failure falls back.
+      const lk = await fetchLiveKitToken(sessionId);
+      liveKitModeRef.current = !!lk;
+
+      startHeartbeat(sessionId);
+      await startSession(coords, !!lk);
+
+      if (lk) {
+        // LiveKit publishes camera + mic itself — no frame loop, no chunked
+        // audio, no local recording pipeline. Just location alongside it.
+        trace('livekit-mode');
+        setLiveKit(lk);
+        setLiveMode('livekit');
+        setIsRecording(true);
+        // At the chosen time the session does NOT end — it enters the overdue
+        // "Are you safe?" cycle (stream keeps running until the user is safe).
+        if (recordEndTimerRef.current) clearTimeout(recordEndTimerRef.current);
+        recordEndTimerRef.current = setTimeout(() => {
+          if (liveKitModeRef.current) enterOverdue();
+        }, recordDurationSecRef.current * 1000);
+        if (!IS_WEB) {
+          startBackgroundLocation()
+            .then(ok => trace(ok ? 'bg-location-started' : 'bg-location-FAILED'))
+            .catch(() => trace('bg-location-FAILED'));
+        }
+        return;
+      }
+
+      // Snapshot / segment mode — now safe to mount the camera.
+      setLiveMode('camera');
+      startFrameLoop(sessionId);
+      // Location keeps streaming when the phone locks / app is switched away.
+      // Chunked audio runs for the WHOLE session (live sound for the circle +
+      // the always-active recording keeps iOS from suspending the app in the
+      // background). Both are best-effort and never block go-live.
       if (!IS_WEB) {
-        startBackgroundLocation().catch(() => {});
-        startBackgroundAudio().catch(() => {});
+        startBackgroundLocation()
+          .then(ok => trace(ok ? 'bg-location-started' : 'bg-location-FAILED'))
+          .catch(() => trace('bg-location-FAILED'));
+        startChunkedAudio(
+          uri => uploadAudioChunk(uri, sessionId),
+          msg => trace(`audio-chunk-error: ${msg}`),
+        )
+          .then(ok => trace(ok ? 'chunk-audio-started' : 'chunk-audio-DENIED'))
+          .catch(() => {});
       }
     };
 
@@ -608,7 +1020,8 @@ export default function HomeScreen() {
       if (!notifiedRef.current) beginSessionOnce(null);
     }, 8000);
 
-    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
+    hWarning();
+    setLiveMode('deciding'); // don't mount camera until the mode is chosen
     setShowCamera(true);
   };
 
@@ -643,6 +1056,138 @@ export default function HomeScreen() {
   // — the recording is the evidence and takes priority. Responders still get
   // live location and the "Download recording" link on the live page.)
 
+  // Resolves when the app is back in the foreground (or the deadline passes).
+  const waitForForeground = (deadline: number) =>
+    new Promise<void>(resolve => {
+      if (AppState.currentState === 'active') return resolve();
+      const timer = setTimeout(() => {
+        sub.remove();
+        resolve();
+      }, Math.max(0, deadline - Date.now()));
+      const sub = AppState.addEventListener('change', s => {
+        if (s === 'active') {
+          clearTimeout(timer);
+          sub.remove();
+          resolve();
+        }
+      });
+    });
+
+  // Live audio: each rolling ~5s clip uploads immediately so the circle's live
+  // page can play sound a few seconds behind real time. One retry — chunks are
+  // perishable, and the server only stitches what arrived.
+  const uploadAudioChunk = async (uri: string, sessionId: string) => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const fd = new FormData();
+        fd.append('chunk', { uri, type: 'audio/m4a', name: 'chunk.m4a' } as any);
+        const serverUrl = await getServerUrl();
+        const res = await fetchWithAuth(`${serverUrl}/audiochunk/${sessionId}`, {
+          method: 'POST',
+          body: fd,
+        });
+        if (res.ok || (res.status >= 400 && res.status < 500)) return;
+      } catch {
+        // retry once below
+      }
+      await new Promise(r => setTimeout(r, 800));
+    }
+  };
+
+  // After a LiveKit session ends, its recording is finalized server-side (egress
+  // → R2) a little later. Poll the live state for the recordingUrl, then download
+  // and save it to the camera roll. Best-effort, capped at ~2 min.
+  const saveLiveKitRecordingWhenReady = async (sessionId: string) => {
+    const serverUrl = await getServerUrl();
+    for (let i = 0; i < 40; i++) {
+      await new Promise(r => setTimeout(r, 3000));
+      try {
+        const res = await fetch(`${serverUrl}/live/${sessionId}/state`);
+        if (res.ok) {
+          const s = await res.json();
+          if (s?.recordingUrl) {
+            const dest = `${FileSystem.cacheDirectory}session-${sessionId}.mp4`;
+            const dl = await FileSystem.downloadAsync(s.recordingUrl, dest);
+            if (dl?.uri) await saveToCameraRoll(dl.uri);
+            return;
+          }
+        }
+      } catch {
+        // keep polling
+      }
+    }
+  };
+
+  // The merged full-session audio lands in the app's Documents folder — visible
+  // in the Files app (On My iPhone → Make It Home → Recordings) thanks to
+  // UIFileSharingEnabled. No prompts, fully automatic.
+  const saveAudioUrlToFiles = async (url: string) => {
+    try {
+      const dir = `${FileSystem.documentDirectory}Recordings/`;
+      await FileSystem.makeDirectoryAsync(dir, { intermediates: true }).catch(() => {});
+      const stamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-');
+      await FileSystem.downloadAsync(url, `${dir}session-audio-${stamp}.m4a`);
+    } catch {
+      // best-effort — the cloud copy is the durable one
+    }
+  };
+
+  // Hold a captured file for upload-at-end (mirrored to disk so a force-quit /
+  // dead battery still uploads next launch). Nothing uploads until finishSession.
+  const addPending = (uri: string, kind: 'video' | 'audio', dur?: number) => {
+    pendingMediaRef.current.push({
+      uri,
+      kind,
+      lat: coordsRef.current?.latitude ?? null,
+      lng: coordsRef.current?.longitude ?? null,
+      dur,
+    });
+    const sid = sessionIdRef.current;
+    if (sid) {
+      AsyncStorage.setItem(
+        PENDING_MEDIA_KEY,
+        JSON.stringify({ sessionId: sid, items: pendingMediaRef.current }),
+      ).catch(() => {});
+    }
+  };
+
+  // Upload everything held for this session, then clear the on-disk queue. Runs
+  // at session end (or on next launch after a crash). Sequential so we don't
+  // hammer the server with parallel multipart uploads.
+  const flushPending = async (sessionId: string | null) => {
+    const items = pendingMediaRef.current.splice(0);
+    for (const it of items) {
+      const at = it.lat != null && it.lng != null ? { latitude: it.lat, longitude: it.lng } : null;
+      try {
+        if (it.kind === 'audio') await uploadAudioToHistory(it.uri, sessionId, at);
+        else await uploadRecording(it.uri, sessionId, at, { historyOnly: true, durationSec: it.dur });
+      } catch {
+        // best-effort; each uploader already retries internally
+      }
+    }
+    // Have the server stitch this session's parts into ONE video and ONE audio
+    // (the audio chunks live server-side already). History then shows a single
+    // recording of each kind per session. Best-effort: on failure the parts
+    // simply remain as-is.
+    if (sessionId) {
+      try {
+        const serverUrl = await getServerUrl();
+        const gold = await isGold();
+        const res = await fetchWithAuth(`${serverUrl}/merge`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sessionId, gold }),
+        });
+        const merged = res.ok ? await res.json().catch(() => null) : null;
+        // Auto-save the full-session audio into the Files app.
+        if (merged?.audioUrl && !IS_WEB) await saveAudioUrlToFiles(merged.audioUrl);
+      } catch {
+        // parts stay as separate entries — still complete evidence
+      }
+    }
+    await AsyncStorage.removeItem(PENDING_MEDIA_KEY).catch(() => {});
+  };
+
   const handleCameraReady = async () => {
     if (isRecordingRef.current) return;
     isRecordingRef.current = true;
@@ -654,58 +1199,102 @@ export default function HomeScreen() {
     // video file at all). The recording is the evidence — it takes priority.
     // Responders still get live location + the "Download recording" link.
 
-    // The chosen recording length is enforced by a wall-clock timer, NOT by
-    // recordAsync resolving — on some devices recordAsync can settle early, and
-    // we must not tear the session down the instant it does.
+    // At the chosen check-in time the session does NOT end — it enters the
+    // overdue "Are you safe?" cycle, and recording continues until the user
+    // presses "I'm safe". A wall-clock timer owns that transition.
     const seconds = recordDurationSecRef.current;
     if (recordEndTimerRef.current) clearTimeout(recordEndTimerRef.current);
     recordEndTimerRef.current = setTimeout(() => {
-      if (isRecordingRef.current) finishSession('auto');
+      if (isRecordingRef.current) enterOverdue();
     }, seconds * 1000);
 
-    // Start recording, retrying briefly on "Camera is not ready yet". On iOS the
-    // native movie output is attached in setCameraMode() (a prop update after
-    // mount), which can land a beat AFTER onCameraReady fires — so the very first
-    // recordAsync can hit CameraOutputNotReadyException. Retrying for ~3s covers
-    // that race; without it we got no file at all.
-    let video: { uri: string } | undefined;
-    let recordError: string | null = null;
-    const startedAt = Date.now();
+    // Signal finishSession when this loop has fully exited (so it can flush the
+    // final held segment before uploading).
+    let resolveLoopDone: () => void = () => {};
+    loopDoneRef.current = new Promise<void>(res => { resolveLoopDone = res; });
+
     // Small settle so the movie output exists on the first attempt in most cases.
     await new Promise(r => setTimeout(r, 400));
-    for (let attempt = 0; ; attempt++) {
-      if (!isRecordingRef.current) break; // user ended before we ever started
-      try {
-        // maxDuration is a backstop cap at the camera level.
-        video = await cameraRef.current?.recordAsync({ maxDuration: seconds });
-        recordError = null;
-        break;
-      } catch (e: any) {
-        const msg = String(e?.message ?? e);
-        const notReady = /not ready/i.test(msg);
-        if (notReady && Date.now() - startedAt < 3000) {
-          await new Promise(r => setTimeout(r, 250));
-          continue; // camera output not attached yet — try again
+
+    // SEGMENT LOOP. iOS kills the camera the instant the app leaves the
+    // foreground. That must NOT end the session: the partial video segment (with
+    // sound) is HELD (not uploaded), audio-only recording takes over for the gap
+    // (mic is free once the camera stops), and a new video recording starts when
+    // the app is visible again. The loop runs until the user presses "I'm safe"
+    // (finishSession) — segments are capped at 10 min each so files stay
+    // manageable however long the session runs. Location streams throughout.
+    const SEGMENT_MAX_SEC = 600;
+    let segments = 0;
+    while (isRecordingRef.current) {
+      if (AppState.currentState !== 'active') {
+        // App is backgrounded: the camera can't run, but the chunked audio and
+        // location keep going on their own. Just wait to resume the video.
+        setCameraPaused(true);
+        trace('loop-paused');
+        await waitForForeground(Date.now() + 6 * 60 * 60 * 1000);
+        trace('loop-resumed');
+        setCameraPaused(false);
+        if (!isRecordingRef.current) break;
+        // Tell the user the recording picked back up — otherwise the last
+        // status ("saved") lingers and reads like the recording stopped.
+        setNotifyStatus('resumed');
+        // Give the camera a beat to re-attach its capture session.
+        await new Promise(r => setTimeout(r, 600));
+      }
+
+      // Start recording, retrying briefly on "Camera is not ready yet". On iOS
+      // the native movie output is attached in setCameraMode() (a prop update
+      // after mount / foreground return), which can land a beat late — so
+      // recordAsync can hit CameraOutputNotReadyException. Retry for ~4s.
+      let video: { uri: string } | undefined;
+      let recordError: string | null = null;
+      const startedAt = Date.now();
+      for (;;) {
+        if (!isRecordingRef.current) break;
+        try {
+          recordStartedAtRef.current = Date.now(); // frames hold off while this settles
+          video = await cameraRef.current?.recordAsync({ maxDuration: SEGMENT_MAX_SEC });
+          recordError = null;
+          break;
+        } catch (e: any) {
+          const msg = String(e?.message ?? e);
+          if (/not ready/i.test(msg) && Date.now() - startedAt < 4000) {
+            await new Promise(r => setTimeout(r, 250));
+            continue; // camera output not attached yet — try again
+          }
+          // A manual End rejects on some platforms — that's fine. Anything else
+          // is real, and losing the recording silently is what we must not do.
+          recordError = /stop|cancel/i.test(msg) ? null : msg;
+          break;
         }
-        // A manual End rejects on some platforms — that's fine. Anything else is
-        // real, and losing the recording silently is exactly what we must not do.
-        recordError = /stop|cancel/i.test(msg) ? null : msg;
+      }
+      if (recordError && segments === 0) Alert.alert('Recording problem', recordError);
+
+      if (video?.uri) {
+        segments++;
+        const uri = video.uri;
+        trace(`video-segment-${segments}-held`);
+        // Keep a local copy immediately; HOLD the upload until session end.
+        saveToCameraRoll(uri).then(saved => { if (saved) setNotifyStatus('saved'); }).catch(() => {});
+        // Actual recorded length of THIS segment (not the chosen session length).
+        addPending(uri, 'video', Math.max(1, Math.round((Date.now() - startedAt) / 1000)));
+      } else if (!recordError && isRecordingRef.current) {
+        if (AppState.currentState !== 'active') continue; // backgrounded — wait and resume
+        // Resolved with no file, no error, in the foreground — surface it
+        // instead of a silent miss (and don't spin).
+        if (segments === 0) {
+          Alert.alert(
+            'No video was recorded',
+            'The camera stopped without producing a file. This can happen in Expo Go; it works in the installed app.',
+          );
+        }
         break;
       }
+      // Tiny yield so an instantly-resolving camera can't hot-loop.
+      await new Promise(r => setTimeout(r, 300));
     }
-    if (recordError) Alert.alert('Recording problem', recordError);
-
-    if (video?.uri) {
-      const saved = await saveToCameraRoll(video.uri); // keep a copy on the device
-      if (saved) setNotifyStatus('saved');
-      await uploadRecording(video.uri, sessionId); // send it to the safety circle
-    } else if (!recordError && isRecordingRef.current) {
-      // Resolved with no file and no error — surface it instead of a silent miss.
-      Alert.alert(
-        'No video was recorded',
-        'The camera stopped without producing a file. This can happen in Expo Go; it works in the installed app.',
-      );
-    }
+    setCameraPaused(false);
+    resolveLoopDone(); // finishSession may be awaiting this before it flushes
     // Do NOT finish here — the wall-clock timer (or a manual End) owns the
     // session lifecycle.
   };
@@ -722,12 +1311,47 @@ export default function HomeScreen() {
     }).catch(() => {});
   };
 
-  // Ends the live session. reason 'manual' = the user tapped End (we stop the
-  // recording); reason 'auto' = the recording already finished at its chosen
-  // length (nothing to stop). Guarded so the two paths can't double-run.
+  // The slide time ran out with no "I'm safe". The session does NOT end — it
+  // shifts into the overdue cycle: the app asks "Are you safe?" now and every
+  // 5 minutes (notification + on-screen banner), while the SERVER independently
+  // re-alerts the circle with live location every 5 minutes. Recording and the
+  // live stream keep running. Only the user pressing "I'm safe" stops it.
+  const enterOverdue = () => {
+    if (!sessionIdRef.current || finishingRef.current) return;
+    setOverdue(true);
+    hWarning();
+    trace('overdue-cycle-start');
+    const askAreYouSafe = () => {
+      Notifications.scheduleNotificationAsync({
+        content: {
+          title: 'Are you safe?',
+          body: "Your check-in time ran out. Tap I'm safe if you're okay — your circle is being re-alerted until you do.",
+          sound: true,
+        },
+        trigger: null,
+      }).catch(() => {});
+    };
+    askAreYouSafe();
+    if (cycleIntervalRef.current) clearInterval(cycleIntervalRef.current);
+    cycleIntervalRef.current = setInterval(() => {
+      if (!sessionIdRef.current) return;
+      hWarning();
+      askAreYouSafe();
+    }, 5 * 60 * 1000);
+  };
+
+  // Ends the live session. reason 'manual' = the user tapped End; reason 'auto'
+  // = the chosen recording length elapsed. Either way this is the ONE place that
+  // uploads: it stops the segment loop, waits for the final held segment, then
+  // flushes all held video + audio to Gold history. Guarded against double-run.
   const finishSession = (reason: 'manual' | 'auto') => {
     if (!showCamera && !sessionIdRef.current) return;
+    if (finishingRef.current) return;
+    finishingRef.current = true;
+    trace(`finish-session: ${reason}`);
     const endedSessionId = sessionIdRef.current;
+    const wasLiveKit = liveKitModeRef.current;
+    liveKitModeRef.current = false;
     if (goLiveFallbackRef.current) {
       clearTimeout(goLiveFallbackRef.current);
       goLiveFallbackRef.current = null;
@@ -736,87 +1360,117 @@ export default function HomeScreen() {
       clearTimeout(recordEndTimerRef.current);
       recordEndTimerRef.current = null;
     }
-    if (reason === 'manual') cameraRef.current?.stopRecording();
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+    if (heartbeatRef.current) {
+      clearInterval(heartbeatRef.current);
+      heartbeatRef.current = null;
+    }
+    if (frameTimerRef.current) {
+      clearInterval(frameTimerRef.current);
+      frameTimerRef.current = null;
+    }
+    if (cycleIntervalRef.current) {
+      clearInterval(cycleIntervalRef.current);
+      cycleIntervalRef.current = null;
+    }
+    // Stop the segment loop and unblock the in-progress recordAsync (both paths),
+    // so the loop can push its final segment and resolve loopDoneRef.
+    isRecordingRef.current = false;
+    cameraRef.current?.stopRecording();
     locationSub.current?.remove();
     locationSub.current = null;
-    // Stop background systems. The background audio is the evidence that
-    // survived the phone being locked. iOS Photos can't hold audio files, so we
-    // keep it in the app's storage and offer the OS share sheet (save to Files,
-    // AirDrop, send to police) once the "safe?" prompt is answered.
-    if (!IS_WEB) {
-      stopBackgroundLocation().catch(() => {});
-      stopBackgroundAudio()
-        .then(uri => {
-          if (uri) lastAudioUriRef.current = uri;
-        })
-        .catch(() => {});
-    }
+    const doneWaiter = loopDoneRef.current;
+    const lastCoords = coords ? { latitude: coords.latitude, longitude: coords.longitude } : null;
+
+    // Do the heavy work off the UI path: wait for the loop's final segment, stop
+    // background systems, hold the last audio, then upload EVERYTHING held.
+    // LiveKit mode has no local recording pipeline — just stop location.
+    (async () => {
+      if (!IS_WEB) stopBackgroundLocation().catch(() => {});
+      if (wasLiveKit) {
+        // The server records LiveKit sessions via egress; the MP4 is finalized a
+        // little after the session ends. Poll for it, then save to camera roll.
+        if (!IS_WEB && endedSessionId) saveLiveKitRecordingWhenReady(endedSessionId);
+        return;
+      }
+      if (doneWaiter) {
+        await Promise.race([doneWaiter, new Promise(r => setTimeout(r, 4000))]);
+      }
+      if (!IS_WEB) stopChunkedAudio(); // the uploaded chunks are stitched server-side
+      await flushPending(endedSessionId);
+    })().catch(() => {});
+
     AsyncStorage.removeItem(ACTIVE_SESSION_KEY);
+    // Ending the session halts the server's escalation sweep — so this MUST
+    // land, not be best-effort. Retry with backoff until the server confirms
+    // (or a 4xx says the session is already gone), so escalations can't keep
+    // firing after the user ended or was confirmed safe.
     if (endedSessionId) {
-      getServerUrl().then(serverUrl => {
-        fetchWithAuth(`${serverUrl}/session/end`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sessionId: endedSessionId }),
-        }).catch(() => {});
-      });
+      (async () => {
+        const serverUrl = await getServerUrl();
+        let delay = 3000;
+        for (let attempt = 0; attempt < 8; attempt++) {
+          try {
+            const res = await fetchWithAuth(`${serverUrl}/session/end`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ sessionId: endedSessionId }),
+            });
+            if (res.ok || (res.status >= 400 && res.status < 500)) return; // ended, or already gone
+          } catch {
+            // network drop — retry below
+          }
+          await new Promise(r => setTimeout(r, delay));
+          delay = Math.min(Math.round(delay * 1.6), 20000);
+        }
+      })();
     }
     setIsRecording(false);
+    setCameraPaused(false);
     setShowCamera(false);
+    setLiveKit(null);
     setCoords(null);
+    setOverdue(false);
+    setAckByCircle(false);
+    ackSeenRef.current = false;
     notifiedRef.current = false;
     sessionIdRef.current = null;
     lastLocationUpdateRef.current = 0;
-    isRecordingRef.current = false;
+    setTimeout(() => { finishingRef.current = false; }, 1500); // re-arm after teardown
     setTimeout(() => setNotifyStatus('idle'), 3000);
-    // The end-of-session prompt is the highest-intent moment for the recording:
-    // Gold users get a shortcut to their history; free users get one quiet,
-    // contextual line about keeping recordings — never a blocker.
+    hSuccess();
+    // Pressing "I'm safe" IS the safe signal — tell the circle automatically
+    // ("✅ <name> is safe."), no extra prompt. Only the user can end alerts,
+    // and ending them means they're safe.
+    sendSafeNotification();
+    if (wasLiveKit) {
+      Alert.alert(
+        "You're marked safe",
+        'Your circle has been told you\'re safe. The live stream has stopped and the recording is being saved to your history and camera roll.',
+        [
+          { text: 'View in history', onPress: () => router.push('/history') },
+          { text: 'OK', style: 'cancel' },
+        ],
+      );
+      return;
+    }
     isGold().then(gold => {
       Alert.alert(
-        reason === 'auto' ? 'Recording finished' : 'Session ended',
+        "You're marked safe",
         gold
-          ? "Saved to your camera roll and your Gold history.\n\nLet your safety circle know you're safe?"
-          : "Saved to your camera roll (your circle's download link lasts 24h).\n\nLet your safety circle know you're safe?",
+          ? "Your circle has been told you're safe. The recording is saved to your camera roll and your Gold history."
+          : "Your circle has been told you're safe. The recording is saved to your camera roll (your circle's download link lasts 24h).",
         [
-          { text: "Yes, I'm safe", onPress: () => { sendSafeNotification(); offerBackgroundAudio(); } },
           gold
-            ? { text: 'View in history', onPress: () => { offerBackgroundAudio(); router.push('/history'); } }
-            : { text: 'Keep for 90 days with Gold', onPress: () => { offerBackgroundAudio(); router.push('/gold-plans'); } },
-          { text: 'No thanks', style: 'cancel', onPress: offerBackgroundAudio },
+            ? { text: 'View in history', onPress: () => router.push('/history') }
+            : { text: 'Keep for 90 days with Gold', onPress: () => router.push('/gold-plans') },
+          { text: 'OK', style: 'cancel' },
         ],
       );
     });
-  };
-
-  // If audio was captured while the phone was locked / app backgrounded, offer to
-  // keep it. Photos can't store audio, so this uses the OS share sheet (Save to
-  // Files, AirDrop, Messages...). Best-effort; skipped if there's no file.
-  const offerBackgroundAudio = () => {
-    const uri = lastAudioUriRef.current;
-    if (!uri || IS_WEB) return;
-    lastAudioUriRef.current = null;
-    // Give the "safe?" alert a moment to dismiss before presenting another.
-    setTimeout(() => {
-      Alert.alert(
-        'Audio was captured too',
-        'While your phone was locked or you were in another app, Make It Home kept recording audio. Save it as evidence?',
-        [
-          {
-            text: 'Save / share',
-            onPress: async () => {
-              try {
-                const Sharing = await import('expo-sharing');
-                if (await Sharing.isAvailableAsync()) {
-                  await Sharing.shareAsync(uri, { mimeType: 'audio/m4a', dialogTitle: 'Save session audio' });
-                }
-              } catch {}
-            },
-          },
-          { text: 'Not now', style: 'cancel' },
-        ],
-      );
-    }, 400);
   };
 
   const handleEnd = () => finishSession('manual');
@@ -845,6 +1499,9 @@ export default function HomeScreen() {
       }
       return;
     }
+    // A firm double-thump the moment the alert is committed — this is the app's
+    // most important gesture, and it should FEEL like it landed.
+    hConfirm();
     handleSafetyTap(DIR[k].sec);
   };
 
@@ -867,7 +1524,7 @@ export default function HomeScreen() {
         selRef.current = null;
         setSel(null);
         setArmed(true);
-        if (!IS_WEB) Haptics.selectionAsync();
+        hTick();
       })
       .onUpdate(e => {
         const dx = e.translationX;
@@ -885,7 +1542,7 @@ export default function HomeScreen() {
         if (k !== selRef.current) {
           selRef.current = k;
           setSel(k);
-          if (k && !IS_WEB) Haptics.selectionAsync();
+          if (k) hArm(); // firm tick each time a new duration is selected
         }
       })
       .onEnd(() => {
@@ -899,21 +1556,95 @@ export default function HomeScreen() {
       }),
   ).current;
 
-  // ── Camera / go-live screen ────────────────────────────────────────────────
-  if (showCamera) {
-    const statusColor =
-      notifyStatus === 'error'
+  // ── Going-live: still deciding which surface (never mount the camera here) ──
+  if (showCamera && liveMode === 'deciding') {
+    return (
+      <View style={[styles.cameraRoot, { alignItems: 'center', justifyContent: 'center' }]}>
+        <ActivityIndicator color="#fff" />
+        <Text style={{ color: '#fff', marginTop: 14, fontWeight: '700', fontSize: 15 }}>Going live…</Text>
+      </View>
+    );
+  }
+
+  // ── LiveKit real-time broadcast screen ─────────────────────────────────────
+  if (showCamera && liveMode === 'livekit' && liveKit) {
+    return (
+      <Suspense
+        fallback={
+          <View style={styles.cameraRoot}>
+            <ActivityIndicator color="#fff" style={{ flex: 1 }} />
+          </View>
+        }
+      >
+        <LiveKitPublisher
+          serverUrl={liveKit.url}
+          token={liveKit.token}
+          elapsed={elapsed}
+          alertState={
+            notifyStatus === 'error' ? 'failed' : notifyStatus === 'notified' ? 'ok' : 'sending'
+          }
+          overdue={overdue}
+          ackByCircle={ackByCircle}
+          onEnd={() => finishSession('manual')}
+          onConnected={() => {
+            setNotifyStatus('notified');
+            trace('livekit-connected');
+            // Ask the server to record the room. The room + published tracks need
+            // a moment to fully register in LiveKit before egress can attach, so
+            // wait a beat, then retry a few times if it isn't recording yet.
+            const sid = sessionIdRef.current;
+            if (!sid) return;
+            (async () => {
+              const serverUrl = await getServerUrl();
+              await new Promise(r => setTimeout(r, 2500));
+              for (let attempt = 0; attempt < 4; attempt++) {
+                if (sessionIdRef.current !== sid) return;
+                try {
+                  const res = await fetchWithAuth(`${serverUrl}/livekit/start-egress`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sessionId: sid }),
+                  });
+                  const j = await res.json().catch(() => null);
+                  if (j?.recording) { trace('egress-started'); return; }
+                  trace(`egress-retry-${attempt}`);
+                } catch {
+                  trace(`egress-error-${attempt}`);
+                }
+                await new Promise(r => setTimeout(r, 3000));
+              }
+              trace('egress-gaveup');
+            })();
+          }}
+          onError={m => trace(`livekit-error: ${m}`)}
+        />
+      </Suspense>
+    );
+  }
+
+  // ── Camera / go-live screen (snapshot fallback mode only) ──────────────────
+  if (showCamera && liveMode === 'camera') {
+    const statusColor = overdue
+      ? '#f87171'
+      : notifyStatus === 'error'
         ? '#f87171'
-        : notifyStatus === 'uploading'
+        : notifyStatus === 'uploading' || notifyStatus === 'reconnecting'
           ? Beacon.warn
-          : notifyStatus === 'notified' || notifyStatus === 'uploaded' || notifyStatus === 'saved'
+          : notifyStatus === 'notified' || notifyStatus === 'uploaded' || notifyStatus === 'saved' || notifyStatus === 'resumed'
             ? Beacon.safe
             : Beacon.warn;
-    const statusLabel =
-      notifyStatus === 'notified'
+    const statusLabel = overdue
+      ? "⚠ Are you safe? Tap I'm safe — your circle is being re-alerted"
+      : cameraPaused
+      ? '⏸ Camera paused — audio & location still recording'
+      : notifyStatus === 'resumed'
+        ? '● Recording continued — tracking live'
+      : notifyStatus === 'notified'
         ? '✓ Circle notified — tracking live'
         : notifyStatus === 'saved'
           ? '✓ Saved to your camera roll'
+        : notifyStatus === 'reconnecting'
+          ? '⟳ Reconnecting to server…'
         : notifyStatus === 'uploading'
           ? '⬆ Uploading recording…'
           : notifyStatus === 'uploaded'
@@ -930,14 +1661,33 @@ export default function HomeScreen() {
           style={StyleSheet.absoluteFill}
           facing="back"
           mode="video"
+          // 720p keeps long recordings uploadable (default quality can be 4K,
+          // which is hundreds of MB per minute — too big to send anywhere).
+          videoQuality="720p"
+          // Small stills: the live-view frames come from takePictureAsync, and
+          // full-res photos would be ~1MB each — 720p keeps them ~50-100KB.
+          pictureSize="1280x720"
+          animateShutter={false}
           onCameraReady={handleCameraReady}
         />
+        {/* App backgrounded: the camera can't run, so cover the frozen frame with
+            a clear "paused" panel that reassures audio + location are still on. */}
+        {cameraPaused && (
+          <View style={styles.pausedCover} pointerEvents="none">
+            <Ionicons name="pause-circle" size={64} color="#fff" />
+            <Text style={styles.pausedTitle}>Camera paused</Text>
+            <Text style={styles.pausedSub}>
+              You left the app. Audio and your live location are still recording — the video picks
+              back up when you return.
+            </Text>
+          </View>
+        )}
         <SafeAreaView style={styles.cameraOverlay} pointerEvents="box-none">
           <View style={styles.recRow}>
             {isRecording && (
               <View style={styles.recBadge}>
-                <View style={styles.recDot} />
-                <Text style={styles.recLabel}>REC</Text>
+                <View style={[styles.recDot, cameraPaused && { backgroundColor: Beacon.warn }]} />
+                <Text style={styles.recLabel}>{cameraPaused ? 'AUDIO' : 'REC'}</Text>
               </View>
             )}
             <Text style={styles.recTimer}>{formatTime(elapsed)}</Text>
@@ -949,9 +1699,19 @@ export default function HomeScreen() {
               </Text>
             )}
             <Text style={[styles.camStatusLabel, { color: statusColor }]}>{statusLabel}</Text>
+            {ackByCircle && (
+              <Text style={[styles.camStatusLabel, { color: Beacon.safe }]}>🟢 Someone is on their way to you</Text>
+            )}
           </View>
           <View style={styles.endWrap}>
-            <PillButton title="End session" kind="dark" onPress={handleEnd} style={styles.endBtn} />
+            {/* "I'm safe" is THE stop: ends the session, stops all alerts, and
+                texts the circle "✅ <name> is safe." automatically. */}
+            <PillButton
+              title="I'm safe"
+              kind={overdue ? 'primary' : 'dark'}
+              onPress={handleEnd}
+              style={styles.endBtn}
+            />
           </View>
         </SafeAreaView>
       </View>
@@ -1002,17 +1762,17 @@ export default function HomeScreen() {
         </Text>
         <View style={styles.hbarActions}>
           {/* Discreet Gold chip: shortcut for Gold users, quiet discovery for free users. */}
-          <Pressable style={styles.gear} hitSlop={8} onPress={() => router.push('/(tabs)/gold')}>
+          <Pressable style={styles.gear} hitSlop={8} onPress={() => { hTap(); router.push('/(tabs)/gold'); }}>
             <Ionicons name={goldActive ? 'star' : 'star-outline'} size={17} color="#f5b942" />
           </Pressable>
-          <Pressable style={styles.gear} hitSlop={8} onPress={() => router.push('/(tabs)/explore')}>
+          <Pressable style={styles.gear} hitSlop={8} onPress={() => { hTap(); router.push('/(tabs)/explore'); }}>
             <Ionicons name="settings-outline" size={18} color={Beacon.muted} />
           </Pressable>
         </View>
       </View>
 
       {/* Coverage strip */}
-      <Pressable style={styles.cover} onPress={() => router.push('/(tabs)/contacts')}>
+      <Pressable style={styles.cover} onPress={() => { hTap(); router.push('/(tabs)/contacts'); }}>
         <View
           style={[
             styles.coverPip,
@@ -1093,18 +1853,19 @@ export default function HomeScreen() {
                 key={min}
                 style={styles.ciChip}
                 onPress={() => {
+                  hTap();
                   setShowCheckIn(false);
                   startCheckIn(min * 60);
                 }}>
                 <Text style={styles.ciChipText}>{min}m</Text>
               </Pressable>
             ))}
-            <Pressable style={styles.ciCancel} onPress={() => setShowCheckIn(false)}>
+            <Pressable style={styles.ciCancel} onPress={() => { hTap(); setShowCheckIn(false); }}>
               <Ionicons name="close" size={16} color={Beacon.muted} />
             </Pressable>
           </View>
         ) : (
-          <Pressable style={styles.checkInBtn} onPress={() => setShowCheckIn(true)}>
+          <Pressable style={styles.checkInBtn} onPress={() => { hTap(); setShowCheckIn(true); }}>
             <Ionicons name="timer-outline" size={16} color={Beacon.muted} />
             <Text style={styles.checkInText}>
               {checkInStarting ? 'Starting check-in…' : 'Set a Home-safe check-in'}
@@ -1374,6 +2135,16 @@ const styles = StyleSheet.create({
     textShadowOffset: { width: 0, height: 1 },
     textShadowRadius: 3,
   },
+  pausedCover: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(6,8,12,0.92)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 40,
+    gap: 12,
+  },
+  pausedTitle: { color: '#fff', fontSize: 22, fontWeight: '800' },
+  pausedSub: { color: '#9aa4b2', fontSize: 14, lineHeight: 21, textAlign: 'center' },
   endWrap: { alignItems: 'center', marginBottom: 24 },
   endBtn: { width: 200 },
 
