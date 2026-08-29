@@ -1,4 +1,0 @@
-# Railway build config. ffmpeg is needed by POST /merge to stitch a session's
-# video segments into one continuous recording (concat demuxer, stream copy).
-[phases.setup]
-aptPkgs = ["ffmpeg"]
