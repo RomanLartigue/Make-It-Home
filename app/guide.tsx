@@ -8,9 +8,9 @@ import { Beacon } from '@/constants/beacon';
 import { Card, Callout, DetailHeader } from '@/components/beacon/kit';
 
 const STEPS = [
-  { n: '1', title: 'Hold the beacon', desc: 'Hold the orange button and drag to how long to record — 15, 30, 45, or 60 min.' },
-  { n: '2', title: 'Release to go live', desc: 'Let go and your circle is alerted with your live location and a recording for that long.' },
-  { n: '3', title: "You're covered", desc: 'They get your live location and a recording they can download — and it’s saved to your camera roll.' },
+  { n: '1', title: 'Hold the beacon', desc: 'Hold the orange button and drag to how long you need — 15, 30, 45, or 60 min.' },
+  { n: '2', title: 'Release to go live', desc: 'Let go and your circle is alerted — they can watch your live location and video for that long.' },
+  { n: '3', title: "You're covered", desc: 'They watch you live from the link — location and video. Anyone who wants a copy can simply screen-record.' },
   { n: '4', title: '“Made it home”', desc: 'End the session and we let your circle know you’re safe.' },
 ];
 
@@ -29,9 +29,9 @@ const FEATURES: { icon: keyof typeof Ionicons.glyphMap; title: string; body: str
   },
   {
     icon: 'videocam-outline',
-    title: 'Recording & evidence',
+    title: 'Live video',
     body:
-      'Going live records video for the length you chose. It’s saved to your camera roll automatically, and your circle can download it from your link — so both of you have a copy to show police if needed.',
+      'Going live streams video and your location to your circle for the length you chose. Nothing is stored in the cloud — if you or anyone in your circle wants a copy, just screen-record the live page.',
   },
   {
     icon: 'flask-outline',
@@ -81,9 +81,9 @@ export default function GuideScreen() {
         <Card style={{ paddingVertical: 12, gap: 4 }}>
           <Text style={styles.cardTitle}>A link — no app, no account</Text>
           <Text style={styles.cardBody}>
-            Each person gets a text with your name and live location, plus a link to download the recording. They tap
-            “I&apos;m on my way” to say they’ve got it — which stops the ladder from alerting anyone
-            else, so help isn&apos;t duplicated and no one double-panics.
+            Each person gets a text with your name and a link where they can watch your live
+            location and video. They can tap “I&apos;m on my way” to let everyone — including you —
+            know someone is coming. Alerts continue until you mark yourself safe.
           </Text>
         </Card>
 

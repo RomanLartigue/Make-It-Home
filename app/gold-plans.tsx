@@ -19,11 +19,6 @@ const FEATURES: { icon: keyof typeof Ionicons.glyphMap; title: string; body: str
     body: 'Choose exactly when your circle is re-texted — and how many times. Free re-texts at ⅓, ⅔ and the full time of your slider.',
   },
   {
-    icon: 'cloud-outline',
-    title: 'Cloud recording history',
-    body: 'Every session’s recording kept safely in the cloud for 90 days — view or download any time, from any device. Free keeps a copy on your phone plus a 24-hour link.',
-  },
-  {
     icon: 'map-outline',
     title: 'Local safety info',
     body: 'Nearest police stations, hospitals and fire stations to where you are, with distance, directions and one-tap call.',

@@ -27,13 +27,6 @@ const ITEMS: {
     body: 'Nearest police, hospitals and fire stations — distance, call, directions.',
   },
   {
-    route: '/history',
-    icon: 'cloud-outline',
-    color: '#4bd6a6',
-    title: 'Recording history',
-    body: 'Every session’s recording, kept safely for 90 days. View, download or delete.',
-  },
-  {
     route: '/escalation',
     icon: 'notifications-outline',
     color: Beacon.beacon,

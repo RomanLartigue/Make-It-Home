@@ -296,8 +296,8 @@ export default function HomeScreen() {
   }, []);
 
   // Resume-on-launch: if a previous session was force-quit or the phone died
-  // mid-recording, its captured video/audio was held on disk but never uploaded.
-  // Flush it now (and end the orphaned server session so escalations stop).
+  // mid-session, clear its leftover state (and end the orphaned server session
+  // so escalations stop).
   useEffect(() => {
     (async () => {
       // An ACTIVE_SESSION_KEY at launch means the app was KILLED mid-session
@@ -321,7 +321,8 @@ export default function HomeScreen() {
       //    would otherwise keep GPS (and the blue indicator) running forever.
       if (!IS_WEB) stopBackgroundLocation().catch(() => {});
 
-      // 2) Upload any held recordings from the dead session.
+      // 2) Clear any held-segment queue from the dead session (segments already
+      //    reached the camera roll as they were cut; nothing uploads).
       if (hasMedia && parsed) {
         trace(`relaunch-flush: ${parsed.items.length} item(s) from ${parsed.sessionId}`);
         pendingMediaRef.current = parsed.items;
@@ -652,111 +653,9 @@ export default function HomeScreen() {
     }, HEARTBEAT_MS);
   };
 
-  const uploadRecording = async (
-    videoUri: string,
-    sessionId?: string | null,
-    at?: { latitude: number; longitude: number } | null,
-    // historyOnly: store on the server (+ Gold history) but don't text the
-    // circle — used for mid-session segments so re-records don't spam texts.
-    // durationSec: the segment's ACTUAL recorded length for the history label.
-    opts?: { historyOnly?: boolean; durationSec?: number },
-  ) => {
-    const historyOnly = !!opts?.historyOnly;
-    const phones = await getSafetyCirclePhones();
-    if (!historyOnly) {
-      if (phones.length === 0) return;
-      await syncCircle(phones); // guarantee the server has this circle under the current token
-    }
-    setNotifyStatus('uploading');
-    const serverUrl = await getServerUrl();
-    const gold = await isGold();
-    const qs = [gold ? 'gold=1' : '', historyOnly ? 'historyOnly=1' : ''].filter(Boolean).join('&');
-    // A FormData can't be replayed across fetches, so rebuild it for each attempt.
-    const buildForm = () => {
-      const fd = new FormData();
-      // iOS records QuickTime (.mov) — declare what the file actually is, since
-      // the native uploader sends the real type either way.
-      const isMov = /\.mov$/i.test(videoUri);
-      fd.append('video', {
-        uri: videoUri,
-        type: isMov ? 'video/quicktime' : 'video/mp4',
-        name: isMov ? 'recording.mov' : 'recording.mp4',
-      } as any);
-      fd.append('phones', JSON.stringify(phones));
-      if (sessionId) fd.append('sessionId', sessionId);
-      if (gold) {
-        if (at) {
-          fd.append('latitude', String(at.latitude));
-          fd.append('longitude', String(at.longitude));
-        }
-        if (opts?.durationSec != null) fd.append('durationSec', String(opts.durationSec));
-      }
-      return fd;
-    };
-    // Retry with backoff so a dropped connection doesn't lose the recording.
-    let delay = 4000;
-    for (let attempt = 0; attempt < 6; attempt++) {
-      try {
-        const res = await fetchWithAuth(`${serverUrl}/upload${qs ? `?${qs}` : ''}`, {
-          method: 'POST',
-          body: buildForm(),
-        });
-        if (res.ok) {
-          setNotifyStatus('uploaded');
-          return;
-        }
-        // 4xx = the server refused this file (too large, wrong type…) —
-        // retrying the same bytes can't succeed, so surface the reason instead.
-        if (res.status >= 400 && res.status < 500) {
-          const msg = (await res.json().catch(() => null))?.error;
-          setNotifyStatus('error');
-          Alert.alert(
-            'Recording upload failed',
-            `${msg || `The server rejected the recording (HTTP ${res.status}).`}\n\nIt's still saved in your camera roll.`,
-          );
-          return;
-        }
-      } catch {
-        // network drop — retry below
-      }
-      await new Promise(r => setTimeout(r, delay));
-      delay = Math.min(Math.round(delay * 1.6), 30000);
-    }
-    setNotifyStatus('error');
-  };
-
-  // Fallback evidence: when a session captured NO video (e.g. the phone was
-  // locked so iOS stopped the camera), push the background audio to Gold cloud
-  // history so there's still a record. History-only — never MMS'd to the circle.
-  const uploadAudioToHistory = async (
-    audioUri: string,
-    sessionId?: string | null,
-    at?: { latitude: number; longitude: number } | null,
-  ) => {
-    const serverUrl = await getServerUrl();
-    let delay = 4000;
-    for (let attempt = 0; attempt < 5; attempt++) {
-      try {
-        const fd = new FormData();
-        fd.append('video', { uri: audioUri, type: 'audio/m4a', name: 'session-audio.m4a' } as any);
-        if (sessionId) fd.append('sessionId', sessionId);
-        if (at) {
-          fd.append('latitude', String(at.latitude));
-          fd.append('longitude', String(at.longitude));
-        }
-        const res = await fetchWithAuth(`${serverUrl}/upload?gold=1&historyOnly=1`, {
-          method: 'POST',
-          body: fd,
-        });
-        if (res.ok) return;
-        if (res.status >= 400 && res.status < 500) return; // refused — retrying can't help
-      } catch {
-        // retry below
-      }
-      await new Promise(r => setTimeout(r, delay));
-      delay = Math.min(Math.round(delay * 1.6), 30000);
-    }
-  };
+  // (Recording uploads removed: sessions are live-only. The circle watches in
+  // real time and can screen-record the live page for a copy; camera-mode
+  // segments still save to the user's own camera roll at zero server cost.)
 
   // ── Check-in timer ─────────────────────────────────────────────────────────
   const startCheckIn = async (durationSeconds: number) => {
@@ -1118,44 +1017,6 @@ export default function HomeScreen() {
     }
   };
 
-  // After a LiveKit session ends, its recording is finalized server-side (egress
-  // → R2) a little later. Poll the live state for the recordingUrl, then download
-  // and save it to the camera roll. Best-effort, capped at ~2 min.
-  const saveLiveKitRecordingWhenReady = async (sessionId: string) => {
-    const serverUrl = await getServerUrl();
-    for (let i = 0; i < 40; i++) {
-      await new Promise(r => setTimeout(r, 3000));
-      try {
-        const res = await fetch(`${serverUrl}/live/${sessionId}/state`);
-        if (res.ok) {
-          const s = await res.json();
-          if (s?.recordingUrl) {
-            const dest = `${FileSystem.cacheDirectory}session-${sessionId}.mp4`;
-            const dl = await FileSystem.downloadAsync(s.recordingUrl, dest);
-            if (dl?.uri) await saveToCameraRoll(dl.uri);
-            return;
-          }
-        }
-      } catch {
-        // keep polling
-      }
-    }
-  };
-
-  // The merged full-session audio lands in the app's Documents folder — visible
-  // in the Files app (On My iPhone → Make It Home → Recordings) thanks to
-  // UIFileSharingEnabled. No prompts, fully automatic.
-  const saveAudioUrlToFiles = async (url: string) => {
-    try {
-      const dir = `${FileSystem.documentDirectory}Recordings/`;
-      await FileSystem.makeDirectoryAsync(dir, { intermediates: true }).catch(() => {});
-      const stamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-');
-      await FileSystem.downloadAsync(url, `${dir}session-audio-${stamp}.m4a`);
-    } catch {
-      // best-effort — the cloud copy is the durable one
-    }
-  };
-
   // Hold a captured file for upload-at-end (mirrored to disk so a force-quit /
   // dead battery still uploads next launch). Nothing uploads until finishSession.
   const addPending = (uri: string, kind: 'video' | 'audio', dur?: number) => {
@@ -1175,40 +1036,11 @@ export default function HomeScreen() {
     }
   };
 
-  // Upload everything held for this session, then clear the on-disk queue. Runs
-  // at session end (or on next launch after a crash). Sequential so we don't
-  // hammer the server with parallel multipart uploads.
-  const flushPending = async (sessionId: string | null) => {
-    const items = pendingMediaRef.current.splice(0);
-    for (const it of items) {
-      const at = it.lat != null && it.lng != null ? { latitude: it.lat, longitude: it.lng } : null;
-      try {
-        if (it.kind === 'audio') await uploadAudioToHistory(it.uri, sessionId, at);
-        else await uploadRecording(it.uri, sessionId, at, { historyOnly: true, durationSec: it.dur });
-      } catch {
-        // best-effort; each uploader already retries internally
-      }
-    }
-    // Have the server stitch this session's parts into ONE video and ONE audio
-    // (the audio chunks live server-side already). History then shows a single
-    // recording of each kind per session. Best-effort: on failure the parts
-    // simply remain as-is.
-    if (sessionId) {
-      try {
-        const serverUrl = await getServerUrl();
-        const gold = await isGold();
-        const res = await fetchWithAuth(`${serverUrl}/merge`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sessionId, gold }),
-        });
-        const merged = res.ok ? await res.json().catch(() => null) : null;
-        // Auto-save the full-session audio into the Files app.
-        if (merged?.audioUrl && !IS_WEB) await saveAudioUrlToFiles(merged.audioUrl);
-      } catch {
-        // parts stay as separate entries — still complete evidence
-      }
-    }
+  // Recording delivery removed: nothing uploads at session end anymore. The
+  // held-segment queue still exists so camera-mode segments reach the camera
+  // roll; this just clears the on-disk queue when the session is done.
+  const flushPending = async (_sessionId: string | null) => {
+    pendingMediaRef.current = [];
     await AsyncStorage.removeItem(PENDING_MEDIA_KEY).catch(() => {});
   };
 
@@ -1365,9 +1197,8 @@ export default function HomeScreen() {
   };
 
   // Ends the live session. reason 'manual' = the user tapped End; reason 'auto'
-  // = the chosen recording length elapsed. Either way this is the ONE place that
-  // uploads: it stops the segment loop, waits for the final held segment, then
-  // flushes all held video + audio to Gold history. Guarded against double-run.
+  // = the chosen session length elapsed. Stops the streams and the segment
+  // loop, then tears everything down. Guarded against double-run.
   const finishSession = (reason: 'manual' | 'auto') => {
     if (!showCamera && !sessionIdRef.current) return;
     if (finishingRef.current) return;
@@ -1408,23 +1239,17 @@ export default function HomeScreen() {
     locationSub.current = null;
     const doneWaiter = loopDoneRef.current;
 
-    // Do the heavy work off the UI path: wait for the loop's final segment, stop
-    // background systems, hold the last audio, then upload EVERYTHING held.
-    // LiveKit mode has no local recording pipeline — just stop location.
+    // Do the heavy work off the UI path: wait for the loop's final segment and
+    // stop background systems. Nothing uploads — sessions are live-only now.
     (async () => {
       if (!IS_WEB) stopBackgroundLocation().catch(() => {});
-      if (wasLiveKit) {
-        // The server records LiveKit sessions via egress; the MP4 is finalized a
-        // little after the session ends. Poll for it, then save to camera roll.
-        if (!IS_WEB && endedSessionId) saveLiveKitRecordingWhenReady(endedSessionId);
-        return;
-      }
+      if (wasLiveKit) return; // no local pipeline in LiveKit mode
       if (doneWaiter) {
         await Promise.race([doneWaiter, new Promise(r => setTimeout(r, 4000))]);
       }
       if (!IS_WEB) {
-        // Wait (bounded) for the FINAL in-flight audio chunk to upload before
-        // merging — it holds the last seconds of the session.
+        // Wait (bounded) for the FINAL in-flight live-audio chunk so the live
+        // page has the last seconds of sound.
         await Promise.race([stopChunkedAudio(), new Promise(r => setTimeout(r, 7000))]);
       }
       await flushPending(endedSessionId);
@@ -1473,31 +1298,12 @@ export default function HomeScreen() {
     // ("✅ <name> is safe."), no extra prompt. Only the user can end alerts,
     // and ending them means they're safe.
     sendSafeNotification();
-    if (wasLiveKit) {
-      Alert.alert(
-        "You're marked safe",
-        'Your circle has been told you\'re safe. The live stream has stopped and the recording is being saved to your history and camera roll.',
-        [
-          { text: 'View in history', onPress: () => router.push('/history') },
-          { text: 'OK', style: 'cancel' },
-        ],
-      );
-      return;
-    }
-    isGold().then(gold => {
-      Alert.alert(
-        "You're marked safe",
-        gold
-          ? "Your circle has been told you're safe. The recording is saved to your camera roll and your Gold history."
-          : "Your circle has been told you're safe. The recording is saved to your camera roll (your circle's download link lasts 24h).",
-        [
-          gold
-            ? { text: 'View in history', onPress: () => router.push('/history') }
-            : { text: 'Keep for 90 days with Gold', onPress: () => router.push('/gold-plans') },
-          { text: 'OK', style: 'cancel' },
-        ],
-      );
-    });
+    Alert.alert(
+      "You're marked safe",
+      wasLiveKit
+        ? "Your circle has been told you're safe and the live stream has stopped."
+        : "Your circle has been told you're safe. Video captured on this phone is in your camera roll.",
+    );
   };
 
   const handleEnd = () => finishSession('manual');

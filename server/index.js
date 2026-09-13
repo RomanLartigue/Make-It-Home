@@ -41,7 +41,11 @@ const {
 } = process.env;
 
 const LIVEKIT_ENABLED = !!(LIVEKIT_URL && LIVEKIT_API_KEY && LIVEKIT_API_SECRET);
-const EGRESS_ENABLED = !!(LIVEKIT_ENABLED && R2_ENDPOINT && R2_ACCESS_KEY_ID && R2_SECRET_ACCESS_KEY && R2_BUCKET);
+// Recording is REMOVED (product/cost decision, Sept 2026): sessions are
+// live-only — the circle watches in real time and can screen-record the live
+// page for a copy. Hard-off regardless of R2 credentials so no egress compute
+// or storage is ever billed. Flip back to the credential check to re-enable.
+const EGRESS_ENABLED = false;
 
 // ── Required config check (fail fast) ─────────────────────────────────────────
 // Runs before the Twilio client is constructed so a missing credential produces
@@ -1966,9 +1970,7 @@ app.get('/live/:sessionId', async (req, res) => {
           document.getElementById('livehdr').textContent = 'SESSION ENDED';
           document.getElementById('livehdr').style.color = '#9aa4b2';
           document.getElementById('respond').innerHTML = '<div class="acked">Session ended</div>';
-          if (!gotFrame) waiting.innerHTML = IS_LK
-            ? 'Session ended. The live stream has stopped.'
-            : 'Session ended.<br>The recording appears below when it finishes uploading.';
+          if (!gotFrame) waiting.innerHTML = 'Session ended. The live stream has stopped.';
         }
         if (s.acknowledged && !isEnded) document.getElementById('respond').innerHTML = '<div class="acked">✓ Someone is on their way</div>';
         var dl = document.getElementById('dlwrap');

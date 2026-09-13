@@ -19,7 +19,7 @@
       "supportsTablet": false,
       "bundleIdentifier": "com.makeithome.app",
       "infoPlist": {
-        "NSCameraUsageDescription": "Make It Home uses the camera during safety sessions so your safety circle can see your surroundings live and in the saved recording.",
+        "NSCameraUsageDescription": "Make It Home uses the camera during safety sessions so your safety circle can see your surroundings live.",
         "NSMicrophoneUsageDescription": "Make It Home records audio during safety sessions so your safety circle receives a video of your surroundings.",
         "NSContactsUsageDescription": "Make It Home uses your contacts so you can add trusted people to your safety circle.",
         "ITSAppUsesNonExemptEncryption": false,
