@@ -1,5 +1,16 @@
 import React, { useState, useRef } from 'react';
-import { View, Text, TextInput, StyleSheet, Animated, Pressable } from 'react-native';
+import {
+  View,
+  Text,
+  TextInput,
+  StyleSheet,
+  Animated,
+  Pressable,
+  KeyboardAvoidingView,
+  Keyboard,
+  Platform,
+  ScrollView,
+} from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
 import * as Location from 'expo-location';
@@ -58,7 +69,22 @@ export default function OnboardingScreen() {
 
   return (
     <SafeAreaView style={styles.root}>
-      <Animated.View style={[styles.content, { opacity: fade }]}>
+      {/* Keyboard-safe layout: the view shrinks to sit above ANY keyboard size
+          (large accessibility keyboards included), the content scrolls when it
+          doesn't fit, and tapping anywhere outside the field dismisses the
+          keyboard. */}
+      <KeyboardAvoidingView
+        style={{ flex: 1 }}
+        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      >
+        <ScrollView
+          contentContainerStyle={styles.scroll}
+          keyboardShouldPersistTaps="handled"
+          keyboardDismissMode="interactive"
+          showsVerticalScrollIndicator={false}
+        >
+          <Pressable style={styles.tapCatcher} onPress={Keyboard.dismiss} accessible={false}>
+            <Animated.View style={[styles.content, { opacity: fade }]}>
         {step === 0 && (
           <View style={styles.ob}>
             <Dots active={0} />
@@ -134,14 +160,19 @@ export default function OnboardingScreen() {
             </Pressable>
           </View>
         )}
-      </Animated.View>
+            </Animated.View>
+          </Pressable>
+        </ScrollView>
+      </KeyboardAvoidingView>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: Beacon.night },
-  content: { flex: 1, justifyContent: 'center', paddingHorizontal: 28 },
+  scroll: { flexGrow: 1 },
+  tapCatcher: { flex: 1, justifyContent: 'center', paddingHorizontal: 28, paddingVertical: 24 },
+  content: {},
   ob: { gap: 13 },
   dots: { flexDirection: 'row', gap: 6, marginBottom: 4 },
   dot: { width: 22, height: 4, borderRadius: 2, backgroundColor: Beacon.line },

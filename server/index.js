@@ -488,6 +488,7 @@ app.use(async (req, res, next) => {
     req.path === '/terms' ||
     req.path.startsWith('/media/') ||
     req.path.startsWith('/live/') ||
+    req.path.startsWith('/l/') ||
     req.path.startsWith('/ack/') ||
     (req.method === 'GET' && req.path.startsWith('/frame/')) ||
     (req.method === 'GET' && req.path.startsWith('/audiochunk/')) ||
@@ -579,13 +580,19 @@ async function sendSmsToAll(phones, body) {
 // Redis holds the metadata so timers can be restored after a restart.
 const checkIns = new Map(); // id → { timeout, phones, name, latitude, longitude, expiresAt }
 
+// SMS COST NOTE (applies to every template here): carriers bill per SEGMENT —
+// 160 chars for plain GSM text, but ONE emoji (or curly quote/em dash) drops
+// that to 67 chars/segment. Emoji on the long alert texts made each one 4
+// segments (~5c). Long templates are therefore plain GSM and kept tight; the
+// short "safe" texts keep their ✅ (they fit one segment either way).
 function buildAlertBody(name, latitude, longitude) {
   const who = name?.trim() || 'Someone';
+  // 5 decimals ≈ 1m precision — full-precision floats waste a whole segment.
   const mapsLink =
     latitude != null && longitude != null
-      ? `\n\nLast known location: https://maps.google.com/?q=${latitude},${longitude}`
+      ? `\nLast seen: https://maps.google.com/?q=${Number(latitude).toFixed(5)},${Number(longitude).toFixed(5)}`
       : '';
-  return `⏰ Make It Home: ${who} missed their check-in. Please check on them.${mapsLink} Reply STOP to opt out.`;
+  return `Make It Home: ${who} missed their check-in. Please check on them.${mapsLink}\nReply STOP to opt out.`;
 }
 
 function scheduleAlert(id, entry, delayMs) {
@@ -1058,6 +1065,25 @@ async function sessionGet(sessionId) {
   return sessionsMemory.get(sessionId) ?? null;
 }
 
+// Short live links: /l/<code> → /live/<sessionId>. Exists purely to keep SMS
+// to one billable segment (the full Railway URL + session id is ~100 chars by
+// itself). Codes carry 48 bits of randomness — unguessable like session ids.
+const SHORT_PREFIX = 'short:';
+const shortsMemory = new Map();
+async function shortSet(code, sessionId) {
+  if (redis) await redisSet(`${SHORT_PREFIX}${code}`, sessionId, SESSION_TTL);
+  else shortsMemory.set(code, sessionId);
+}
+async function shortGet(code) {
+  if (redis) return redisGet(`${SHORT_PREFIX}${code}`);
+  return shortsMemory.get(code) ?? null;
+}
+// Prefer the short form wherever a session is linked in an SMS; sessions from
+// old app builds (no shortId) keep getting the long link.
+function liveLinkFor(sessionId, session) {
+  return session?.shortId ? `${SERVER_URL}/l/${session.shortId}` : `${SERVER_URL}/live/${sessionId}`;
+}
+
 async function sessionDel(sessionId) {
   if (redis) {
     await redisDel(`${SESSION_PREFIX}${sessionId}`);
@@ -1084,11 +1110,11 @@ function cleanTierName(s) {
 // ask the circle to CHECK ON the user, they don't scream emergency.
 function sessionBody(name, liveLink) {
   const who = name || 'Your contact';
-  return `🏠 Make It Home: ${who} started a safety session and wants you to keep an eye on them.\n\nWatch live: ${liveLink}\n\nReply STOP to opt out.`;
+  return `Make It Home: ${who} started a safety session. Watch live: ${liveLink}\nReply STOP to opt out.`;
 }
 function sessionBodyEscalated(name, liveLink) {
   const who = name || 'Your contact';
-  return `🔔 ${who}'s safety session is still going and they haven't marked themselves safe yet. Please check on them.\n\nWatch live: ${liveLink}\n\nReply STOP to opt out.`;
+  return `${who} hasn't marked themselves safe yet - please check on them: ${liveLink}\nReply STOP to opt out.`;
 }
 
 // Validate the client's tier grouping against the device's stored circle, drop
@@ -1233,7 +1259,7 @@ async function escalationSweep() {
       // batch read at the top of the sweep.
       const pre = await sessionGet(sessionId);
       if (!pre || pre.ended) continue;
-      const liveLink = `${SERVER_URL}/live/${sessionId}`;
+      const liveLink = liveLinkFor(sessionId, s);
       const result = await sendSmsToAll(next.phones, sessionBodyEscalated(s.name, liveLink));
       const at = Date.now();
       await commitSweepProgress(sessionId, fresh => {
@@ -1256,11 +1282,11 @@ async function escalationSweep() {
     if (!phones.length) continue;
     const pre = await sessionGet(sessionId);
     if (!pre || pre.ended) continue;
-    const liveLink = `${SERVER_URL}/live/${sessionId}`;
+    const liveLink = liveLinkFor(sessionId, s);
     const nm = cleanName(s.name) || 'Your contact';
     const result = await sendSmsToAll(
       phones,
-      `⏰ ${nm}'s check-in time has passed and they haven't marked themselves safe. Please check on them.\n\nLive location & video: ${liveLink}\n\nReply STOP to opt out.`,
+      `${nm}'s check-in time has passed - please check on them: ${liveLink}\nReply STOP to opt out.`,
     );
     const at = Date.now();
     await commitSweepProgress(sessionId, fresh => { fresh.cycleAt = at; });
@@ -1309,6 +1335,7 @@ app.post('/session/start', async (req, res) => {
   // Bind this session to the creating device so only it can update/end it.
   const ownerToken = String(req.headers['x-mih-key'] || '');
   const now = Date.now();
+  const shortId = crypto.randomBytes(6).toString('base64url'); // 8 chars, 48 bits
   tiers[0].alertedAt = now; // first tier is alerted immediately, below
   await sessionSet(sessionId, {
     name: nm,
@@ -1321,12 +1348,14 @@ app.post('/session/start', async (req, res) => {
     acknowledged: false,
     ackedAt: null,
     livekit: LIVEKIT_ENABLED && livekit === true,
+    shortId,
   });
+  await shortSet(shortId, sessionId);
 
   // In-memory fallback: expire after 24h
   if (!redis) setTimeout(() => sessionsMemory.delete(sessionId), SESSION_TTL * 1000);
 
-  const liveLink = `${SERVER_URL}/live/${sessionId}`;
+  const liveLink = `${SERVER_URL}/l/${shortId}`;
   const result = await sendSmsToAll(tiers[0].phones, sessionBody(nm, liveLink));
   if (result.sent === 0) {
     console.error(`[/session/start] ${sessionId} tier1 all sends failed:`, result.errors.join('; '));
@@ -1781,6 +1810,16 @@ app.post('/ack/:sessionId', async (req, res) => {
   res.redirect(303, `/live/${sessionId}`);
 });
 
+// GET /l/:code — short live link (SMS cost: keeps alert texts to one segment).
+// 302s to the real live page; expired/unknown codes get a friendly note.
+app.get('/l/:code', async (req, res) => {
+  const code = String(req.params.code || '');
+  if (!/^[\w-]{6,20}$/.test(code)) return res.status(404).send('Not found.');
+  const sid = await shortGet(code);
+  if (!sid) return res.status(404).send('This link has expired.');
+  res.redirect(302, `/live/${encodeURIComponent(sid)}`);
+});
+
 // GET /live/:sessionId
 app.get('/live/:sessionId', async (req, res) => {
   const sessionId = req.params.sessionId;
@@ -2031,7 +2070,7 @@ app.post('/test', async (req, res) => {
   if (r.error) return res.status(r.status).json({ error: r.error });
   const recipients = r.recipients;
   const who = cleanName(name) || 'Someone';
-  const body = `🧪 TEST — ${who} is testing Make It Home. This is only a test, NOT a real emergency — no action needed. Reply STOP to opt out.`;
+  const body = `TEST - ${who} is testing Make It Home. This is only a test, NOT a real emergency - no action needed. Reply STOP to opt out.`;
   const result = await sendSmsToAll(recipients, body);
   if (result.sent === 0) {
     console.error('[/test] All sends failed:', result.errors.join('; '));
