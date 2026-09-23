@@ -17,6 +17,8 @@ import * as Location from 'expo-location';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 import { setUserName } from '@/utils/serverUrl';
+import { setMyPhone } from '@/utils/push';
+import { toE164 } from '@/utils/phoneNumber';
 import { Beacon } from '@/constants/beacon';
 import { PillButton } from '@/components/beacon/kit';
 
@@ -27,6 +29,8 @@ export default function OnboardingScreen() {
   const fade = useRef(new Animated.Value(1)).current;
   const [step, setStep] = useState(0);
   const [name, setName] = useState('');
+  const [phone, setPhone] = useState('');
+  const [phoneErr, setPhoneErr] = useState<string | null>(null);
   const [locLabel, setLocLabel] = useState('Location is off');
   const [locGranted, setLocGranted] = useState(false);
 
@@ -39,8 +43,25 @@ export default function OnboardingScreen() {
 
   const finish = async () => {
     if (name.trim()) await setUserName(name.trim());
+    // Registering the number makes THIS phone reachable by push: whenever
+    // someone's safety circle contains it, sliding their beacon reaches this
+    // device as a free notification instead of a text. Best-effort — a
+    // skipped or failed registration just means texts, never a blocked user.
+    const e164 = toE164(phone.trim());
+    if (e164) setMyPhone(e164).catch(() => {});
     await AsyncStorage.setItem(ONBOARDED_KEY, 'true');
     router.replace('/(tabs)');
+  };
+
+  const continueFromName = () => {
+    if (!name.trim()) return;
+    const raw = phone.trim();
+    if (raw && !toE164(raw)) {
+      setPhoneErr('That number doesn’t look right — e.g. 212 555 1234. You can also leave it empty.');
+      return;
+    }
+    setPhoneErr(null);
+    goStep(1);
   };
 
   const allowLocation = async () => {
@@ -101,11 +122,28 @@ export default function OnboardingScreen() {
               autoCapitalize="words"
               autoFocus
               returnKeyType="next"
-              onSubmitEditing={() => name.trim() && goStep(1)}
             />
+            <Text style={styles.p}>
+              And your phone number — when someone adds you to their safety circle, their alerts
+              reach you right here as notifications instead of texts. (Optional)
+            </Text>
+            <TextInput
+              style={styles.input}
+              value={phone}
+              onChangeText={t => {
+                setPhone(t);
+                setPhoneErr(null);
+              }}
+              placeholder="Your phone number (optional)"
+              placeholderTextColor={Beacon.faint}
+              keyboardType="phone-pad"
+              returnKeyType="done"
+              onSubmitEditing={continueFromName}
+            />
+            {phoneErr ? <Text style={styles.err}>{phoneErr}</Text> : null}
             <PillButton
               title="Continue"
-              onPress={() => name.trim() && goStep(1)}
+              onPress={continueFromName}
               style={{ marginTop: 14, opacity: name.trim() ? 1 : 0.5 }}
             />
           </View>
@@ -179,6 +217,7 @@ const styles = StyleSheet.create({
   dotOn: { width: 30, backgroundColor: Beacon.beacon },
   h2: { fontSize: 24, fontWeight: '800', color: Beacon.text, letterSpacing: -0.4 },
   p: { color: Beacon.muted, fontSize: 13.5, lineHeight: 20 },
+  err: { color: Beacon.hot, fontSize: 12.5, lineHeight: 18 },
   input: {
     marginTop: 4,
     backgroundColor: Beacon.surface,
