@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { View, Text, StyleSheet, Animated, Easing } from 'react-native';
+import { View, Text, StyleSheet, Animated, Easing, AppState } from 'react-native';
 import { GestureDetector, Gesture } from 'react-native-gesture-handler';
 import Ionicons from '@expo/vector-icons/Ionicons';
 
@@ -52,10 +52,19 @@ export function DragBeacon({
     onConfirmRef.current = onConfirm;
   });
 
+  // The endless JS-driven loop must PAUSE when the app isn't foreground: it
+  // keeps posting main-thread UI work, which delayed process exit past iOS's
+  // 5s watchdog on a tester's device (0x8BADF00D "failed to terminate").
+  const [appActive, setAppActive] = useState(AppState.currentState === 'active');
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', s => setAppActive(s === 'active'));
+    return () => sub.remove();
+  }, []);
+
   // Idle breathing pulse (JS driver — the transform also carries xy, which must
   // be JS-driven; mixing drivers on one view throws).
   useEffect(() => {
-    if (armed || disabled) {
+    if (!appActive || armed || disabled) {
       pulse.stopAnimation();
       pulse.setValue(1);
       return;
@@ -68,7 +77,7 @@ export function DragBeacon({
     );
     anim.start();
     return () => anim.stop();
-  }, [armed, disabled, pulse]);
+  }, [armed, disabled, pulse, appActive]);
 
   const gesture = useRef(
     Gesture.Pan()

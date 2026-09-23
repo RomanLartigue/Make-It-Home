@@ -161,31 +161,49 @@ export default function CircleScreen() {
 
   // Opens the OS's native contact picker (like other apps). No custom list and
   // no full contacts-permission prompt needed — the user picks one contact.
+  //
+  // CRITICAL ORDER: the picker must NOT be presented while our RN Modal sheet
+  // is still up — iOS deadlocks when the native picker and an RN Modal fight
+  // over presentation, and tapping a contact froze the whole app (tester
+  // report, build 44). So: close the sheet, let it fully dismiss, present the
+  // picker, then reopen the sheet with the picked values filled in.
   const pickFromContacts = async () => {
     hTap();
+    setMode('closed');
+    await new Promise(r => setTimeout(r, 600)); // let the RN Modal fully dismiss
+    let pickedName = '';
+    let e164: string | null = null;
+    let cancelled = false;
+    let failed = false;
     try {
       const contact = await Contacts.presentContactPickerAsync();
-      if (!contact) return; // cancelled
-      // iOS often returns firstName/lastName without a composed `name` field —
-      // build one ourselves so the picked person isn't labeled "Unknown".
-      const pickedName =
-        contact.name ||
-        [contact.firstName, contact.middleName, contact.lastName].filter(Boolean).join(' ') ||
-        contact.company ||
-        '';
-      const raw = contact.phoneNumbers?.[0]?.number ?? '';
-      const e164 = toE164(raw);
-      if (!e164) {
-        Alert.alert(
-          'No usable number',
-          `${pickedName || 'That contact'} doesn't have a number we can use — pick another, or type it in above.`,
-        );
-        return;
+      if (!contact) {
+        cancelled = true; // user backed out — reopen the sheet as it was
+      } else {
+        // iOS often returns firstName/lastName without a composed `name` field —
+        // build one ourselves so the picked person isn't labeled "Unknown".
+        pickedName =
+          contact.name ||
+          [contact.firstName, contact.middleName, contact.lastName].filter(Boolean).join(' ') ||
+          contact.company ||
+          '';
+        e164 = toE164(contact.phoneNumbers?.[0]?.number ?? '');
       }
+    } catch {
+      failed = true;
+    }
+    if (e164) {
       setName(pickedName);
       setPhone(e164);
-    } catch {
+    }
+    setMode('form'); // the user was mid-add — always bring the sheet back
+    if (failed) {
       Alert.alert('Couldn’t open contacts', 'Try again, or just type the number in above.');
+    } else if (!cancelled && !e164) {
+      Alert.alert(
+        'No usable number',
+        `${pickedName || 'That contact'} doesn't have a number we can use — pick another, or type it in above.`,
+      );
     }
   };
 

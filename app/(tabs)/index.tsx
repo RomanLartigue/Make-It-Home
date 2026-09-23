@@ -347,9 +347,18 @@ export default function HomeScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Endless JS-driven pulse loops must PAUSE when the app isn't foreground —
+  // they keep posting main-thread UI work, which delayed process exit past
+  // iOS's 5s watchdog on a tester's device (0x8BADF00D report).
+  const [appActive, setAppActive] = useState(AppState.currentState === 'active');
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', s => setAppActive(s === 'active'));
+    return () => sub.remove();
+  }, []);
+
   // Idle beacon pulse
   useEffect(() => {
-    if (armed || showCamera || checkInActive) {
+    if (!appActive || armed || showCamera || checkInActive) {
       pulse.stopAnimation();
       pulse.setValue(1);
       return;
@@ -375,10 +384,15 @@ export default function HomeScreen() {
     );
     anim.start();
     return () => anim.stop();
-  }, [armed, showCamera, checkInActive, pulse]);
+  }, [armed, showCamera, checkInActive, pulse, appActive]);
 
   // Live pulse for camera / check-in overlays
   useEffect(() => {
+    if (!appActive) {
+      livePulse.stopAnimation();
+      livePulse.setValue(1);
+      return;
+    }
     const anim = Animated.loop(
       Animated.sequence([
         Animated.timing(livePulse, { toValue: 1.1, duration: 700, useNativeDriver: false }),
@@ -387,7 +401,7 @@ export default function HomeScreen() {
     );
     anim.start();
     return () => anim.stop();
-  }, [livePulse]);
+  }, [livePulse, appActive]);
 
   // Recording elapsed timer
   useEffect(() => {
@@ -1425,32 +1439,8 @@ export default function HomeScreen() {
             // startSession owns that status, and overwriting a 'reconnecting'/
             // 'error' here would show "Circle alerted" when no texts went out.
             trace('livekit-connected');
-            // Ask the server to record the room. The room + published tracks need
-            // a moment to fully register in LiveKit before egress can attach, so
-            // wait a beat, then retry a few times if it isn't recording yet.
-            const sid = sessionIdRef.current;
-            if (!sid) return;
-            (async () => {
-              const serverUrl = await getServerUrl();
-              await new Promise(r => setTimeout(r, 2500));
-              for (let attempt = 0; attempt < 4; attempt++) {
-                if (sessionIdRef.current !== sid) return;
-                try {
-                  const res = await fetchWithAuth(`${serverUrl}/livekit/start-egress`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ sessionId: sid }),
-                  });
-                  const j = await res.json().catch(() => null);
-                  if (j?.recording) { trace('egress-started'); return; }
-                  trace(`egress-retry-${attempt}`);
-                } catch {
-                  trace(`egress-error-${attempt}`);
-                }
-                await new Promise(r => setTimeout(r, 3000));
-              }
-              trace('egress-gaveup');
-            })();
+            // (Recording removed — sessions are live-only, so there is no
+            // egress to start anymore.)
           }}
           onError={m => trace(`livekit-error: ${m}`)}
         />
