@@ -600,6 +600,49 @@ async function sendExpoPushes(messages) {
   }
 }
 
+// Follow-up delivery guarantee: ~25s after a push is ACCEPTED, ask Expo for the
+// receipts. A receipt that reports an error means the push never reached the
+// phone — send that person the SMS after all (and forget dead tokens). A
+// receipt that is merely missing is still in flight: leave it alone rather
+// than risk double-alerting.
+function verifyPushReceipts(items, body) {
+  setTimeout(async () => {
+    try {
+      const controller = new AbortController();
+      const t = setTimeout(() => controller.abort(), 10_000);
+      const res = await fetch('https://exp.host/--/api/v2/push/getReceipts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: items.map(i => i.id) }),
+        signal: controller.signal,
+      });
+      clearTimeout(t);
+      if (!res.ok) return;
+      const receipts = (await res.json().catch(() => null))?.data || {};
+      const failedPhones = [];
+      for (const it of items) {
+        const r = receipts[it.id];
+        if (r && r.status === 'error') {
+          failedPhones.push(it.to);
+          if (r?.details?.error === 'DeviceNotRegistered') pushTokenDel(it.to).catch(() => {});
+          console.error(`[push] receipt error (${r?.details?.error || r?.message || 'unknown'}) — falling back to SMS.`);
+        }
+      }
+      if (failedPhones.length && twilioClient) {
+        const results = await Promise.allSettled(
+          failedPhones.map(to =>
+            Promise.resolve().then(() => twilioClient.messages.create({ body, from: TWILIO_PHONE_NUMBER, to })),
+          ),
+        );
+        const ok = results.filter(r => r.status === 'fulfilled').length;
+        console.log(`[push] receipt fallback: SMS sent ${ok}/${failedPhones.length}.`);
+      }
+    } catch {
+      // best-effort — the ticket-stage fallback already covered hard failures
+    }
+  }, 25_000);
+}
+
 // ── Shared helpers ────────────────────────────────────────────────────────────
 // Delivers an alert to every recipient independently so one bad number (stale
 // entry, carrier reject) can't blackhole the whole alert. App-registered
@@ -619,7 +662,12 @@ async function sendSmsToAll(phones, body) {
     // Push copy: same message minus the SMS-only STOP suffix; the live link
     // rides along as data so tapping the notification opens it.
     const url = (body.match(/https?:\/\/\S+/) || [null])[0];
-    const pushBody = body.replace(/\s*Reply STOP to opt out\.?\s*$/i, '').trim();
+    // Push copy polish: the notification title already says "Make It Home",
+    // and STOP is an SMS concept.
+    const pushBody = body
+      .replace(/^Make It Home: /, '')
+      .replace(/\s*Reply STOP to opt out\.?\s*$/i, '')
+      .trim();
     const tickets = await sendExpoPushes(
       pushTargets.map(p => ({
         to: p.token,
@@ -634,9 +682,11 @@ async function sendSmsToAll(phones, body) {
       // Expo API unreachable — the alert MUST still land: SMS everyone.
       smsTargets = smsTargets.concat(pushTargets.map(p => p.to));
     } else {
+      const accepted = [];
       tickets.forEach((tk, i) => {
         if (tk && tk.status === 'ok') {
           pushSent++;
+          if (tk.id) accepted.push({ id: tk.id, to: pushTargets[i].to });
         } else {
           // Bad ticket → SMS fallback; dead tokens are forgotten so the next
           // alert goes straight to SMS without the detour.
@@ -644,6 +694,12 @@ async function sendSmsToAll(phones, body) {
           if (tk?.details?.error === 'DeviceNotRegistered') pushTokenDel(pushTargets[i].to).catch(() => {});
         }
       });
+      // An "ok" TICKET only means Expo accepted the message — actual delivery
+      // to Apple can still fail (dead install, revoked permission, credential
+      // problems), and that failure only shows up in the RECEIPT. For a safety
+      // alert, silently-lost is the one unacceptable outcome, so check the
+      // receipts shortly after and text anyone whose push truly failed.
+      if (accepted.length) verifyPushReceipts(accepted, body);
     }
     if (pushSent) console.log(`[push] delivered ${pushSent}/${pushTargets.length} as free push.`);
   }
