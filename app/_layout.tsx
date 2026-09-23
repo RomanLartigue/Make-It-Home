@@ -2,13 +2,15 @@ import { ThemeProvider } from '@react-navigation/native';
 import { Stack } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
-import { View, StyleSheet, Platform } from 'react-native';
+import { View, StyleSheet, Platform, Linking } from 'react-native';
 import 'react-native-gesture-handler';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { useEffect } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as Notifications from 'expo-notifications';
 
 import { getDeviceToken, syncCircle } from '@/utils/serverUrl';
+import { registerPushForAlerts } from '@/utils/push';
 import { BeaconNavTheme } from '@/constants/theme';
 import { Beacon } from '@/constants/beacon';
 // Registers the background-location task at launch (TaskManager.defineTask must
@@ -38,6 +40,26 @@ export default function RootLayout() {
       }
       if (phones.length) syncCircle(phones);
     })();
+  }, []);
+
+  // Circle alerts as push: refresh this device's registration each launch (a
+  // no-op unless the user saved their number in Settings), and open the live
+  // link when a circle-alert notification is tapped — from a running app or a
+  // cold start.
+  useEffect(() => {
+    if (Platform.OS === 'web') return;
+    registerPushForAlerts().catch(() => {});
+    const openFrom = (resp: Notifications.NotificationResponse | null) => {
+      const url = resp?.notification?.request?.content?.data?.url;
+      if (typeof url === 'string' && /^https:\/\//.test(url)) {
+        Linking.openURL(url).catch(() => {});
+      }
+    };
+    const sub = Notifications.addNotificationResponseReceivedListener(openFrom);
+    Notifications.getLastNotificationResponseAsync()
+      .then(openFrom)
+      .catch(() => {});
+    return () => sub.remove();
   }, []);
 
   // NOTE: a session left behind by a force-kill is cleaned up by the Home

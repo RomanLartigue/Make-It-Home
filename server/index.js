@@ -554,25 +554,122 @@ function cleanName(name) {
   return (typeof name === 'string' ? name : '').trim().slice(0, 100);
 }
 
+// ── Push notifications (Expo push service) ───────────────────────────────────
+// Hybrid delivery: a circle member who has the app registers their own phone
+// number + Expo push token (POST /push/register). Any alert addressed to that
+// number is then delivered as a FREE push notification instead of a billed SMS,
+// with automatic SMS fallback if the push fails. Alerts to numbers without the
+// app are plain SMS, exactly as before — no circle member ever needs the app.
+const PUSH_PREFIX = 'push:';
+const PUSH_TTL = 180 * 24 * 60 * 60; // re-registered on every app launch
+const pushMemory = new Map();
+
+async function pushTokenGet(phone) {
+  if (redis) return redisGet(`${PUSH_PREFIX}${phone}`);
+  return pushMemory.get(phone) ?? null;
+}
+async function pushTokenSet(phone, token) {
+  if (redis) await redisSet(`${PUSH_PREFIX}${phone}`, token, PUSH_TTL);
+  else pushMemory.set(phone, token);
+}
+async function pushTokenDel(phone) {
+  if (redis) await redisDel(`${PUSH_PREFIX}${phone}`);
+  else pushMemory.delete(phone);
+}
+
+// Send a batch of pushes through Expo's push API. Returns per-message tickets
+// aligned with the input order; a thrown/failed request returns null (callers
+// treat that as "fall back to SMS for everyone in the batch").
+async function sendExpoPushes(messages) {
+  if (!messages.length) return [];
+  try {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 10_000);
+    const res = await fetch('https://exp.host/--/api/v2/push/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(messages),
+      signal: controller.signal,
+    });
+    clearTimeout(t);
+    if (!res.ok) return null;
+    const json = await res.json().catch(() => null);
+    return Array.isArray(json?.data) ? json.data : null;
+  } catch {
+    return null;
+  }
+}
+
 // ── Shared helpers ────────────────────────────────────────────────────────────
-// Sends to every recipient independently so one bad number (stale entry, carrier
-// reject) can't blackhole the whole alert. Returns a summary; never throws.
+// Delivers an alert to every recipient independently so one bad number (stale
+// entry, carrier reject) can't blackhole the whole alert. App-registered
+// numbers get a push (free); the rest get SMS; failed pushes fall back to SMS.
+// Returns a summary; never throws.
 async function sendSmsToAll(phones, body) {
+  const pushTargets = [];
+  let smsTargets = [];
+  for (const to of phones) {
+    const token = await pushTokenGet(to);
+    if (token) pushTargets.push({ to, token });
+    else smsTargets.push(to);
+  }
+
+  let pushSent = 0;
+  if (pushTargets.length) {
+    // Push copy: same message minus the SMS-only STOP suffix; the live link
+    // rides along as data so tapping the notification opens it.
+    const url = (body.match(/https?:\/\/\S+/) || [null])[0];
+    const pushBody = body.replace(/\s*Reply STOP to opt out\.?\s*$/i, '').trim();
+    const tickets = await sendExpoPushes(
+      pushTargets.map(p => ({
+        to: p.token,
+        title: 'Make It Home',
+        body: pushBody,
+        sound: 'default',
+        priority: 'high',
+        data: url ? { url } : {},
+      })),
+    );
+    if (!tickets) {
+      // Expo API unreachable — the alert MUST still land: SMS everyone.
+      smsTargets = smsTargets.concat(pushTargets.map(p => p.to));
+    } else {
+      tickets.forEach((tk, i) => {
+        if (tk && tk.status === 'ok') {
+          pushSent++;
+        } else {
+          // Bad ticket → SMS fallback; dead tokens are forgotten so the next
+          // alert goes straight to SMS without the detour.
+          smsTargets.push(pushTargets[i].to);
+          if (tk?.details?.error === 'DeviceNotRegistered') pushTokenDel(pushTargets[i].to).catch(() => {});
+        }
+      });
+    }
+    if (pushSent) console.log(`[push] delivered ${pushSent}/${pushTargets.length} as free push.`);
+  }
+
+  if (!smsTargets.length) return { sent: pushSent, failed: 0, errors: [], viaPush: pushSent, viaSms: 0 };
   if (!twilioClient) {
-    return { sent: 0, failed: phones.length, errors: ['Twilio not configured on the server.'] };
+    return {
+      sent: pushSent,
+      failed: smsTargets.length,
+      errors: ['Twilio not configured on the server.'],
+      viaPush: pushSent,
+      viaSms: 0,
+    };
   }
   const results = await Promise.allSettled(
     // Promise.resolve().then(...) so a SYNCHRONOUS throw from create() becomes a
     // rejected promise (caught by allSettled) instead of escaping and crashing.
-    phones.map(to =>
+    smsTargets.map(to =>
       Promise.resolve().then(() => twilioClient.messages.create({ body, from: TWILIO_PHONE_NUMBER, to })),
     ),
   );
-  const sent = results.filter(r => r.status === 'fulfilled').length;
+  const smsSent = results.filter(r => r.status === 'fulfilled').length;
   const errors = results
     .filter(r => r.status === 'rejected')
     .map(r => r.reason?.message || String(r.reason));
-  return { sent, failed: errors.length, errors };
+  return { sent: pushSent + smsSent, failed: errors.length, errors, viaPush: pushSent, viaSms: smsSent };
 }
 
 // ── Check-in timer store ──────────────────────────────────────────────────────
@@ -2058,6 +2155,30 @@ app.post('/safe', async (req, res) => {
   }
   console.log(`[/safe] Sent ${result.sent}/${recipients.length}, ${result.failed} failed.`);
   res.json({ sent: result.sent, failed: result.failed });
+});
+
+// ── POST /push/register ───────────────────────────────────────────────────────
+// A circle member with the app registers "alerts to MY number should arrive as
+// push, not SMS": { phone: '+1...', token: 'ExponentPushToken[...]' }.
+// token '' (or null) removes the registration — back to SMS. Authed like every
+// other device call; re-called on each app launch to refresh the TTL.
+app.post('/push/register', async (req, res) => {
+  const phone = String(req.body?.phone || '').trim();
+  if (!/^\+\d{7,15}$/.test(phone)) {
+    return res.status(400).json({ error: 'Phone must be E.164 (e.g. +12125551234).' });
+  }
+  const token = req.body?.token == null ? '' : String(req.body.token).trim();
+  if (token === '') {
+    await pushTokenDel(phone);
+    console.log('[push] registration removed for a number.');
+    return res.json({ ok: true, removed: true });
+  }
+  if (!/^Expo(nent)?PushToken\[[\w+/=-]+\]$/.test(token)) {
+    return res.status(400).json({ error: 'Invalid push token.' });
+  }
+  await pushTokenSet(phone, token);
+  console.log('[push] registered a number for push delivery.');
+  res.json({ ok: true });
 });
 
 // ── POST /test ────────────────────────────────────────────────────────────────

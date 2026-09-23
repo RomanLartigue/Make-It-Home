@@ -14,6 +14,8 @@ import * as Location from 'expo-location';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 import { getUserName, setUserName, getServerUrl, fetchWithAuth, syncCircle } from '@/utils/serverUrl';
+import { getMyPhone, setMyPhone } from '@/utils/push';
+import { toE164 } from '@/utils/phoneNumber';
 import { setGold } from '@/utils/gold';
 import { confirmDestructive } from '@/utils/confirm';
 import { Beacon } from '@/constants/beacon';
@@ -23,6 +25,9 @@ export default function SettingsScreen() {
   const router = useRouter();
   const [name, setName] = useState('');
   const [saved, setSaved] = useState(false);
+  const [myPhone, setMyPhoneText] = useState('');
+  const [phoneSaved, setPhoneSaved] = useState(false);
+  const [phoneError, setPhoneError] = useState<string | null>(null);
   const [testing, setTesting] = useState(false);
   const [serverStatus, setServerStatus] = useState<'idle' | 'ok' | 'error'>('idle');
   const [locOn, setLocOn] = useState(false);
@@ -30,6 +35,7 @@ export default function SettingsScreen() {
   useFocusEffect(
     useCallback(() => {
       getUserName().then(setName);
+      getMyPhone().then(p => setMyPhoneText(p || '')).catch(() => {});
       Location.getForegroundPermissionsAsync()
         .then(p => setLocOn(!!p.granted))
         .catch(() => {});
@@ -43,6 +49,33 @@ export default function SettingsScreen() {
     setSaved(true);
     hSuccess();
     setTimeout(() => setSaved(false), 1600);
+  };
+
+  const handleSavePhone = async () => {
+    setPhoneError(null);
+    const raw = myPhone.trim();
+    if (!raw) {
+      // Cleared on purpose: stop push delivery, alerts go back to SMS.
+      await setMyPhone(null);
+      setPhoneSaved(true);
+      hSuccess();
+      setTimeout(() => setPhoneSaved(false), 1600);
+      return;
+    }
+    const e164 = toE164(raw);
+    if (!e164) {
+      setPhoneError('Enter a valid US phone number, e.g. 212 555 1234.');
+      return;
+    }
+    setMyPhoneText(e164);
+    const err = await setMyPhone(e164);
+    if (err) {
+      setPhoneError(err);
+      return;
+    }
+    setPhoneSaved(true);
+    hSuccess();
+    setTimeout(() => setPhoneSaved(false), 1600);
   };
 
   const testConnection = async () => {
@@ -116,6 +149,32 @@ export default function SettingsScreen() {
             style={{ marginTop: 10, opacity: name.trim() ? 1 : 0.5 }}
           />
         </Card>
+        <Card style={{ marginTop: 8, paddingVertical: 12 }}>
+          <Text style={styles.fieldLabel}>Your phone number</Text>
+          <Text style={styles.fieldHint}>
+            If someone adds you to their safety circle, their alerts arrive here as notifications
+            instead of texts. Leave empty to receive texts.
+          </Text>
+          <TextInput
+            style={styles.input}
+            value={myPhone}
+            onChangeText={t => {
+              setMyPhoneText(t);
+              setPhoneError(null);
+            }}
+            placeholder="e.g. 212 555 1234"
+            placeholderTextColor={Beacon.faint}
+            keyboardType="phone-pad"
+            returnKeyType="done"
+          />
+          {phoneError ? <Text style={styles.fieldError}>{phoneError}</Text> : null}
+          <PillButton
+            title={phoneSaved ? '✓ Saved' : 'Save number'}
+            kind={phoneSaved ? 'dark' : 'primary'}
+            onPress={handleSavePhone}
+            style={{ marginTop: 10 }}
+          />
+        </Card>
         <Card style={{ marginTop: 8, paddingVertical: 2 }}>
           <SRow label="Location" value={locOn ? 'On' : 'Off'} valueColor={locOn ? Beacon.safe : undefined} last />
         </Card>
@@ -176,6 +235,7 @@ const styles = StyleSheet.create({
   h1: { fontSize: 22, fontWeight: '800', color: Beacon.text, marginTop: 8, letterSpacing: -0.3 },
   fieldLabel: { fontSize: 13, fontWeight: '700', color: Beacon.text, marginBottom: 4 },
   fieldHint: { fontSize: 12, color: Beacon.muted, lineHeight: 17 },
+  fieldError: { fontSize: 12, color: Beacon.hot, marginTop: 8, lineHeight: 17 },
   input: {
     backgroundColor: Beacon.surface2,
     borderWidth: 1,
