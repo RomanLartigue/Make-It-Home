@@ -60,10 +60,13 @@ export function randomId(prefix: string): string {
 export async function syncCircle(phones: string[]): Promise<void> {
   try {
     const serverUrl = await getServerUrl();
+    // The name rides along so the server's "you've been added to X's circle"
+    // notice (and the "circles you're in" screen) can say who X is.
+    const name = await getUserName().catch(() => '');
     await fetchWithAuth(`${serverUrl}/circle/sync`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ phones }),
+      body: JSON.stringify({ phones, name }),
     });
   } catch {
     // best-effort; next circle change (or app launch) will re-sync

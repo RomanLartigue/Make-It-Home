@@ -162,8 +162,8 @@ export default function OnboardingScreen() {
                 data is kept briefly and auto-deleted.
               </Text>
               <Text style={[styles.legalBody, { marginTop: 8 }]}>
-                By adding contacts, you confirm they&apos;ve agreed to receive safety text messages
-                from you. Message &amp; data rates may apply; reply STOP to opt out.
+                When you add someone to your safety circle, we send them a message letting them
+                know. Message &amp; data rates may apply; anyone can reply STOP to opt out.
               </Text>
             </View>
             <View style={styles.legalLinks}>

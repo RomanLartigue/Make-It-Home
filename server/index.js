@@ -349,6 +349,56 @@ async function getCircle(token) {
   return circleStore.get(token) ?? [];
 }
 
+// ── Circle membership extras ──────────────────────────────────────────────────
+// ownername:<token> — the display name people see when this device adds them.
+// memberof:<phone>  — reverse index: which devices' circles contain a number
+//                     ([{t: ownerToken}]) — powers "circles you're in".
+// intro:<token>:<phone> — this person was already told they were added (so
+//                     re-syncs and relaunches never re-text them).
+// ownphone:<token>  — the device owner's own number (set at /push/register).
+const YEAR_TTL = 365 * 24 * 60 * 60;
+const ownerNameMemory = new Map();
+const memberOfMemory = new Map();
+const introMemory = new Set();
+const ownPhoneMemory = new Map();
+
+async function ownerNameSet(token, name) {
+  if (redis) await redisSet(`ownername:${token}`, name, YEAR_TTL);
+  else ownerNameMemory.set(token, name);
+}
+async function ownerNameGet(token) {
+  if (redis) return redisGet(`ownername:${token}`);
+  return ownerNameMemory.get(token) ?? null;
+}
+async function memberOfGet(phone) {
+  if (redis) return (await redisGet(`memberof:${phone}`)) ?? [];
+  return memberOfMemory.get(phone) ?? [];
+}
+async function memberOfSet(phone, list) {
+  if (redis) await redisSet(`memberof:${phone}`, list, YEAR_TTL);
+  else memberOfMemory.set(phone, list);
+}
+async function introSeen(token, phone) {
+  if (redis) return !!(await redisGet(`intro:${token}:${phone}`));
+  return introMemory.has(`${token}:${phone}`);
+}
+async function introMark(token, phone) {
+  if (redis) await redisSet(`intro:${token}:${phone}`, 1, YEAR_TTL);
+  else introMemory.add(`${token}:${phone}`);
+}
+async function ownPhoneSet(token, phone) {
+  if (redis) await redisSet(`ownphone:${token}`, phone, YEAR_TTL);
+  else ownPhoneMemory.set(token, phone);
+}
+async function ownPhoneGet(token) {
+  if (redis) return redisGet(`ownphone:${token}`);
+  return ownPhoneMemory.get(token) ?? null;
+}
+async function ownPhoneDel(token) {
+  if (redis) await redisDel(`ownphone:${token}`);
+  else ownPhoneMemory.delete(token);
+}
+
 // ── Per-device daily message cap ──────────────────────────────────────────────
 // Abuse guard on Twilio spend. Generous enough for heavy testing/demo days — a
 // hit cap silently blocking a real alert is worse than a few dollars of SMS.
@@ -2224,8 +2274,10 @@ app.post('/push/register', async (req, res) => {
     return res.status(400).json({ error: 'Phone must be E.164 (e.g. +12125551234).' });
   }
   const token = req.body?.token == null ? '' : String(req.body.token).trim();
+  const deviceToken = String(req.headers['x-mih-key'] || '');
   if (token === '') {
     await pushTokenDel(phone);
+    await ownPhoneDel(deviceToken);
     console.log('[push] registration removed for a number.');
     return res.json({ ok: true, removed: true });
   }
@@ -2233,6 +2285,7 @@ app.post('/push/register', async (req, res) => {
     return res.status(400).json({ error: 'Invalid push token.' });
   }
   await pushTokenSet(phone, token);
+  await ownPhoneSet(deviceToken, phone); // powers GET /circles/mine
   console.log('[push] registered a number for push delivery.');
   res.json({ ok: true });
 });
@@ -2468,9 +2521,72 @@ app.post('/circle/sync', async (req, res) => {
   }
   const token = String(req.headers['x-mih-key'] || '');
   const unique = [...new Set(phones)];
+  const prev = await getCircle(token);
   await saveCircle(token, unique);
+  const nm = cleanName(req.body?.name);
+  if (nm) await ownerNameSet(token, nm);
+
+  // Keep the reverse index ("whose circles contain this number") current.
+  const prevSet = new Set(prev);
+  const added = unique.filter(p => !prevSet.has(p));
+  const removed = prev.filter(p => !unique.includes(p));
+  for (const p of added) {
+    const list = await memberOfGet(p);
+    if (!list.find(e => e && e.t === token)) {
+      list.push({ t: token });
+      await memberOfSet(p, list.slice(-100));
+    }
+  }
+  for (const p of removed) {
+    const list = await memberOfGet(p);
+    const next = list.filter(e => e && e.t !== token);
+    if (next.length !== list.length) await memberOfSet(p, next);
+  }
+
+  // Tell each NEWLY added person they're in the circle — once, ever, per
+  // owner+number (re-syncs and relaunches never re-text). This notice replaced
+  // the add-contact consent checkbox: the recipient learns what Make It Home
+  // is BEFORE any alert arrives, and gets STOP in the very first message.
+  // Delivered hybrid like everything else (push if they have the app).
+  const toIntro = [];
+  for (const p of added.slice(0, 10)) {
+    if (!(await introSeen(token, p))) toIntro.push(p);
+  }
+  if (toIntro.length) {
+    const who = nm || (await ownerNameGet(token)) || 'Someone you know';
+    (async () => {
+      const r = await sendSmsToAll(
+        toIntro,
+        `Make It Home: ${who} added you to their safety circle. When they start a safety session, you'll get a link to watch over them.\nReply STOP to opt out.`,
+      );
+      for (const p of toIntro) introMark(token, p).catch(() => {});
+      console.log(`[intro] circle-add notice sent ${r.sent}/${toIntro.length}.`);
+    })().catch(() => {});
+  }
+
   console.log(`[/circle/sync] Stored ${unique.length} number(s) for a device.`);
   res.json({ count: unique.length });
+});
+
+// ── GET /circles/mine ─────────────────────────────────────────────────────────
+// "Whose circles am I in?" — answered for the device's OWN registered number
+// only (set at /push/register), so nobody can query arbitrary numbers. Returns
+// the display names of people whose circles currently contain that number.
+app.get('/circles/mine', async (req, res) => {
+  const token = String(req.headers['x-mih-key'] || '');
+  const phone = await ownPhoneGet(token);
+  if (!phone) return res.json({ phone: null, circles: [] });
+  const list = await memberOfGet(phone);
+  const circles = [];
+  for (const e of list.slice(0, 50)) {
+    if (!e || !e.t) continue;
+    // Verify against the live circle so removals and deleted accounts drop out.
+    const circ = await getCircle(e.t);
+    if (!circ.includes(phone)) continue;
+    const nm = await ownerNameGet(e.t);
+    circles.push({ name: nm || 'Someone' });
+  }
+  res.json({ phone, circles });
 });
 
 // ── POST /register ────────────────────────────────────────────────────────────

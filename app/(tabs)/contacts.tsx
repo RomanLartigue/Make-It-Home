@@ -55,7 +55,6 @@ export default function CircleScreen() {
   const [editId, setEditId] = useState<string | null>(null);
   const [name, setName] = useState('');
   const [phone, setPhone] = useState('');
-  const [smsConsent, setSmsConsent] = useState(false);
   const [actionFor, setActionFor] = useState<SafetyContact | null>(null);
 
   // One corrupt stored value must not brick the circle screen (loaded would
@@ -103,7 +102,6 @@ export default function CircleScreen() {
     setEditId(null);
     setName('');
     setPhone('');
-    setSmsConsent(false); // require an explicit opt-in tick every time
     setMode('form');
   };
 
@@ -118,7 +116,6 @@ export default function CircleScreen() {
     setEditId(actionFor.id);
     setName(actionFor.name);
     setPhone(actionFor.phone);
-    setSmsConsent(false); // consent tick only gates adding a new contact
     setMode('form');
   };
 
@@ -126,8 +123,6 @@ export default function CircleScreen() {
     const n = name.trim();
     const rawP = phone.trim();
     if (!n || !rawP) return;
-    // Adding a new contact requires an explicit SMS-consent tick.
-    if (!editId && !smsConsent) return;
     const e164 = toE164(rawP);
     if (!e164) {
       Alert.alert(
@@ -256,6 +251,11 @@ export default function CircleScreen() {
             style={{ flex: 1 }}
           />
         </View>
+        <PillButton
+          title="🫶  Circles you're in"
+          kind="ghost"
+          onPress={() => router.push('/circles')}
+        />
         <Pressable style={styles.addRow} onPress={openAdd}>
           <Text style={styles.addText}>＋ Add someone</Text>
         </Pressable>
@@ -321,20 +321,10 @@ export default function CircleScreen() {
                       </Pressable>
                     )}
                     {!editId && (
-                      <Pressable
-                        style={styles.consentRow}
-                        onPress={() => { hTap(); setSmsConsent(v => !v); }}
-                        accessibilityRole="checkbox"
-                        accessibilityState={{ checked: smsConsent }}>
-                        <View style={[styles.checkbox, smsConsent && styles.checkboxOn]}>
-                          {smsConsent && <Ionicons name="checkmark" size={14} color={Beacon.night} />}
-                        </View>
-                        <Text style={styles.consent}>
-                          I confirm this person has agreed to receive safety alert text messages
-                          from Make It Home. Message frequency varies. Msg &amp; data rates may apply.
-                          Reply STOP to opt out.
-                        </Text>
-                      </Pressable>
+                      <Text style={styles.addNote}>
+                        We&apos;ll send them a quick message letting them know you added them —
+                        they can reply STOP any time.
+                      </Text>
                     )}
                     <View style={styles.sheetBtns}>
                       <PillButton title="Cancel" kind="dark" onPress={closeSheet} style={{ flex: 1 }} />
@@ -342,7 +332,6 @@ export default function CircleScreen() {
                         title={editId ? 'Save' : 'Add'}
                         kind="primary"
                         onPress={saveContact}
-                        disabled={!editId && !smsConsent}
                         style={{ flex: 1 }}
                       />
                     </View>
@@ -418,19 +407,6 @@ const styles = StyleSheet.create({
   },
   pickLink: { flexDirection: 'row', alignItems: 'center', gap: 6, paddingVertical: 4, marginBottom: 6 },
   pickLinkText: { color: Beacon.info, fontWeight: '600', fontSize: 13 },
-  consentRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 10, marginTop: 2, marginBottom: 12 },
-  checkbox: {
-    width: 22,
-    height: 22,
-    borderRadius: 6,
-    borderWidth: 1.5,
-    borderColor: Beacon.line,
-    backgroundColor: Beacon.surface2,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginTop: 1,
-  },
-  checkboxOn: { backgroundColor: Beacon.beacon, borderColor: Beacon.beacon },
-  consent: { flex: 1, color: Beacon.muted, fontSize: 11.5, lineHeight: 16 },
+  addNote: { color: Beacon.muted, fontSize: 11.5, lineHeight: 16, marginTop: 2, marginBottom: 12 },
   sheetBtns: { flexDirection: 'row', gap: 10, marginTop: 6 },
 });

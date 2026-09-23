@@ -85,6 +85,7 @@ export default function RootLayout() {
                 <Stack.Screen name="gold-plans" options={{ headerShown: false }} />
                 <Stack.Screen name="guide" options={{ headerShown: false }} />
                 <Stack.Screen name="nearby" options={{ headerShown: false }} />
+                <Stack.Screen name="circles" options={{ headerShown: false }} />
                 <Stack.Screen name="legal" options={{ headerShown: false, presentation: 'modal' }} />
               </Stack>
             </View>
