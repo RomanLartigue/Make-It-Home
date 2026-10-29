@@ -37,7 +37,7 @@ const FEATURES: { icon: keyof typeof Ionicons.glyphMap; title: string; body: str
     icon: 'flask-outline',
     title: 'Test your alert',
     body:
-      'Want to be sure your alerts land? Settings → “Test your alert” sends your circle a clearly-marked test text (not a real emergency), so you can confirm everyone receives it.',
+      'Want to be sure your alerts land? Circle tab → “Test alert” sends your circle a clearly-marked test message (not a real emergency), so you can confirm everyone receives it.',
   },
 ];
 

@@ -84,7 +84,15 @@ export function isBackgroundAudioActive(): boolean {
 // the continuously-active recording is also what keeps iOS from suspending the
 // app when it's backgrounded). Each finished clip is handed to onChunk for
 // upload; the server stitches them into the one full-session audio at the end.
-let chunkActive = false;
+// GENERATION TOKEN, not a boolean: with a plain `chunkActive` flag, an end
+// followed quickly by a new go-live (panic behavior) could re-animate the OLD
+// loop — two loops fighting over the one recorder, and worse, the old loop's
+// final "release the audio session" landing AFTER the new session configured
+// its own, killing the background keep-alive (→ heartbeat starves → the
+// server falsely marks the user safe). Each start gets its own generation;
+// a loop only runs while ITS generation is still the current one.
+let chunkGeneration = 0;
+let latestStartGen = 0; // generation of the most recent loop that configured the audio session
 let chunkLoopDone: Promise<void> | null = null;
 
 export async function startChunkedAudio(
@@ -92,7 +100,8 @@ export async function startChunkedAudio(
   onError?: (msg: string) => void,
   chunkMs = 5000,
 ): Promise<boolean> {
-  if (chunkActive) return true;
+  const myGen = ++chunkGeneration; // retires any previous loop immediately
+  const previousLoop = chunkLoopDone;
   try {
     const { Audio } = await import('expo-av');
     const perm = await Audio.requestPermissionsAsync();
@@ -100,15 +109,21 @@ export async function startChunkedAudio(
       onError?.('mic permission denied');
       return false;
     }
+    // Let the previous loop fully exit (bounded) before touching the shared
+    // audio session, so its teardown can't race our setup.
+    if (previousLoop) {
+      await Promise.race([previousLoop, new Promise(res => setTimeout(res, 8000))]);
+    }
+    if (myGen !== chunkGeneration) return false; // superseded while waiting
     await Audio.setAudioModeAsync({
       allowsRecordingIOS: true,
       playsInSilentModeIOS: true,
       staysActiveInBackground: true,
     });
-    chunkActive = true;
+    latestStartGen = myGen;
     let errored = false;
     chunkLoopDone = (async () => {
-      while (chunkActive) {
+      while (myGen === chunkGeneration) {
         let rec: any = null;
         try {
           const r = await Audio.Recording.createAsync(Audio.RecordingOptionsPresets.LOW_QUALITY);
@@ -120,6 +135,16 @@ export async function startChunkedAudio(
           if (!errored) {
             errored = true;
             onError?.(String(e?.message ?? e));
+            // Re-assert OUR audio mode: a stale teardown may have cleared it,
+            // which would otherwise make every retry fail forever AND drop
+            // the background keep-alive.
+            try {
+              await Audio.setAudioModeAsync({
+                allowsRecordingIOS: true,
+                playsInSilentModeIOS: true,
+                staysActiveInBackground: true,
+              });
+            } catch {}
           }
           await new Promise(res => setTimeout(res, 2000));
           continue;
@@ -135,10 +160,16 @@ export async function startChunkedAudio(
           // lost chunk — the next one starts immediately
         }
       }
-      try {
-        const { Audio: A } = await import('expo-av');
-        await A.setAudioModeAsync({ allowsRecordingIOS: false, staysActiveInBackground: false });
-      } catch {}
+      // Release the shared audio session only if NO newer loop has configured
+      // it since us (a retired loop tearing down its successor's session was
+      // the whole bug). A plain stop leaves us the latest starter, so the
+      // session is still released properly at session end.
+      if (latestStartGen === myGen) {
+        try {
+          const { Audio: A } = await import('expo-av');
+          await A.setAudioModeAsync({ allowsRecordingIOS: false, staysActiveInBackground: false });
+        } catch {}
+      }
     })();
     return true;
   } catch (e: any) {
@@ -153,6 +184,6 @@ export async function startChunkedAudio(
  * the last clip makes it into the stitched session audio.
  */
 export function stopChunkedAudio(): Promise<void> {
-  chunkActive = false;
+  chunkGeneration++; // retire the running loop (it exits after its current chunk)
   return chunkLoopDone ?? Promise.resolve();
 }

@@ -6,7 +6,13 @@ import {
   StyleSheet,
   ScrollView,
   ActivityIndicator,
+  Alert,
+  Platform,
 } from 'react-native';
+import * as Notifications from 'expo-notifications';
+import Constants from 'expo-constants';
+
+import { stopBackgroundLocation } from '@/tasks/backgroundLocation';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect, useRouter } from 'expo-router';
 import { hSuccess } from '@/utils/haptics';
@@ -63,7 +69,18 @@ export default function SettingsScreen() {
     }
   };
 
-  const deleteMyData = () => {
+  const deleteMyData = async () => {
+    // A live safety session must be ended BY THE USER first: deleting data
+    // mid-session would strand the GPS task and tear the session's owner out
+    // from under the circle's live view.
+    const activeSession = await AsyncStorage.getItem('@makeithome_active_session').catch(() => null);
+    if (activeSession) {
+      Alert.alert(
+        'End your session first',
+        'You have a safety session running. Press "I’m safe" on the Home tab, then delete your data.',
+      );
+      return;
+    }
     confirmDestructive(
       'Delete my data',
       'This erases your name, safety circle, and check-in state from this device and signs it out. This cannot be undone.',
@@ -73,6 +90,13 @@ export default function SettingsScreen() {
         try {
           await syncCircle([]);
         } catch {}
+        // Stop the native background-location task (it survives relaunches —
+        // without this a crashed session's GPS would run until reinstall) and
+        // drop any scheduled check-in warning notifications.
+        if (Platform.OS !== 'web') {
+          await stopBackgroundLocation().catch(() => {});
+          await Notifications.cancelAllScheduledNotificationsAsync().catch(() => {});
+        }
         // Un-register push delivery for this person's number — otherwise the
         // server would keep routing circle alerts to this (now wiped) device.
         try {
@@ -170,7 +194,9 @@ export default function SettingsScreen() {
           <SRow label="Delete my data" danger onPress={deleteMyData} right={<View />} last />
         </Card>
 
-        <Text style={styles.version}>Make It Home · v1.0.1</Text>
+        <Text style={styles.version}>
+          Make It Home · v{(Constants as any)?.expoConfig?.version ?? '1.0'}
+        </Text>
       </ScrollView>
     </SafeAreaView>
   );

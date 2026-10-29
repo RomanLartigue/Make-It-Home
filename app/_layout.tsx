@@ -49,7 +49,14 @@ export default function RootLayout() {
   useEffect(() => {
     if (Platform.OS === 'web') return;
     registerPushForAlerts().catch(() => {});
+    // Dedupe: on a cold start from a notification tap, the listener AND
+    // getLastNotificationResponseAsync can both fire for the same response,
+    // opening the live page twice.
+    const handled = new Set<string>();
     const openFrom = (resp: Notifications.NotificationResponse | null) => {
+      const id = resp?.notification?.request?.identifier;
+      if (!id || handled.has(id)) return;
+      handled.add(id);
       const url = resp?.notification?.request?.content?.data?.url;
       if (typeof url === 'string' && /^https:\/\//.test(url)) {
         Linking.openURL(url).catch(() => {});

@@ -97,7 +97,13 @@ export default function CircleScreen() {
 
   const closeSheet = () => setMode('closed');
 
+  // True from the moment the contact picker is requested until it resolves.
+  // Nothing may reopen the sheet during that window: iOS deadlocks if the
+  // native picker presents while an RN Modal is up (the build-44 freeze).
+  const pickingRef = React.useRef(false);
+
   const openAdd = () => {
+    if (pickingRef.current) return;
     hTap();
     setEditId(null);
     setName('');
@@ -106,6 +112,7 @@ export default function CircleScreen() {
   };
 
   const openActions = (c: SafetyContact) => {
+    if (pickingRef.current) return;
     hTap();
     setActionFor(c);
     setMode('action');
@@ -129,6 +136,12 @@ export default function CircleScreen() {
         'Check the phone number',
         `"${rawP}" isn't a dialable number. Include the full number with country code, e.g. +1 555 123 4567.`,
       );
+      return;
+    }
+    // One entry per number: a duplicate would double-text that person on
+    // every alert (and show twice in the list).
+    if (circle.some(c => c.phone === e164 && c.id !== editId)) {
+      Alert.alert('Already in your circle', `${e164} is already one of your safety contacts.`);
       return;
     }
     if (editId) {
@@ -163,6 +176,8 @@ export default function CircleScreen() {
   // report, build 44). So: close the sheet, let it fully dismiss, present the
   // picker, then reopen the sheet with the picked values filled in.
   const pickFromContacts = async () => {
+    if (pickingRef.current) return; // double-tap guard — a second picker deadlocks
+    pickingRef.current = true;
     hTap();
     setMode('closed');
     await new Promise(r => setTimeout(r, 600)); // let the RN Modal fully dismiss
@@ -187,6 +202,7 @@ export default function CircleScreen() {
     } catch {
       failed = true;
     }
+    pickingRef.current = false;
     if (e164) {
       setName(pickedName);
       setPhone(e164);

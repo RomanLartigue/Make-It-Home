@@ -122,8 +122,16 @@ async function cancelCheckInWarning(notifId: string | null) {
 
 async function getSafetyCirclePhones(): Promise<string[]> {
   const raw = await AsyncStorage.getItem(SAFETY_CIRCLE_KEY);
-  const circle = raw ? JSON.parse(raw) : [];
-  return circle.map((c: any) => c.phone).filter(Boolean);
+  // Guarded parse: this runs on the GO-LIVE path — a corrupt stored value must
+  // degrade to "no circle" (which alerts loudly), never throw mid-panic.
+  let circle: any[] = [];
+  try {
+    const p = raw ? JSON.parse(raw) : [];
+    circle = Array.isArray(p) ? p : [];
+  } catch {
+    circle = [];
+  }
+  return circle.map((c: any) => c?.phone).filter(Boolean);
 }
 
 // Build the escalation rounds for a go-live: the whole circle is alerted now
@@ -139,13 +147,26 @@ async function getEscalationTiers(slideSeconds: number): Promise<
     AsyncStorage.getItem(SAFETY_CIRCLE_KEY),
     AsyncStorage.getItem(ESCALATION_SCHEDULE_KEY),
   ]);
-  const circle: any[] = rawCircle ? JSON.parse(rawCircle) : [];
-  const phones = circle.map(c => c.phone).filter(Boolean);
+  // Guarded parses — go-live path: corrupt values degrade, never throw.
+  let circle: any[] = [];
+  try {
+    const p = rawCircle ? JSON.parse(rawCircle) : [];
+    circle = Array.isArray(p) ? p : [];
+  } catch {
+    circle = [];
+  }
+  const phones = circle.map(c => c?.phone).filter(Boolean);
   if (!phones.length) return null;
   const gold = await isGold();
   let schedule: number[];
   if (gold) {
-    schedule = normalizeSchedule(rawSchedule ? JSON.parse(rawSchedule) : DEFAULT_SCHEDULE);
+    let storedSchedule: any = DEFAULT_SCHEDULE;
+    try {
+      storedSchedule = rawSchedule ? JSON.parse(rawSchedule) : DEFAULT_SCHEDULE;
+    } catch {
+      storedSchedule = DEFAULT_SCHEDULE;
+    }
+    schedule = normalizeSchedule(storedSchedule);
   } else {
     const third = Math.max(1, Math.round(slideSeconds / 180)); // ⅓ of the slide, in minutes
     schedule = [third, third, third];
@@ -200,6 +221,7 @@ export default function HomeScreen() {
   const locationSub = useRef<Location.LocationSubscription | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const notifiedRef = useRef(false);
+  const alertSentRef = useRef(false); // true once the circle was actually alerted this session
   const sessionIdRef = useRef<string | null>(null);
   const lastLocationUpdateRef = useRef(0);
   const isRecordingRef = useRef(false);
@@ -521,6 +543,7 @@ export default function HomeScreen() {
       const outcome = await attempt();
       if (sessionIdRef.current !== sessionId) return;
       if (outcome === 'ok') {
+        alertSentRef.current = true; // the circle HAS been alerted this session
         setNotifyStatus('notified');
         return;
       }
@@ -662,7 +685,14 @@ export default function HomeScreen() {
         // unreachable — handled by the staleness check below
       }
       if (Date.now() - lastServerOkRef.current > HEARTBEAT_MS + 5000) {
-        setNotifyStatus(s => (s === 'notified' || s === 'reconnecting' ? 'reconnecting' : s));
+        // 'saved'/'resumed' are media statuses — they must not mask a server
+        // outage, or the UI shows green "tracking live" while the circle was
+        // never alerted. Anything but a hard error reverts to 'reconnecting'.
+        setNotifyStatus(s =>
+          s === 'notified' || s === 'reconnecting' || s === 'saved' || s === 'resumed'
+            ? 'reconnecting'
+            : s,
+        );
       }
     }, HEARTBEAT_MS);
   };
@@ -747,12 +777,32 @@ export default function HomeScreen() {
     const id = checkInId.current;
     checkInId.current = null;
     if (!id) return;
-    const serverUrl = await getServerUrl();
-    fetchWithAuth(`${serverUrl}/checkin/cancel`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id, notifySafe }),
-    }).catch(() => {});
+    // This POST is the thing that stops the server's timer. A single lost
+    // request (elevator, garage — exactly where people arrive) used to mean
+    // the circle still got a "missed check-in" alert after a real "I'm safe".
+    // Retry with backoff like /session/end, and warn visibly if it never lands.
+    (async () => {
+      const serverUrl = await getServerUrl();
+      let delay = 2000;
+      for (let attempt = 0; attempt < 8; attempt++) {
+        try {
+          const res = await fetchWithAuth(`${serverUrl}/checkin/cancel`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id, notifySafe }),
+          });
+          if (res.ok || (res.status >= 400 && res.status < 500)) return; // cancelled, or already gone
+        } catch {
+          // network drop — retry below
+        }
+        await new Promise(r => setTimeout(r, delay));
+        delay = Math.min(Math.round(delay * 1.6), 15000);
+      }
+      Alert.alert(
+        'Check-in may still be armed',
+        "We couldn't reach the server to cancel your check-in, so your circle might still be alerted at the deadline. When you're connected again, let them know you're okay.",
+      );
+    })().catch(() => {});
   };
 
   const extendCheckIn = async () => {
@@ -787,11 +837,17 @@ export default function HomeScreen() {
     if (IS_WEB || IS_EXPO_GO) return null;
     try {
       const serverUrl = await getServerUrl();
+      // 5s hard cap: a black-holed connection here must not pin go-live — the
+      // snapshot fallback is always available.
+      const controller = new AbortController();
+      const t = setTimeout(() => controller.abort(), 5000);
       const res = await fetchWithAuth(`${serverUrl}/livekit/publish-token`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sessionId }),
+        signal: controller.signal,
       });
+      clearTimeout(t);
       if (!res.ok) return null; // 503 = LiveKit not configured on the server
       const j = await res.json().catch(() => null);
       return j?.url && j?.token ? { url: j.url, token: j.token } : null;
@@ -860,7 +916,25 @@ export default function HomeScreen() {
 
     if (checkInActive) cancelCheckIn(false);
     notifiedRef.current = false;
+    alertSentRef.current = false;
     setNotifyStatus('idle');
+
+    // KEEP-ALIVE FIRST (critical): the core use case is releasing the beacon
+    // and immediately pocketing/locking the phone — BEFORE the network chain
+    // below has finished. Without an active background mode iOS suspends our
+    // JS within seconds of backgrounding, freezing the token fetch, the
+    // session start, the 8s no-GPS fallback, everything — and the circle is
+    // never alerted, silently. Background location is that keep-alive, so it
+    // starts before ANY awaited network work (it was previously started only
+    // after /session/start completed).
+    if (!IS_WEB) {
+      startBackgroundLocation()
+        .then(ok => trace(ok ? 'bg-location-started' : 'bg-location-FAILED'))
+        .catch(() => trace('bg-location-FAILED'));
+    }
+    // The overdue cycle's "Are you safe?" prompts need notification permission;
+    // ask now (no-op if already granted) so they aren't silently dead later.
+    Notifications.requestPermissionsAsync().catch(() => {});
 
     // Start the session exactly once, with whatever location we have — possibly
     // null. A panic button must never silently no-op: if a GPS fix never arrives
@@ -873,56 +947,79 @@ export default function HomeScreen() {
         clearTimeout(goLiveFallbackRef.current);
         goLiveFallbackRef.current = null;
       }
-      const sessionId = randomId('session');
-      sessionIdRef.current = sessionId;
-      await AsyncStorage.setItem(ACTIVE_SESSION_KEY, sessionId);
+      // The whole body is guarded: an unexpected throw here previously
+      // stranded the user on the "Going live…" spinner forever with NO alert
+      // sent and NO error shown — the worst possible failure on a panic path.
+      try {
+        const sessionId = randomId('session');
+        sessionIdRef.current = sessionId;
+        await AsyncStorage.setItem(ACTIVE_SESSION_KEY, sessionId);
 
-      // Decide live mode: real-time LiveKit stream (Gold + server + real build)
-      // or the snapshot/segment fallback. Best-effort — any failure falls back.
-      const lk = await fetchLiveKitToken(sessionId);
-      liveKitModeRef.current = !!lk;
+        // Decide live mode: real-time LiveKit stream or the snapshot/segment
+        // fallback. Best-effort — any failure falls back.
+        const lk = await fetchLiveKitToken(sessionId);
+        liveKitModeRef.current = !!lk;
 
-      startHeartbeat(sessionId);
-      await startSession(coords, !!lk);
+        // Alert the circle FIRST; the heartbeat starts only once the session
+        // exists (starting it earlier let a slow /session/start race the
+        // heartbeat's 404-recreate path into double-texting the circle).
+        await startSession(coords, !!lk);
+        startHeartbeat(sessionId);
 
-      if (lk) {
-        // LiveKit publishes camera + mic itself — no frame loop, no chunked
-        // audio, no local recording pipeline. Just location alongside it.
-        trace('livekit-mode');
-        setLiveKit(lk);
-        setLiveMode('livekit');
-        setIsRecording(true);
-        // At the chosen time the session does NOT end — it enters the overdue
-        // "Are you safe?" cycle (stream keeps running until the user is safe).
-        if (recordEndTimerRef.current) clearTimeout(recordEndTimerRef.current);
-        recordEndTimerRef.current = setTimeout(() => {
-          if (liveKitModeRef.current) enterOverdue();
-        }, recordDurationSecRef.current * 1000);
-        if (!IS_WEB) {
-          startBackgroundLocation()
-            .then(ok => trace(ok ? 'bg-location-started' : 'bg-location-FAILED'))
-            .catch(() => trace('bg-location-FAILED'));
+        if (lk) {
+          // LiveKit publishes camera + mic itself — no frame loop, no chunked
+          // audio, no local recording pipeline. Just location alongside it.
+          // (Background location was already started at go-live, before any
+          // network work — it is the keep-alive.)
+          trace('livekit-mode');
+          setLiveKit(lk);
+          setLiveMode('livekit');
+          setIsRecording(true);
+          // At the chosen time the session does NOT end — it enters the overdue
+          // "Are you safe?" cycle (stream keeps running until the user is safe).
+          if (recordEndTimerRef.current) clearTimeout(recordEndTimerRef.current);
+          recordEndTimerRef.current = setTimeout(() => {
+            if (liveKitModeRef.current) enterOverdue();
+          }, recordDurationSecRef.current * 1000);
+          return;
         }
-        return;
-      }
 
-      // Snapshot / segment mode — now safe to mount the camera.
-      setLiveMode('camera');
-      startFrameLoop(sessionId);
-      // Location keeps streaming when the phone locks / app is switched away.
-      // Chunked audio runs for the WHOLE session (live sound for the circle +
-      // the always-active recording keeps iOS from suspending the app in the
-      // background). Both are best-effort and never block go-live.
-      if (!IS_WEB) {
-        startBackgroundLocation()
-          .then(ok => trace(ok ? 'bg-location-started' : 'bg-location-FAILED'))
-          .catch(() => trace('bg-location-FAILED'));
-        startChunkedAudio(
-          uri => uploadAudioChunk(uri, sessionId),
-          msg => trace(`audio-chunk-error: ${msg}`),
-        )
-          .then(ok => trace(ok ? 'chunk-audio-started' : 'chunk-audio-DENIED'))
-          .catch(() => {});
+        // Snapshot / segment mode — now safe to mount the camera.
+        setLiveMode('camera');
+        startFrameLoop(sessionId);
+        // Chunked audio runs for the WHOLE camera-mode session (live sound for
+        // the circle + the always-active recording keeps iOS from suspending
+        // the app in the background). Best-effort, never blocks go-live.
+        if (!IS_WEB) {
+          startChunkedAudio(
+            uri => uploadAudioChunk(uri, sessionId),
+            msg => trace(`audio-chunk-error: ${msg}`),
+          )
+            .then(ok => trace(ok ? 'chunk-audio-started' : 'chunk-audio-DENIED'))
+            .catch(() => {});
+        }
+      } catch (e: any) {
+        // Loud failure + full local teardown — the user must KNOW the circle
+        // was not alerted, and the UI must come back usable for a retry.
+        trace(`go-live-FAILED: ${String(e?.message ?? e).slice(0, 200)}`);
+        notifiedRef.current = false;
+        sessionIdRef.current = null;
+        AsyncStorage.removeItem(ACTIVE_SESSION_KEY).catch(() => {});
+        if (heartbeatRef.current) {
+          clearInterval(heartbeatRef.current);
+          heartbeatRef.current = null;
+        }
+        try {
+          locationSub.current?.remove();
+        } catch {}
+        locationSub.current = null;
+        if (!IS_WEB) stopBackgroundLocation().catch(() => {});
+        setShowCamera(false);
+        setNotifyStatus('idle');
+        Alert.alert(
+          'Could not go live',
+          'Something went wrong starting your session — your circle has NOT been alerted. Please try again.',
+        );
       }
     };
 
@@ -1107,7 +1204,8 @@ export default function HomeScreen() {
         if (!isRecordingRef.current) break;
         // Tell the user the recording picked back up — otherwise the last
         // status ("saved") lingers and reads like the recording stopped.
-        setNotifyStatus('resumed');
+        // Never over a delivery problem: media status must not mask an outage.
+        setNotifyStatus(s => (s === 'reconnecting' || s === 'error' ? s : 'resumed'));
         // Give the camera a beat to re-attach its capture session.
         await new Promise(r => setTimeout(r, 600));
       }
@@ -1145,7 +1243,10 @@ export default function HomeScreen() {
         const uri = video.uri;
         trace(`video-segment-${segments}-held`);
         // Keep a local copy immediately; HOLD the upload until session end.
-        saveToCameraRoll(uri).then(saved => { if (saved) setNotifyStatus('saved'); }).catch(() => {});
+        saveToCameraRoll(uri)
+          // Media status never masks a delivery problem (see heartbeat check).
+          .then(ok => { if (ok) setNotifyStatus(s => (s === 'reconnecting' || s === 'error' ? s : 'saved')); })
+          .catch(() => {});
         // Actual recorded length of THIS segment (not the chosen session length).
         addPending(uri, 'video', Math.max(1, Math.round((Date.now() - startedAt) / 1000)));
       } else if (!recordError && isRecordingRef.current) {
@@ -1248,8 +1349,15 @@ export default function HomeScreen() {
     // Stop the segment loop and unblock the in-progress recordAsync (both paths),
     // so the loop can push its final segment and resolve loopDoneRef.
     isRecordingRef.current = false;
-    cameraRef.current?.stopRecording();
-    locationSub.current?.remove();
+    // Guarded: a synchronous native throw here would leave finishingRef stuck
+    // true forever — making every later "I'm safe" press a silent no-op, the
+    // one way the user could lose the ability to stop their own alerts.
+    try {
+      cameraRef.current?.stopRecording();
+    } catch {}
+    try {
+      locationSub.current?.remove();
+    } catch {}
     locationSub.current = null;
     const doneWaiter = loopDoneRef.current;
 
@@ -1306,12 +1414,19 @@ export default function HomeScreen() {
     sessionIdRef.current = null;
     lastLocationUpdateRef.current = 0;
     setTimeout(() => { finishingRef.current = false; }, 1500); // re-arm after teardown
-    setTimeout(() => setNotifyStatus('idle'), 3000);
+    // Only reset the banner if no NEW session started in the window — a fresh
+    // session's "✓ Circle notified" must not be wiped back to idle.
+    setTimeout(() => {
+      if (!sessionIdRef.current) setNotifyStatus('idle');
+    }, 3000);
     hSuccess();
     // Pressing "I'm safe" IS the safe signal — tell the circle automatically
     // ("✅ <name> is safe."), no extra prompt. Only the user can end alerts,
-    // and ending them means they're safe.
-    sendSafeNotification();
+    // and ending them means they're safe. Skipped when the circle was never
+    // alerted this session (e.g. Cancel on a wedged "Going live…" screen) —
+    // a "safe" text with no preceding alert would only confuse people.
+    if (alertSentRef.current) sendSafeNotification();
+    alertSentRef.current = false;
     Alert.alert(
       "You're marked safe",
       wasLiveKit
@@ -1409,6 +1524,15 @@ export default function HomeScreen() {
       <View style={[styles.cameraRoot, { alignItems: 'center', justifyContent: 'center' }]}>
         <ActivityIndicator color="#fff" />
         <Text style={{ color: '#fff', marginTop: 14, fontWeight: '700', fontSize: 15 }}>Going live…</Text>
+        {/* Escape hatch: if startup wedges (dead network mid-chain), the user
+            must never be trapped on this spinner with no way out. If the
+            circle was already alerted this acts exactly like "I'm safe". */}
+        <Pressable
+          onPress={() => finishSession('manual')}
+          style={{ marginTop: 26, paddingVertical: 12, paddingHorizontal: 28 }}
+        >
+          <Text style={{ color: '#9aa4b2', fontWeight: '700', fontSize: 14 }}>Cancel</Text>
+        </Pressable>
       </View>
     );
   }

@@ -20,7 +20,7 @@
       "bundleIdentifier": "com.makeithome.app",
       "infoPlist": {
         "NSCameraUsageDescription": "Make It Home uses the camera during safety sessions so your safety circle can see your surroundings live.",
-        "NSMicrophoneUsageDescription": "Make It Home records audio during safety sessions so your safety circle receives a video of your surroundings.",
+        "NSMicrophoneUsageDescription": "Make It Home uses the microphone during safety sessions so your safety circle can hear your surroundings live.",
         "NSContactsUsageDescription": "Make It Home uses your contacts so you can add trusted people to your safety circle.",
         "ITSAppUsesNonExemptEncryption": false,
         "UIFileSharingEnabled": true,
@@ -44,12 +44,6 @@
         "android.permission.ACCESS_COARSE_LOCATION",
         "android.permission.ACCESS_FINE_LOCATION",
         "android.permission.READ_CONTACTS",
-        "android.permission.READ_EXTERNAL_STORAGE",
-        "android.permission.WRITE_EXTERNAL_STORAGE",
-        "android.permission.READ_MEDIA_VISUAL_USER_SELECTED",
-        "android.permission.READ_MEDIA_IMAGES",
-        "android.permission.READ_MEDIA_VIDEO",
-        "android.permission.READ_MEDIA_AUDIO",
         "android.permission.ACCESS_BACKGROUND_LOCATION",
         "android.permission.FOREGROUND_SERVICE",
         "android.permission.FOREGROUND_SERVICE_LOCATION",
@@ -83,8 +77,7 @@
       [
         "expo-media-library",
         {
-          "photosPermission": "Make It Home saves your safety recordings to your photo library.",
-          "savePhotosPermission": "Make It Home saves your safety recordings to your photo library so you keep a copy.",
+          "savePhotosPermission": "Make It Home saves video captured during a safety session to your photo library so you keep a copy.",
           "isAccessMediaLocationEnabled": false
         }
       ],

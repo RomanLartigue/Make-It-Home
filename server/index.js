@@ -1,6 +1,17 @@
 require('dotenv').config();
 
 const crypto = require('crypto');
+
+// A safety server must not die silently. Unhandled rejections are logged and
+// survived; a truly uncaught exception logs loudly and exits so the platform
+// restarts a clean process (sessions live in Redis and survive the restart).
+process.on('unhandledRejection', reason => {
+  console.error('[fatal-ish] Unhandled promise rejection:', reason);
+});
+process.on('uncaughtException', err => {
+  console.error('[fatal] Uncaught exception — exiting for a clean restart:', err);
+  process.exit(1);
+});
 const { spawn } = require('child_process');
 let LiveKit = null;
 try { LiveKit = require('livekit-server-sdk'); } catch { LiveKit = null; }
@@ -147,12 +158,15 @@ app.post('/clientlog', (req, res) => {
     console.log(`[trace] ${b.name || '?'} — ${b.message || ''}`);
     return res.json({ ok: true });
   }
+  // Clamp + strip newlines: this endpoint is public, so unbounded fields
+  // would allow log flooding and forged log lines.
+  const clamp = (v, n) => String(v ?? '').replace(/[\r\n]+/g, ' | ').slice(0, n);
   console.log('[clientlog] ===== CLIENT STARTUP ERROR =====');
-  console.log('[clientlog] phase   =', b.phase);
-  console.log('[clientlog] isFatal =', b.isFatal);
-  console.log('[clientlog] name    =', b.name);
-  console.log('[clientlog] message =', b.message);
-  console.log('[clientlog] stack   =', b.stack);
+  console.log('[clientlog] phase   =', clamp(b.phase, 100));
+  console.log('[clientlog] isFatal =', !!b.isFatal);
+  console.log('[clientlog] name    =', clamp(b.name, 200));
+  console.log('[clientlog] message =', clamp(b.message, 1000));
+  console.log('[clientlog] stack   =', clamp(b.stack, 4000));
   console.log('[clientlog] ================================');
   res.json({ ok: true });
 });
@@ -470,6 +484,18 @@ app.use('/safe', smsLimiter);
 app.use('/checkin/start', smsLimiter);
 app.use('/session/start', smsLimiter);
 app.use('/test', smsLimiter);
+// These can trigger SMS too (intro notices, verification codes) — same limits.
+app.use('/circle/sync', smsLimiter);
+app.use('/push/register', smsLimiter);
+app.use('/push/verify', smsLimiter);
+// Unauthenticated log sink: tight limit so it can't be used to flood logs.
+app.use('/clientlog', rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 60,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Too many requests.' },
+}));
 
 // ── Public static assets (legal pages + opt-in screenshots) ───────────────────
 // Served from server/public with NO X-MIH-Key auth so a plain browser (and the
@@ -728,8 +754,9 @@ async function sendSmsToAll(phones, body) {
         data: url ? { url } : {},
       })),
     );
-    if (!tickets) {
-      // Expo API unreachable — the alert MUST still land: SMS everyone.
+    if (!tickets || tickets.length !== pushTargets.length) {
+      // Expo API unreachable OR returned a partial/mismatched ticket list —
+      // we can't tell who was accepted, and the alert MUST land: SMS everyone.
       smsTargets = smsTargets.concat(pushTargets.map(p => p.to));
     } else {
       const accepted = [];
@@ -1426,6 +1453,12 @@ async function escalationSweep() {
     if (lastSeen && now - lastSeen > 2 * 60 * 1000) {
       const fresh = await sessionGet(sessionId);
       if (!fresh || fresh.ended) continue;
+      // Re-check liveness on the FRESH read: the batch snapshot can be minutes
+      // old by the time this session is evaluated (the sweep awaits SMS sends),
+      // and a heartbeat that landed mid-sweep means the app is alive — ending
+      // it here would falsely mark a live user "safe" and kill their alerts.
+      const freshSeen = Number(fresh.updatedAt || fresh.startedAt || 0);
+      if (freshSeen && Date.now() - freshSeen <= 2 * 60 * 1000) continue;
       await sessionSet(sessionId, { ...fresh, ended: true, endedAt: Date.now(), endedBy: 'app-closed' });
       liveFrames.delete(sessionId);
       const phones = [...new Set((s.tiers || []).flatMap(t => t.phones || []))];
@@ -1518,7 +1551,10 @@ app.post('/session/start', async (req, res) => {
   const { sessionId, phones, name, latitude, longitude, tiers: clientTiers, livekit } = req.body;
   // Strict id shape: it's embedded in SMS links and the live page's markup, so
   // never let an attacker-shaped id exist in the first place.
-  if (!sessionId || !/^[\w-]{8,64}$/.test(String(sessionId))) {
+  // 24-char minimum: public live endpoints are guarded only by knowledge of
+  // this id, so a short/guessable client-chosen id would expose the stream.
+  // (The app generates "session_" + 32 hex chars = 40.)
+  if (!sessionId || !/^[\w-]{24,64}$/.test(String(sessionId))) {
     return res.status(400).json({ error: 'Valid sessionId required.' });
   }
   const coordErr = validateCoords(latitude, longitude);
@@ -1582,10 +1618,22 @@ app.post('/session/update', async (req, res) => {
   if (session.ownerToken && session.ownerToken !== token) {
     return res.status(403).json({ error: 'Forbidden.' });
   }
-  await sessionSet(sessionId, { ...session, latitude: latitude ?? null, longitude: longitude ?? null, updatedAt: Date.now() });
+  // Fresh-read-merge (same reason as commitSweepProgress): this handler's
+  // GET→SET pair races /safe and the sweep. Writing a stale snapshot here
+  // could erase a concurrent `ended: true` and resurrect alerting after the
+  // user declared safe — so re-read right before writing, never write over
+  // `ended`, and let the sweep keep ownership of alertedAt/cycleAt.
+  const fresh = (await sessionGet(sessionId)) || session;
+  if (!fresh.ended) {
+    await sessionSet(sessionId, { ...fresh, latitude: latitude ?? null, longitude: longitude ?? null, updatedAt: Date.now() });
+    // Keep the short live link alive as long as the session is: the session's
+    // TTL refreshes on every heartbeat, but short:<code> was set once at start
+    // — without this, a session past 24h would escalate with a dead /l/ link.
+    if (fresh.shortId) shortSet(fresh.shortId, sessionId).catch(() => {});
+  }
   // acknowledged lets the user's app show "someone is on their way" (it never
   // affects the alerting — that runs until the user marks safe).
-  res.json({ ok: true, acknowledged: !!session.acknowledged });
+  res.json({ ok: true, acknowledged: !!fresh.acknowledged, ended: !!fresh.ended });
 });
 
 // POST /session/end
@@ -1991,9 +2039,12 @@ app.post('/ack/:sessionId', async (req, res) => {
   // Ended sessions are kept for recording delivery — a stale tab's "on my way"
   // must not text the whole circle about a finished session.
   if (session && !session.acknowledged && !session.ended) {
+    // Fresh-read-merge so this write can't clobber a concurrent `ended: true`
+    // or the sweep's alertedAt/cycleAt progress.
+    const fresh = (await sessionGet(sessionId)) || session;
+    if (fresh.ended) return res.redirect(303, `/live/${encodeURIComponent(sessionId)}`);
+    await sessionSet(sessionId, { ...fresh, acknowledged: true, ackedAt: Date.now() });
     session.acknowledged = true;
-    session.ackedAt = Date.now();
-    await sessionSet(sessionId, session);
     console.log(`[ack] ${sessionId} acknowledged (informational — alerts continue until the user is safe).`);
     // Tell the circle someone is heading over. Purely informational: it does
     // NOT stop the alerts — only the user marking safe does. Sent once
@@ -2276,18 +2327,77 @@ app.post('/push/register', async (req, res) => {
   const token = req.body?.token == null ? '' : String(req.body.token).trim();
   const deviceToken = String(req.headers['x-mih-key'] || '');
   if (token === '') {
-    await pushTokenDel(phone);
-    await ownPhoneDel(deviceToken);
-    console.log('[push] registration removed for a number.');
+    // Removal is only honored for the number this device itself verified —
+    // otherwise anyone could un-register someone else's push delivery.
+    if ((await ownPhoneGet(deviceToken)) === phone) {
+      await pushTokenDel(phone);
+      await ownPhoneDel(deviceToken);
+      console.log('[push] registration removed for a number.');
+    }
     return res.json({ ok: true, removed: true });
   }
   if (!/^Expo(nent)?PushToken\[[\w+/=-]+\]$/.test(token)) {
     return res.status(400).json({ error: 'Invalid push token.' });
   }
-  await pushTokenSet(phone, token);
+
+  // OWNERSHIP: binding a phone number to a push token diverts that number's
+  // safety alerts to this device — so the number must be PROVEN, not claimed
+  // (otherwise any app user could hijack another person's alerts, and
+  // /circles/mine would leak who protects whom). Proof = a 6-digit code
+  // texted to the number. A device that already proved a number may refresh
+  // its push token for that same number silently (the every-launch path).
+  if ((await ownPhoneGet(deviceToken)) === phone) {
+    await pushTokenSet(phone, token); // trusted refresh
+    return res.json({ ok: true });
+  }
+  if (!twilioClient) return res.status(503).json({ error: 'Verification is unavailable right now.' });
+  const capped = await incrDailyCount(deviceToken, 1);
+  if (capped > DAILY_CAP) return res.status(429).json({ error: 'Daily message limit reached for this device.' });
+  const code = String(crypto.randomInt(100000, 1000000));
+  const pending = { phone, expoToken: token, code, tries: 0, at: Date.now() };
+  if (redis) await redisSet(`pushverify:${deviceToken}`, pending, 10 * 60);
+  else {
+    pushVerifyMemory.set(deviceToken, pending);
+    setTimeout(() => pushVerifyMemory.delete(deviceToken), 10 * 60 * 1000);
+  }
+  try {
+    // Always SMS (never push) — the point is proving control of the SIM.
+    await twilioClient.messages.create({
+      body: `Make It Home code: ${code}. Enter it in the app to get circle alerts on this phone. Reply STOP to opt out.`,
+      from: TWILIO_PHONE_NUMBER,
+      to: phone,
+    });
+  } catch (e) {
+    return res.status(502).json({ error: 'Could not text a verification code to that number.' });
+  }
+  console.log('[push] verification code sent for a number.');
+  res.json({ ok: true, pending: true });
+});
+
+// ── POST /push/verify ─────────────────────────────────────────────────────────
+// Completes /push/register: { phone, code }. Five attempts per pending code.
+const pushVerifyMemory = new Map();
+app.post('/push/verify', async (req, res) => {
+  const deviceToken = String(req.headers['x-mih-key'] || '');
+  const phone = String(req.body?.phone || '').trim();
+  const code = String(req.body?.code || '').trim();
+  const pending = redis ? await redisGet(`pushverify:${deviceToken}`) : pushVerifyMemory.get(deviceToken);
+  if (!pending || pending.phone !== phone) {
+    return res.status(400).json({ error: 'No pending verification. Save your number again.' });
+  }
+  if (pending.tries >= 5) return res.status(429).json({ error: 'Too many attempts. Save your number again.' });
+  if (!/^\d{6}$/.test(code) || code !== pending.code) {
+    pending.tries += 1;
+    if (redis) await redisSet(`pushverify:${deviceToken}`, pending, 10 * 60);
+    else pushVerifyMemory.set(deviceToken, pending);
+    return res.status(400).json({ error: 'Wrong code.' });
+  }
+  if (redis) await redisDel(`pushverify:${deviceToken}`);
+  else pushVerifyMemory.delete(deviceToken);
+  await pushTokenSet(phone, pending.expoToken);
   await ownPhoneSet(deviceToken, phone); // powers GET /circles/mine
-  console.log('[push] registered a number for push delivery.');
-  res.json({ ok: true });
+  console.log('[push] number verified and registered for push delivery.');
+  res.json({ ok: true, verified: true });
 });
 
 // ── POST /test ────────────────────────────────────────────────────────────────
@@ -2553,15 +2663,27 @@ app.post('/circle/sync', async (req, res) => {
     if (!(await introSeen(token, p))) toIntro.push(p);
   }
   if (toIntro.length) {
-    const who = nm || (await ownerNameGet(token)) || 'Someone you know';
-    (async () => {
-      const r = await sendSmsToAll(
-        toIntro,
-        `Make It Home: ${who} added you to their safety circle. When they start a safety session, you'll get a link to watch over them.\nReply STOP to opt out.`,
-      );
-      for (const p of toIntro) introMark(token, p).catch(() => {});
-      console.log(`[intro] circle-add notice sent ${r.sent}/${toIntro.length}.`);
-    })().catch(() => {});
+    // ABUSE GUARDS: intro notices send SMS to numbers the device chose, so
+    // they MUST count against the same per-device daily cap as alerts (an
+    // uncapped path here is an open SMS relay — cycle 10 fresh numbers per
+    // sync and the cap never trips). The name is sender-controlled text
+    // inside our SMS: collapse whitespace and keep it short so it can't
+    // smuggle a multi-line phishing body.
+    const counted = await incrDailyCount(token, toIntro.length);
+    if (counted > DAILY_CAP) {
+      console.warn('[intro] skipped — daily cap reached for this device.');
+    } else {
+      const who =
+        (nm || (await ownerNameGet(token)) || 'Someone you know').replace(/\s+/g, ' ').slice(0, 40);
+      (async () => {
+        const r = await sendSmsToAll(
+          toIntro,
+          `Make It Home: ${who} added you to their safety circle. When they start a safety session, you'll get a link to watch over them.\nReply STOP to opt out.`,
+        );
+        for (const p of toIntro) introMark(token, p).catch(() => {});
+        console.log(`[intro] circle-add notice sent ${r.sent}/${toIntro.length}.`);
+      })().catch(() => {});
+    }
   }
 
   console.log(`[/circle/sync] Stored ${unique.length} number(s) for a device.`);

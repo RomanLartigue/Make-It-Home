@@ -1,13 +1,13 @@
 // Escalation ladder — RE-NOTIFICATION model.
 //
-// A "round" is not a group of people; it's another text to the WHOLE safety
-// circle. When you go live, everyone is alerted immediately. If no one taps
-// "I'm on my way", everyone is texted again after each scheduled wait, until
-// someone acknowledges (or the rounds run out).
+// A "round" is not a group of people; it's another alert to the WHOLE safety
+// circle. When you go live, everyone is alerted immediately, then re-alerted
+// on the schedule, then every 5 minutes forever once the slide time has fully
+// passed. ONLY the user stops alerts, by marking themselves safe — a
+// responder's "I'm on my way" is informational and never halts the ladder.
 //
-// Free users get a fixed schedule (another text after 5, then 10, then 15 min).
-// Silver/Gold can customize the intervals and how many rounds — gated when
-// subscriptions ship (see makeithome-monetization-plan).
+// Free users get the thirds-of-the-slider schedule; Gold customizes the
+// intervals and how many rounds (see makeithome-monetization-plan).
 
 export const ESCALATION_SCHEDULE_KEY = '@makeithome_escalation_schedule';
 

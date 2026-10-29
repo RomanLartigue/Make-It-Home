@@ -180,7 +180,8 @@ export default function EscalationScreen() {
           ))}
         </View>
         <Text style={styles.note}>
-          The moment a responder taps “I’m on my way,” the reminders stop — no one is texted again.
+          When a responder taps “I’m on my way,” you’ll see it — but the reminders keep going
+          until you mark yourself safe. Only you can stop the alerts.
         </Text>
 
         {gold ? (
