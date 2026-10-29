@@ -124,8 +124,9 @@ export default function OnboardingScreen() {
               returnKeyType="next"
             />
             <Text style={styles.p}>
-              And your phone number — when someone adds you to their safety circle, their alerts
-              reach you right here as notifications instead of texts. (Optional)
+              Your phone number is optional — totally fine to skip. With it, when someone adds you
+              to their safety circle, their alerts reach you here as notifications; without it,
+              you simply get texts. You can add or change it any time in Settings.
             </Text>
             <TextInput
               style={styles.input}
@@ -134,7 +135,7 @@ export default function OnboardingScreen() {
                 setPhone(t);
                 setPhoneErr(null);
               }}
-              placeholder="Your phone number (optional)"
+              placeholder="Phone number (optional — skip is fine)"
               placeholderTextColor={Beacon.faint}
               keyboardType="phone-pad"
               returnKeyType="done"

@@ -6,7 +6,7 @@ import Ionicons from '@expo/vector-icons/Ionicons';
 
 import { getServerUrl, fetchWithAuth } from '@/utils/serverUrl';
 import { Beacon, AVATAR_COLORS, initials } from '@/constants/beacon';
-import { Card, DetailHeader } from '@/components/beacon/kit';
+import { Card, DetailHeader, PillButton } from '@/components/beacon/kit';
 
 // "Whose circles am I in?" — the mirror of the Safety circle screen. The
 // server answers for this device's OWN registered number (entered during
@@ -83,8 +83,13 @@ export default function CirclesScreen() {
             <Ionicons name="call-outline" size={40} color={Beacon.faint} />
             <Text style={styles.emptyText}>
               Make It Home doesn&apos;t know your number yet, so it can&apos;t match you to circles.
-              Your number is added during setup — it&apos;s how alerts reach you as notifications too.
+              Add it and alerts from people who added you will reach you here as notifications too.
             </Text>
+            <PillButton
+              title="Add my number in Settings"
+              onPress={() => router.push('/explore')}
+              style={{ marginTop: 4, alignSelf: 'stretch' }}
+            />
           </View>
         ) : circles.length === 0 ? (
           <View style={styles.center}>
