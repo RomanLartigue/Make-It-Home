@@ -28,10 +28,13 @@ Write-Host ''
 Write-Host 'Step 1 of 3 done: local files updated.' -ForegroundColor Green
 
 # 2) Railway (live server) -----------------------------------------------------
+# Full path: Roman's terminal does not have the npm global folder on PATH, so
+# the bare name "railway" is not recognized there.
+$railway = 'C:\Users\roman\AppData\Roaming\npm\railway.cmd'
 Set-Location (Join-Path $root 'server')
-railway variables --set "REGISTRATION_SECRET=$sec" | Out-Null
+& $railway variables --set "REGISTRATION_SECRET=$sec" | Out-Null
 if ($LASTEXITCODE -ne 0) {
-  Write-Host 'Railway update FAILED. Run "railway login" and then run this script again.' -ForegroundColor Red
+  Write-Host 'Railway update FAILED. Tell Claude.' -ForegroundColor Red
   exit 1
 }
 Write-Host 'Step 2 of 3 done: live server updated (it restarts itself in ~1 minute).' -ForegroundColor Green
