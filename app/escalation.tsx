@@ -1,7 +1,7 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { View, Text, StyleSheet, ScrollView, Pressable, TextInput } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { useRouter } from 'expo-router';
+import { useFocusEffect, useRouter } from 'expo-router';
 import Ionicons from '@expo/vector-icons/Ionicons';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
@@ -55,6 +55,29 @@ export default function EscalationScreen() {
       setLoaded(true);
     })();
   }, []);
+
+  // Re-read the circle count on every focus: this screen's own empty-state card
+  // links to "Add someone" — coming back from there used to still show
+  // "No one in your circle yet" (mount-only read), as if the add had failed.
+  useFocusEffect(
+    useCallback(() => {
+      let active = true;
+      AsyncStorage.getItem(CIRCLE_KEY)
+        .then(raw => {
+          if (!active) return;
+          try {
+            const c = raw ? JSON.parse(raw) : [];
+            setCircleCount(Array.isArray(c) ? c.length : 0);
+          } catch {
+            setCircleCount(0);
+          }
+        })
+        .catch(() => {});
+      return () => {
+        active = false;
+      };
+    }, []),
+  );
 
   // Free users' schedule is thirds of whatever they slide to (shown here with a
   // 30-minute example: alerts at 10 / 20 / 30). Gold users run whatever they've

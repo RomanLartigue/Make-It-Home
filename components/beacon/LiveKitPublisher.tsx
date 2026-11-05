@@ -186,7 +186,11 @@ export function LiveKitPublisher({
   // mic publishing while backgrounded; the camera track goes black, so we show
   // the paused panel instead.
   useEffect(() => {
-    const sub = AppState.addEventListener('change', s => setPaused(s !== 'active'));
+    // Only a real BACKGROUND counts as paused: iOS fires 'inactive' for
+    // Control Center pulls, Face ID sheets and incoming-call banners — the
+    // camera is still capturing then, and flashing the full "You left the app"
+    // cover mid-emergency was alarming and wrong.
+    const sub = AppState.addEventListener('change', s => setPaused(s === 'background'));
     return () => sub.remove();
   }, []);
 

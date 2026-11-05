@@ -15,7 +15,12 @@ export default function LegalScreen() {
     <SafeAreaView style={styles.root}>
       <View style={styles.head}>
         <Text style={styles.title}>{isPrivacy ? 'Privacy Policy' : 'Terms of Service'}</Text>
-        <Pressable onPress={() => router.back()} hitSlop={8}>
+        <Pressable
+          // History-safe: a deep-link cold start onto this screen has no back
+          // stack, where back() is a no-op and "Done" was the only control.
+          onPress={() => (router.canGoBack() ? router.back() : router.replace('/(tabs)'))}
+          hitSlop={8}
+        >
           <Text style={styles.done}>Done</Text>
         </Pressable>
       </View>

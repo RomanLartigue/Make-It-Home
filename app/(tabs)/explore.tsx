@@ -33,6 +33,7 @@ export default function SettingsScreen() {
   const [saved, setSaved] = useState(false);
   const [myPhone, setMyPhoneText] = useState('');
   const [phoneSaved, setPhoneSaved] = useState(false);
+  const [phoneSaving, setPhoneSaving] = useState(false);
   const [phoneError, setPhoneError] = useState<string | null>(null);
   const [testing, setTesting] = useState(false);
   const [serverStatus, setServerStatus] = useState<'idle' | 'ok' | 'error'>('idle');
@@ -63,8 +64,11 @@ export default function SettingsScreen() {
     try {
       const serverUrl = await getServerUrl();
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 5000);
-      const res = await fetchWithAuth(`${serverUrl}/health`, { signal: controller.signal });
+      const timer = setTimeout(() => controller.abort(), 8000);
+      // An AUTHENTICATED endpoint on purpose: /health is auth-exempt, so a
+      // device that could never register (broken build secret) still showed
+      // "✓ you're ready" here while every real alert would 401.
+      const res = await fetchWithAuth(`${serverUrl}/circles/mine`, { signal: controller.signal });
       clearTimeout(timer);
       setServerStatus(res.ok ? 'ok' : 'error');
     } catch {
@@ -75,32 +79,42 @@ export default function SettingsScreen() {
   };
 
   const handleSavePhone = async () => {
+    if (phoneSaving) return; // a double-tap would request two verification codes
     setPhoneError(null);
     const raw = myPhone.trim();
-    if (!raw) {
-      // Cleared on purpose: stop notification delivery, alerts go back to texts.
-      await setMyPhone(null);
+    setPhoneSaving(true);
+    try {
+      if (!raw) {
+        // Cleared on purpose: stop notification delivery, alerts go back to texts.
+        const err = await setMyPhone(null);
+        if (err) {
+          setPhoneError(err);
+          return;
+        }
+        setPhoneSaved(true);
+        hSuccess();
+        setTimeout(() => setPhoneSaved(false), 1600);
+        return;
+      }
+      const e164 = toE164(raw);
+      if (!e164) {
+        setPhoneError('That doesn’t look like a dialable number. US: 212 555 1234 — elsewhere, include the +country code.');
+        return;
+      }
+      setMyPhoneText(e164);
+      // setMyPhone registers with the server; a NEW number triggers the texted
+      // 6-digit verification code (the prompt appears on its own).
+      const err = await setMyPhone(e164);
+      if (err) {
+        setPhoneError(err);
+        return;
+      }
       setPhoneSaved(true);
       hSuccess();
       setTimeout(() => setPhoneSaved(false), 1600);
-      return;
+    } finally {
+      setPhoneSaving(false);
     }
-    const e164 = toE164(raw);
-    if (!e164) {
-      setPhoneError('Enter a valid US phone number, e.g. 212 555 1234.');
-      return;
-    }
-    setMyPhoneText(e164);
-    // setMyPhone registers with the server; a NEW number triggers the texted
-    // 6-digit verification code (the prompt appears on its own).
-    const err = await setMyPhone(e164);
-    if (err) {
-      setPhoneError(err);
-      return;
-    }
-    setPhoneSaved(true);
-    hSuccess();
-    setTimeout(() => setPhoneSaved(false), 1600);
   };
 
   const deleteMyData = async () => {
@@ -115,15 +129,42 @@ export default function SettingsScreen() {
       );
       return;
     }
+    // Same for a pending check-in: wiping locally while the SERVER timer kept
+    // running meant the circle got a "missed check-in" emergency text an hour
+    // after the user believed everything was erased.
+    const pendingCheckIn = await AsyncStorage.getItem('@makeithome_checkin').catch(() => null);
+    if (pendingCheckIn) {
+      Alert.alert(
+        'Cancel your check-in first',
+        'You have a Home-safe check-in running. Mark yourself safe on the Home tab, then delete your data.',
+      );
+      return;
+    }
     confirmDestructive(
       'Delete my data',
       'This erases your name, safety circle, and check-in state from this device and signs it out. This cannot be undone.',
       'Delete everything',
       async () => {
-        // Clear the server-side circle first, then purge the account.
+        // The SERVER delete must succeed before anything is wiped locally:
+        // offline, the old flow "succeeded" into onboarding while the server
+        // kept the circle, the push registration, and any timers.
         try {
-          await syncCircle([]);
-        } catch {}
+          const serverUrl = await getServerUrl();
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 10_000);
+          const res = await fetchWithAuth(`${serverUrl}/account/delete`, {
+            method: 'POST',
+            signal: controller.signal,
+          });
+          clearTimeout(timer);
+          if (!res.ok && res.status !== 401) throw new Error(`HTTP ${res.status}`);
+        } catch {
+          Alert.alert(
+            "Couldn't reach the server",
+            'Your data was NOT deleted. Connect to the internet and try again, so the copy on our server is erased too.',
+          );
+          return;
+        }
         // Stop the native background-location task (it survives relaunches —
         // without this a crashed session's GPS would run until reinstall) and
         // drop any scheduled check-in warning notifications.
@@ -131,15 +172,9 @@ export default function SettingsScreen() {
           await stopBackgroundLocation().catch(() => {});
           await Notifications.cancelAllScheduledNotificationsAsync().catch(() => {});
         }
-        // Un-register push delivery for this person's number — otherwise the
-        // server would keep routing circle alerts to this (now wiped) device.
-        try {
-          await setMyPhone(null);
-        } catch {}
-        try {
-          const serverUrl = await getServerUrl();
-          await fetchWithAuth(`${serverUrl}/account/delete`, { method: 'POST' });
-        } catch {}
+        // (Push un-registration and the server purge already happened in the
+        // /account/delete above — the server now cleans the phone→push binding
+        // itself, so no extra calls that could mint a fresh token post-delete.)
         // Reset the in-memory Gold cache too — wiping only the stored flag
         // leaves Gold active until the next app restart.
         await setGold(false).catch(() => {});
@@ -177,7 +212,8 @@ export default function SettingsScreen() {
             title={saved ? '✓ Saved' : 'Save'}
             kind={saved ? 'dark' : 'primary'}
             onPress={handleSave}
-            style={{ marginTop: 10, opacity: name.trim() ? 1 : 0.5 }}
+            disabled={!name.trim()}
+            style={{ marginTop: 10 }}
           />
         </Card>
         <Card style={{ marginTop: 8, paddingVertical: 12 }}>
@@ -200,9 +236,10 @@ export default function SettingsScreen() {
           />
           {phoneError ? <Text style={styles.fieldError}>{phoneError}</Text> : null}
           <PillButton
-            title={phoneSaved ? '✓ Saved' : 'Save number'}
+            title={phoneSaving ? 'Saving…' : phoneSaved ? '✓ Saved' : 'Save number'}
             kind={phoneSaved ? 'dark' : 'primary'}
             onPress={handleSavePhone}
+            disabled={phoneSaving}
             style={{ marginTop: 10 }}
           />
         </Card>

@@ -151,16 +151,25 @@ app.use((req, res, next) => {
 // Diagnostic: the app POSTs uncaught JS startup errors here so we can read the
 // real error text in the server logs (a Release build otherwise just abort()s
 // with no visible message). Public + unauthenticated on purpose — it only logs.
+// Rate limit mounted BEFORE the route — Express matches in registration order,
+// so a limiter mounted later never runs for this path.
+app.use('/clientlog', rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 60,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Too many requests.' },
+}));
 app.post('/clientlog', (req, res) => {
   const b = req.body || {};
-  // Session lifecycle breadcrumbs (background/foreground/upload) — one line each.
-  if (b.phase === 'session-trace') {
-    console.log(`[trace] ${b.name || '?'} — ${b.message || ''}`);
-    return res.json({ ok: true });
-  }
   // Clamp + strip newlines: this endpoint is public, so unbounded fields
   // would allow log flooding and forged log lines.
   const clamp = (v, n) => String(v ?? '').replace(/[\r\n]+/g, ' | ').slice(0, n);
+  // Session lifecycle breadcrumbs (background/foreground/upload) — one line each.
+  if (b.phase === 'session-trace') {
+    console.log(`[trace] ${clamp(b.name, 120) || '?'} — ${clamp(b.message, 500)}`);
+    return res.json({ ok: true });
+  }
   console.log('[clientlog] ===== CLIENT STARTUP ERROR =====');
   console.log('[clientlog] phase   =', clamp(b.phase, 100));
   console.log('[clientlog] isFatal =', !!b.isFatal);
@@ -192,13 +201,21 @@ if (!twilioClient) {
 // If not set, falls back to in-memory Maps (fine for local dev).
 let redis = null;
 if (REDIS_URL) {
-  redis = new Redis(REDIS_URL, { lazyConnect: true, maxRetriesPerRequest: 2 });
+  redis = new Redis(REDIS_URL, {
+    lazyConnect: true,
+    maxRetriesPerRequest: 2,
+    // Never give up reconnecting: a transient blip at boot must not silently
+    // drop production to in-memory mode until the next deploy.
+    retryStrategy: times => Math.min(times * 500, 10_000),
+  });
   redis.on('connect', () => console.log('[redis] Connected.'));
   redis.on('error', err => console.error('[redis] Error:', err.message));
-  redis.connect().catch(() => {
-    console.warn('[redis] Could not connect — falling back to in-memory store.');
-    redis = null;
-  });
+  const tryConnect = () =>
+    redis.connect().catch(() => {
+      console.warn('[redis] Could not connect — retrying in 15s (requests fall back/fail-closed meanwhile).');
+      setTimeout(tryConnect, 15_000);
+    });
+  tryConnect();
 }
 
 // In production, check-in timers MUST survive restarts/redeploys — otherwise the
@@ -216,9 +233,20 @@ const CHECKIN_PREFIX = 'checkin:';
 const SESSION_PREFIX = 'session:';
 const SESSION_TTL = 24 * 60 * 60; // seconds
 
+// Returns true when the value is durably stored, false when the write failed.
+// Callers that SEND things based on persisted state (the escalation sweep)
+// must check this: a swallowed write failure (Redis maxmemory, read-only
+// replica) would make every later pass believe the send never happened and
+// re-text the circle forever.
 async function redisSet(key, value, ttlSeconds) {
-  if (!redis) return;
-  await redis.set(key, JSON.stringify(value), 'EX', ttlSeconds).catch(() => {});
+  if (!redis) return true; // in-memory mode: caller's own Map write is the store
+  try {
+    await redis.set(key, JSON.stringify(value), 'EX', ttlSeconds);
+    return true;
+  } catch (e) {
+    console.error(`[redis] SET failed for ${key.slice(0, 30)}…: ${e?.message || e}`);
+    return false;
+  }
 }
 
 async function redisDel(key) {
@@ -229,7 +257,13 @@ async function redisDel(key) {
 async function redisGet(key) {
   if (!redis) return null;
   const raw = await redis.get(key).catch(() => null);
-  return raw ? JSON.parse(raw) : null;
+  if (!raw) return null;
+  // One corrupt value must not become an unhandled rejection inside the auth
+  // middleware (the request would hang forever under Express 4).
+  try { return JSON.parse(raw); } catch {
+    console.error(`[redis] Corrupt JSON under ${key.slice(0, 40)} — treating as missing.`);
+    return null;
+  }
 }
 
 async function redisScanAll(pattern) {
@@ -260,10 +294,28 @@ async function saveToken(token, deviceId) {
   }
 }
 
+// Recently-validated tokens are cached in memory for 1h so a Redis outage
+// doesn't 401 panic alerts from devices that were just fine (fail-closed auth
+// is right for strangers, wrong for a phone that authenticated minutes ago).
+const tokenCache = new Map(); // token → cachedUntil (ms)
 async function isTokenValid(token) {
   if (redis) {
-    const val = await redisGet(`${TOKEN_PREFIX}${token}`);
-    return val !== null;
+    try {
+      const raw = await redis.get(`${TOKEN_PREFIX}${token}`);
+      if (raw !== null) {
+        tokenCache.set(token, Date.now() + 60 * 60 * 1000);
+        if (tokenCache.size > 5000) tokenCache.delete(tokenCache.keys().next().value);
+        // Sliding expiry: an app in active use must never have its token rot
+        // out mid-session (a rotated token orphans session/check-in ownership,
+        // leaving alerts the user can no longer stop).
+        redis.expire(`${TOKEN_PREFIX}${token}`, TOKEN_TTL).catch(() => {});
+        return true;
+      }
+      return false;
+    } catch {
+      const until = tokenCache.get(token);
+      return !!until && until > Date.now();
+    }
   }
   return tokenStore.has(token);
 }
@@ -458,15 +510,51 @@ async function recipientsFor(req, clientPhones) {
 // Panic/alert endpoints: a safety app shouldn't hard-block a user who triggers
 // repeatedly, so keep this generous. Logs a line when it does reject, so a
 // "can't reach server" report can be distinguished from a rate-limit.
+// KEYED BY DEVICE TOKEN, not IP: mobile carriers put thousands of users behind
+// one CGNAT IP, so an IP-keyed pool shared across endpoints meant a handful of
+// strangers on the same carrier could 429 someone else's real panic alert.
+// Unauthenticated callers (no token yet) still key by IP.
+const deviceKey = req => {
+  const t = req.headers['x-mih-key'];
+  return t ? `t:${String(t).slice(0, 80)}` : `ip:${req.ip}`;
+};
 const smsLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: 40,
   standardHeaders: 'draft-7',
   legacyHeaders: false,
+  keyGenerator: deviceKey,
+  validate: false, // custom key: silence the ipv6-subnet validator
   handler: (req, res) => {
     console.warn(`[ratelimit] 429 ${req.method} ${req.path} ip=${req.ip}`);
     res.status(429).json({ error: 'Too many requests. Please wait before trying again.' });
   },
+});
+// Per-launch housekeeping (circle sync, push registration) runs much more often
+// than alerts — its own generous pool so it can never starve /session/start.
+const housekeepingLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 120,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  keyGenerator: deviceKey,
+  validate: false,
+  handler: (req, res) => {
+    console.warn(`[ratelimit] 429 ${req.method} ${req.path} ip=${req.ip}`);
+    res.status(429).json({ error: 'Too many requests. Please wait before trying again.' });
+  },
+});
+// Live-media firehose (a frame every ~2s + an audio chunk every ~5s is ~630 per
+// 15 min): generous but bounded, so an unauthenticated-adjacent flood can't
+// fill the disk or starve the event loop.
+const liveMediaLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 1200,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  keyGenerator: deviceKey,
+  validate: false,
+  message: { error: 'Too many requests.' },
 });
 
 // Tight limit on registration: 5 attempts per hour per IP.
@@ -482,20 +570,19 @@ app.use('/register', registerLimiter);
 app.use('/upload', smsLimiter);
 app.use('/safe', smsLimiter);
 app.use('/checkin/start', smsLimiter);
+app.use('/checkin/cancel', smsLimiter); // notifySafe texts the circle
 app.use('/session/start', smsLimiter);
 app.use('/test', smsLimiter);
-// These can trigger SMS too (intro notices, verification codes) — same limits.
-app.use('/circle/sync', smsLimiter);
-app.use('/push/register', smsLimiter);
-app.use('/push/verify', smsLimiter);
-// Unauthenticated log sink: tight limit so it can't be used to flood logs.
-app.use('/clientlog', rateLimit({
-  windowMs: 15 * 60 * 1000,
-  limit: 60,
-  standardHeaders: 'draft-7',
-  legacyHeaders: false,
-  message: { error: 'Too many requests.' },
-}));
+// These can trigger SMS too (intro notices, verification codes) but also run
+// on every launch — generous separate pool.
+app.use('/circle/sync', housekeepingLimiter);
+app.use('/push/register', housekeepingLimiter);
+app.use('/push/verify', housekeepingLimiter);
+// POST only: the responder page's GET polling (a frame every 1.2s for the whole
+// session) must never be throttled — it's unauthenticated viewing, not uploads.
+const postOnly = limiter => (req, res, next) => (req.method === 'POST' ? limiter(req, res, next) : next());
+app.use('/frame', postOnly(liveMediaLimiter));
+app.use('/audiochunk', postOnly(liveMediaLimiter));
 
 // ── Public static assets (legal pages + opt-in screenshots) ───────────────────
 // Served from server/public with NO X-MIH-Key auth so a plain browser (and the
@@ -520,33 +607,12 @@ app.get('/livekit-client.js', (req, res) => {
 });
 app.use(express.static(publicDir));
 
-// ── Hosted web app (Expo web export) ──────────────────────────────────────────
-// The Expo web build lives in server/web (exported with baseUrl "/app"). Serving
-// it here lets anyone run the app in a browser with nothing to install — same
-// origin as the API, so its fetch() calls need no CORS. Mounted before the auth
-// middleware so the static assets load without a token; the app still obtains a
-// per-device token via /register at runtime like the native app does.
-//
-// The global helmet CSP is strict (script-src 'none') for the live-tracking
-// page; the SPA needs to run its own JS bundle, so relax CSP for /app responses.
-const webAppDir = path.join(__dirname, 'web');
-const APP_CSP =
-  "default-src 'self'; " +
-  "script-src 'self' 'unsafe-inline' 'unsafe-eval'; " +
-  "style-src 'self' 'unsafe-inline'; " +
-  "img-src 'self' data: blob:; " +
-  "font-src 'self' data:; " +
-  "connect-src 'self' https://maps.google.com; " +
-  "worker-src 'self' blob:; " +
-  "child-src 'self' blob:";
-app.use('/app', (req, res, next) => {
-  res.setHeader('Content-Security-Policy', APP_CSP);
-  next();
-});
-app.use('/app', express.static(webAppDir));
-// SPA fallback: client-side routes (/app/contacts, /app/onboarding, …) that don't
-// map to a real file are served the app shell so the router can handle them.
-app.get(/^\/app(\/.*)?$/, (req, res) => res.sendFile(path.join(webAppDir, 'index.html')));
+// ── Hosted web app: REMOVED (Nov 2026) ────────────────────────────────────────
+// The Expo web export that used to be served at /app embedded the registration
+// secret in its world-readable JS bundle (it had to — it registered like the
+// native app), which made the secret public and let anyone mint device tokens.
+// The web build is gone and the secret has been rotated. Do not re-add a
+// self-registering web app without a separate low-privilege registration path.
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
 // Unauthenticated paths:
@@ -625,9 +691,11 @@ function clampDuration(seconds) {
   return Math.min(Math.max(Math.round(n), 60), 86400);
 }
 
-// Coerce to string, trim, cap at 100 chars before it's used in an SMS.
+// Coerce to string, collapse ALL whitespace (a newline in a device-controlled
+// name would let a multi-line phishing body ride inside our SMS templates),
+// trim, cap at 100 chars before it's used in an SMS.
 function cleanName(name) {
-  return (typeof name === 'string' ? name : '').trim().slice(0, 100);
+  return (typeof name === 'string' ? name : '').replace(/\s+/g, ' ').trim().slice(0, 100);
 }
 
 // ── Push notifications (Expo push service) ───────────────────────────────────
@@ -681,42 +749,82 @@ async function sendExpoPushes(messages) {
 // phone — send that person the SMS after all (and forget dead tokens). A
 // receipt that is merely missing is still in flight: leave it alone rather
 // than risk double-alerting.
-function verifyPushReceipts(items, body) {
-  setTimeout(async () => {
-    try {
-      const controller = new AbortController();
-      const t = setTimeout(() => controller.abort(), 10_000);
-      const res = await fetch('https://exp.host/--/api/v2/push/getReceipts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ids: items.map(i => i.id) }),
-        signal: controller.signal,
-      });
-      clearTimeout(t);
-      if (!res.ok) return;
-      const receipts = (await res.json().catch(() => null))?.data || {};
-      const failedPhones = [];
-      for (const it of items) {
-        const r = receipts[it.id];
-        if (r && r.status === 'error') {
-          failedPhones.push(it.to);
-          if (r?.details?.error === 'DeviceNotRegistered') pushTokenDel(it.to).catch(() => {});
-          console.error(`[push] receipt error (${r?.details?.error || r?.message || 'unknown'}) — falling back to SMS.`);
-        }
+//
+// PERSISTED, not a bare setTimeout: a redeploy inside the 25s window used to
+// silently drop the SMS fallback — the exact lost-alert this mechanism exists
+// to prevent. Pending checks live in Redis and the 15s sweep processes the due
+// ones, so they survive restarts.
+const RECEIPT_PREFIX = 'receiptcheck:';
+const receiptMemory = new Map();
+function queueReceiptCheck(items, body) {
+  const id = crypto.randomBytes(8).toString('hex');
+  const rec = { items, body, dueAt: Date.now() + 25_000 };
+  if (redis) {
+    redisSet(`${RECEIPT_PREFIX}${id}`, rec, 30 * 60).then(ok => {
+      if (!ok) receiptMemory.set(id, rec); // Redis write failed — keep it in memory
+    }).catch(() => receiptMemory.set(id, rec));
+  } else {
+    receiptMemory.set(id, rec);
+  }
+}
+
+async function checkReceiptsNow(items, body) {
+  try {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 10_000);
+    const res = await fetch('https://exp.host/--/api/v2/push/getReceipts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: items.map(i => i.id) }),
+      signal: controller.signal,
+    });
+    clearTimeout(t);
+    if (!res.ok) return;
+    const receipts = (await res.json().catch(() => null))?.data || {};
+    const failedPhones = [];
+    for (const it of items) {
+      const r = receipts[it.id];
+      if (r && r.status === 'error') {
+        failedPhones.push(it.to);
+        if (r?.details?.error === 'DeviceNotRegistered') pushTokenDel(it.to).catch(() => {});
+        console.error(`[push] receipt error (${r?.details?.error || r?.message || 'unknown'}) — falling back to SMS.`);
       }
-      if (failedPhones.length && twilioClient) {
-        const results = await Promise.allSettled(
-          failedPhones.map(to =>
-            Promise.resolve().then(() => twilioClient.messages.create({ body, from: TWILIO_PHONE_NUMBER, to })),
-          ),
-        );
-        const ok = results.filter(r => r.status === 'fulfilled').length;
-        console.log(`[push] receipt fallback: SMS sent ${ok}/${failedPhones.length}.`);
-      }
-    } catch {
-      // best-effort — the ticket-stage fallback already covered hard failures
     }
-  }, 25_000);
+    if (failedPhones.length && twilioClient) {
+      const results = await Promise.allSettled(
+        failedPhones.map(to =>
+          Promise.resolve().then(() => twilioClient.messages.create({ body, from: TWILIO_PHONE_NUMBER, to })),
+        ),
+      );
+      const ok = results.filter(r => r.status === 'fulfilled').length;
+      console.log(`[push] receipt fallback: SMS sent ${ok}/${failedPhones.length}.`);
+    }
+  } catch {
+    // best-effort — the ticket-stage fallback already covered hard failures
+  }
+}
+
+async function processDueReceiptChecks() {
+  const now = Date.now();
+  const due = [];
+  if (redis) {
+    for (const key of await redisScanAll(`${RECEIPT_PREFIX}*`)) {
+      const rec = await redisGet(key);
+      if (rec && rec.dueAt <= now) {
+        await redisDel(key); // claim before processing so a crash can't double-send more than once
+        due.push(rec);
+      }
+    }
+  }
+  for (const [id, rec] of receiptMemory) {
+    if (rec.dueAt <= now) {
+      receiptMemory.delete(id);
+      due.push(rec);
+    }
+  }
+  for (const rec of due) {
+    if (rec && Array.isArray(rec.items) && rec.items.length) await checkReceiptsNow(rec.items, rec.body);
+  }
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
@@ -776,7 +884,7 @@ async function sendSmsToAll(phones, body) {
       // problems), and that failure only shows up in the RECEIPT. For a safety
       // alert, silently-lost is the one unacceptable outcome, so check the
       // receipts shortly after and text anyone whose push truly failed.
-      if (accepted.length) verifyPushReceipts(accepted, body);
+      if (accepted.length) queueReceiptCheck(accepted, body);
     }
     if (pushSent) console.log(`[push] delivered ${pushSent}/${pushTargets.length} as free push.`);
   }
@@ -950,7 +1058,29 @@ app.get('/media/:filename', async (req, res) => {
 });
 
 // ── POST /upload ──────────────────────────────────────────────────────────────
-app.post('/upload', (req, res, next) => {
+// Per-device daily upload budget: historyOnly/gold uploads used to skip every
+// guard, letting any token fill the container's disk with 2GB files.
+const uploadCounts = new Map();
+async function incrUploadCount(token) {
+  const key = `upcount:${token}:${new Date().toISOString().slice(0, 10)}`;
+  if (redis) {
+    const c = await redis.incr(key).catch(() => 1);
+    if (c === 1) await redis.expire(key, 25 * 60 * 60).catch(() => {});
+    return c;
+  }
+  const c = (uploadCounts.get(key) || 0) + 1;
+  uploadCounts.set(key, c);
+  return c;
+}
+app.post('/upload', async (req, res, next) => {
+  const token = String(req.headers['x-mih-key'] || '');
+  const n = await incrUploadCount(token);
+  if (n > 40) {
+    console.warn('[/upload] Rejected (429): daily upload budget reached for a device.');
+    return res.status(429).json({ error: 'Daily upload limit reached for this device.' });
+  }
+  next();
+}, (req, res, next) => {
   upload.single('video')(req, res, err => {
     if (err) {
       const status = err.status || (err.code === 'LIMIT_FILE_SIZE' ? 413 : 400);
@@ -1207,7 +1337,12 @@ app.post('/checkin/start', async (req, res) => {
   const ownerToken = String(req.headers['x-mih-key'] || '');
   const entry = { phones: recipients, name: cleanName(name), latitude: latitude ?? null, longitude: longitude ?? null, expiresAt, ownerToken };
 
-  await redisSet(`${CHECKIN_PREFIX}${id}`, entry, dur + 60); // +60s grace period
+  // TTL is a LEAK BACKSTOP only (the key is explicitly deleted on fire/cancel),
+  // so make the grace a full day: with the old +60s, a redeploy straddling the
+  // deadline (Railway restarts take 1–3 min) expired the key before
+  // restoreCheckIns() could fire the late alert — the missed-check-in text was
+  // silently never sent. 24h grace means a late alert always beats a lost one.
+  await redisSet(`${CHECKIN_PREFIX}${id}`, entry, dur + 24 * 60 * 60);
   const timeout = scheduleAlert(id, entry, dur * 1000);
   checkIns.set(id, { ...entry, timeout });
 
@@ -1234,7 +1369,10 @@ app.post('/checkin/cancel', async (req, res) => {
   console.log(`[/checkin/cancel] Cancelled ${id}.`);
 
   if (notifySafe) {
-    const who = entry.name?.trim() || 'Your contact';
+    // Counted like every other send (safe notices used to bypass the cap,
+    // doubling the real per-check-in message budget).
+    await incrDailyCount(token, entry.phones.length).catch(() => {});
+    const who = cleanName(entry.name) || 'Your contact';
     const r = await sendSmsToAll(entry.phones, `✅ ${who} has checked in and is safe. Reply STOP to opt out.`);
     console.log(`[/checkin/cancel] Safe SMS: sent ${r.sent}, failed ${r.failed}.`);
   }
@@ -1265,7 +1403,8 @@ app.post('/checkin/extend', async (req, res) => {
   const newDelay = newExpiresAt - Date.now();
   const updatedEntry = { ...entry, expiresAt: newExpiresAt };
 
-  await redisSet(`${CHECKIN_PREFIX}${id}`, updatedEntry, Math.ceil(newDelay / 1000) + 60);
+  // Same 24h leak-backstop grace as /checkin/start (see comment there).
+  await redisSet(`${CHECKIN_PREFIX}${id}`, updatedEntry, Math.ceil(newDelay / 1000) + 24 * 60 * 60);
   const timeout = scheduleAlert(id, updatedEntry, newDelay);
   checkIns.set(id, { ...updatedEntry, timeout });
 
@@ -1282,12 +1421,14 @@ const sessionsMemory = new Map(); // fallback when Redis is not configured
 // (~1 every 2s), and worthless after the session ends. sessionId → { buf, at }.
 const liveFrames = new Map();
 
+// Returns true when the write is durably stored (see redisSet) — the sweep
+// checks this before trusting that "already alerted" will be remembered.
 async function sessionSet(sessionId, data) {
   if (redis) {
-    await redisSet(`${SESSION_PREFIX}${sessionId}`, data, SESSION_TTL);
-  } else {
-    sessionsMemory.set(sessionId, data);
+    return redisSet(`${SESSION_PREFIX}${sessionId}`, data, SESSION_TTL);
   }
+  sessionsMemory.set(sessionId, data);
+  return true;
 }
 
 async function sessionGet(sessionId) {
@@ -1429,8 +1570,23 @@ async function commitSweepProgress(sessionId, mutate) {
   const fresh = await sessionGet(sessionId);
   if (!fresh) return false;
   mutate(fresh);
-  await sessionSet(sessionId, fresh);
-  return true;
+  // Propagate the write result: a failed persist means the sweep must NOT
+  // trust that this progress will be remembered on the next pass.
+  return sessionSet(sessionId, fresh);
+}
+
+// In-memory "already sent this boot" guard, keyed `${sessionId}:<step>`.
+// Belt-and-braces against persist failures: if Redis stops accepting writes
+// (maxmemory, read-only replica) the sweep would otherwise re-read the old
+// state every 15s and re-text the same tier forever. Entries are pruned once
+// older than the session TTL.
+const sweepSent = new Map(); // key → ms timestamp
+function sweepSentMark(key) {
+  sweepSent.set(key, Date.now());
+  if (sweepSent.size > 10_000) {
+    const cutoff = Date.now() - SESSION_TTL * 1000;
+    for (const [k, at] of sweepSent) if (at < cutoff) sweepSent.delete(k);
+  }
 }
 
 async function escalationSweep() {
@@ -1445,12 +1601,16 @@ async function escalationSweep() {
     // Swipe-closing the app = "I'm safe" (product decision). A killed app can
     // run no code, so this is detected by silence: the app heartbeats
     // /session/update every 15s while alive (foreground AND background), and
-    // each heartbeat refreshes updatedAt. ~2 min of silence ⇒ the app was
+    // each heartbeat refreshes updatedAt. 5 min of silence ⇒ the app was
     // closed ⇒ end the session and tell the circle the user is safe, exactly
     // as if they'd pressed the button. (Trade-off, accepted: a dead battery is
-    // indistinguishable from a swipe-close and also reads as safe.)
+    // indistinguishable from a swipe-close and also reads as safe. The window
+    // was 2 min, but ordinary connectivity gaps — subway, garage, elevator —
+    // routinely exceed that and falsely texted "safe" mid-emergency; 5 min
+    // costs little on a real swipe-close and spares those.)
+    const LIVENESS_MS = 5 * 60 * 1000;
     const lastSeen = Number(s.updatedAt || s.startedAt || 0);
-    if (lastSeen && now - lastSeen > 2 * 60 * 1000) {
+    if (lastSeen && now - lastSeen > LIVENESS_MS) {
       const fresh = await sessionGet(sessionId);
       if (!fresh || fresh.ended) continue;
       // Re-check liveness on the FRESH read: the batch snapshot can be minutes
@@ -1458,12 +1618,22 @@ async function escalationSweep() {
       // and a heartbeat that landed mid-sweep means the app is alive — ending
       // it here would falsely mark a live user "safe" and kill their alerts.
       const freshSeen = Number(fresh.updatedAt || fresh.startedAt || 0);
-      if (freshSeen && Date.now() - freshSeen <= 2 * 60 * 1000) continue;
-      await sessionSet(sessionId, { ...fresh, ended: true, endedAt: Date.now(), endedBy: 'app-closed' });
+      if (freshSeen && Date.now() - freshSeen <= LIVENESS_MS) continue;
+      // Send-once guard: if this persist FAILS (Redis write outage), the next
+      // pass would see the session un-ended and text "is safe" again, every
+      // 15s, forever. The in-memory mark stops the re-send storm.
+      if (sweepSent.has(`${sessionId}:ended`)) {
+        console.error(`[liveness] ${sessionId}: ended-write still not persisted — suppressing repeat safe notice.`);
+        continue;
+      }
+      sweepSentMark(`${sessionId}:ended`);
+      const wrote = await sessionSet(sessionId, { ...fresh, ended: true, endedAt: Date.now(), endedBy: 'app-closed' });
+      if (!wrote) console.error(`[liveness] ${sessionId}: FAILED to persist ended=true — relying on in-memory guard.`);
       liveFrames.delete(sessionId);
       const phones = [...new Set((s.tiers || []).flatMap(t => t.phones || []))];
       const nm = cleanName(s.name) || 'Your contact';
       if (phones.length && twilioClient) {
+        incrDailyCount(s.ownerToken || 'unknown', phones.length).catch(() => {});
         sendSmsToAll(phones, `✅ ${nm} is safe. Reply STOP to opt out.`)
           .then(r => console.log(`[liveness] ${sessionId}: app closed — safe notice sent ${r.sent}/${phones.length}.`))
           .catch(() => {});
@@ -1495,12 +1665,24 @@ async function escalationSweep() {
       // batch read at the top of the sweep.
       const pre = await sessionGet(sessionId);
       if (!pre || pre.ended) continue;
+      // Send-once guard (survives a failed alertedAt persist — see liveness).
+      if (sweepSent.has(`${sessionId}:tier:${nextIdx}`)) {
+        console.error(`[escalation] ${sessionId}: tier ${nextIdx + 1} progress still not persisted — suppressing repeat send.`);
+        continue;
+      }
+      sweepSentMark(`${sessionId}:tier:${nextIdx}`);
+      // Escalation sends count against the same per-device daily cap as every
+      // other SMS (they were uncounted before). A real emergency is still never
+      // silenced: the cap only logs here, it does not skip a scheduled tier.
+      const tierCount = await incrDailyCount(s.ownerToken || 'unknown', next.phones.length);
+      if (tierCount > DAILY_CAP) console.warn(`[escalation] ${sessionId}: tier send is over the daily cap (${tierCount}) — sending anyway (scheduled tier).`);
       const liveLink = liveLinkFor(sessionId, s);
       const result = await sendSmsToAll(next.phones, sessionBodyEscalated(s.name, liveLink));
       const at = Date.now();
-      await commitSweepProgress(sessionId, fresh => {
+      const committed = await commitSweepProgress(sessionId, fresh => {
         if (Array.isArray(fresh.tiers) && fresh.tiers[nextIdx]) fresh.tiers[nextIdx].alertedAt = at;
       });
+      if (!committed) console.error(`[escalation] ${sessionId}: FAILED to persist tier ${nextIdx + 1} progress — in-memory guard prevents repeats.`);
       console.log(
         `[escalation] ${sessionId}: alerted tier ${nextIdx + 1} "${next.name}" ${result.sent}/${next.phones.length}.`,
       );
@@ -1512,12 +1694,27 @@ async function escalationSweep() {
     // link (current location + stream/recording) — forever, until the user is
     // safe. Only the user can stop this.
     const lastTier = s.tiers[s.tiers.length - 1];
-    const lastAt = Number(s.cycleAt || lastTier.alertedAt || 0);
+    // The in-memory mark also acts as the clock when the cycleAt persist fails,
+    // so a Redis write outage can't turn "every 5 min" into "every 15 s".
+    const lastAt = Math.max(
+      Number(s.cycleAt || lastTier.alertedAt || 0),
+      Number(sweepSent.get(`${sessionId}:cycle`) || 0),
+    );
     if (!lastAt || now - lastAt < 5 * 60 * 1000) continue;
     const phones = [...new Set(s.tiers.flatMap(t => t.phones || []))];
     if (!phones.length) continue;
     const pre = await sessionGet(sessionId);
     if (!pre || pre.ended) continue;
+    // The overdue cycle repeats indefinitely by design, so IT is the one send
+    // that must respect the daily cap — otherwise a session left open all
+    // night texts the whole circle every 5 minutes with no ceiling at all
+    // (~1,150 uncounted SMS by morning for an 8-person circle).
+    const cycleCount = await incrDailyCount(s.ownerToken || 'unknown', phones.length);
+    if (cycleCount > DAILY_CAP) {
+      sweepSentMark(`${sessionId}:cycle`); // re-check again in 5 min, not 15 s
+      console.warn(`[escalation] ${sessionId}: overdue cycle paused — daily cap reached (${cycleCount}).`);
+      continue;
+    }
     const liveLink = liveLinkFor(sessionId, s);
     const nm = cleanName(s.name) || 'Your contact';
     const result = await sendSmsToAll(
@@ -1525,7 +1722,9 @@ async function escalationSweep() {
       `${nm}'s check-in time has passed - please check on them: ${liveLink}\nReply STOP to opt out.`,
     );
     const at = Date.now();
-    await commitSweepProgress(sessionId, fresh => { fresh.cycleAt = at; });
+    sweepSentMark(`${sessionId}:cycle`);
+    const committed = await commitSweepProgress(sessionId, fresh => { fresh.cycleAt = at; });
+    if (!committed) console.error(`[escalation] ${sessionId}: FAILED to persist cycleAt — in-memory clock prevents a 15s re-send loop.`);
     console.log(`[escalation] ${sessionId}: overdue cycle alert ${result.sent}/${phones.length}.`);
   }
 }
@@ -1542,6 +1741,7 @@ setInterval(async () => {
 
   if (sweepRunning) return;
   sweepRunning = true;
+  try { await processDueReceiptChecks(); } catch (e) { console.error('[push] receipt sweep error:', e?.message || e); }
   try { await escalationSweep(); } catch (e) { console.error('[escalation] sweep error:', e?.message || e); }
   finally { sweepRunning = false; }
 }, 15000);
@@ -1559,6 +1759,23 @@ app.post('/session/start', async (req, res) => {
   }
   const coordErr = validateCoords(latitude, longitude);
   if (coordErr) return res.status(400).json({ error: coordErr });
+
+  // Idempotent retries: the client re-POSTs the SAME sessionId when a response
+  // is lost in transit. If the session already exists and its first alert went
+  // out, answer success instead of re-texting the whole circle.
+  const ownerTokenEarly = String(req.headers['x-mih-key'] || '');
+  const existing = await sessionGet(sessionId);
+  if (existing && !existing.ended && existing.ownerToken === ownerTokenEarly && existing.alertedCount > 0) {
+    console.log(`[/session/start] ${sessionId}: duplicate start — already alerted, returning ok.`);
+    return res.json({
+      sessionId,
+      liveLink: liveLinkFor(sessionId, existing),
+      sent: existing.alertedCount,
+      failed: 0,
+      tiers: Array.isArray(existing.tiers) ? existing.tiers.length : 1,
+      duplicate: true,
+    });
+  }
 
   // Build validated, tier-grouped recipients (falls back to one all-at-once tier).
   const built = await buildTiers(req, clientTiers, phones);
@@ -1598,8 +1815,16 @@ app.post('/session/start', async (req, res) => {
   const result = await sendSmsToAll(tiers[0].phones, sessionBody(nm, liveLink));
   if (result.sent === 0) {
     console.error(`[/session/start] ${sessionId} tier1 all sends failed:`, result.errors.join('; '));
+    // Nothing reached anyone: remove the session (so the client's retry gets a
+    // clean attempt instead of a half-live duplicate that keeps escalating
+    // behind a "NOT alerted" error screen) and refund the counted messages.
+    await sessionDel(sessionId);
+    await incrDailyCount(ownerToken, -[...new Set(tiers.flatMap(t => t.phones))].length).catch(() => {});
     return res.status(500).json({ error: 'Could not reach any contact.', sessionId, liveLink, failed: result.failed });
   }
+  // Remember delivery for the idempotent-retry path above.
+  const freshAfterSend = await sessionGet(sessionId);
+  if (freshAfterSend) await sessionSet(sessionId, { ...freshAfterSend, alertedCount: result.sent });
   console.log(
     `[/session/start] Started ${sessionId}: tier1 sent ${result.sent}/${tiers[0].phones.length}, ${result.failed} failed; ${tiers.length} tier(s).`,
   );
@@ -1625,7 +1850,15 @@ app.post('/session/update', async (req, res) => {
   // `ended`, and let the sweep keep ownership of alertedAt/cycleAt.
   const fresh = (await sessionGet(sessionId)) || session;
   if (!fresh.ended) {
-    await sessionSet(sessionId, { ...fresh, latitude: latitude ?? null, longitude: longitude ?? null, updatedAt: Date.now() });
+    // A heartbeat with no GPS fix must not wipe the responders' last-known
+    // location (sessions can start before the first fix; the next heartbeat
+    // used to blank the live page back to "Location pending…").
+    await sessionSet(sessionId, {
+      ...fresh,
+      latitude: latitude ?? fresh.latitude ?? null,
+      longitude: longitude ?? fresh.longitude ?? null,
+      updatedAt: Date.now(),
+    });
     // Keep the short live link alive as long as the session is: the session's
     // TTL refreshes on every heartbeat, but short:<code> was set once at start
     // — without this, a session past 24h would escalate with a dead /l/ link.
@@ -1713,14 +1946,21 @@ const chunkUpload = multer({
   fileFilter: (rq, f, cb) => cb(null, /audio|octet/.test(String(f.mimetype || ''))),
 });
 
-app.post('/audiochunk/:sessionId', chunkUpload.single('chunk'), async (req, res) => {
-  const sessionId = req.params.sessionId;
-  const session = await sessionGet(sessionId);
+// Ownership is checked BEFORE multer touches the request: multer writes the
+// file to disk first, so a rejected chunk used to strand an orphan file for
+// 24h — a free disk-filling primitive for anyone with a token.
+app.post('/audiochunk/:sessionId', async (req, res, next) => {
+  const session = await sessionGet(req.params.sessionId);
   if (!session) return res.status(404).json({ error: 'Session not found.' });
   const token = String(req.headers['x-mih-key'] || '');
   if (session.ownerToken && session.ownerToken !== token) {
     return res.status(403).json({ error: 'Forbidden.' });
   }
+  if (session.ended) return res.status(409).json({ error: 'Session has ended.' });
+  next();
+}, chunkUpload.single('chunk'), async (req, res) => {
+  const sessionId = req.params.sessionId;
+  const token = String(req.headers['x-mih-key'] || '');
   if (!req.file) return res.status(400).json({ error: 'No chunk received.' });
   let entry = liveAudio.get(sessionId);
   if (!entry) {
@@ -2033,18 +2273,26 @@ app.get('/live/:sessionId/state', async (req, res) => {
 // auth) — it's reached from the live link, guarded only by knowing the
 // unguessable sessionId. A POST (form submit), never a GET, so SMS/link-preview
 // prefetchers can't acknowledge by accident.
+const ackSent = new Set(); // sessionId → on-my-way notice already sent this boot
 app.post('/ack/:sessionId', async (req, res) => {
   const sessionId = req.params.sessionId;
   const session = await sessionGet(sessionId);
   // Ended sessions are kept for recording delivery — a stale tab's "on my way"
   // must not text the whole circle about a finished session.
   if (session && !session.acknowledged && !session.ended) {
+    // Two responders tapping "I'm on my way" at the same moment both read
+    // acknowledged:false — an in-memory first-wins gate keeps the circle from
+    // getting the on-my-way text twice.
+    if (ackSent.has(sessionId)) return res.redirect(303, `/live/${encodeURIComponent(sessionId)}`);
+    ackSent.add(sessionId);
+    if (ackSent.size > 5000) ackSent.delete(ackSent.values().next().value);
     // Fresh-read-merge so this write can't clobber a concurrent `ended: true`
     // or the sweep's alertedAt/cycleAt progress.
     const fresh = (await sessionGet(sessionId)) || session;
     if (fresh.ended) return res.redirect(303, `/live/${encodeURIComponent(sessionId)}`);
     await sessionSet(sessionId, { ...fresh, acknowledged: true, ackedAt: Date.now() });
     session.acknowledged = true;
+    incrDailyCount(session.ownerToken || 'unknown', [...new Set((session.tiers || []).flatMap(t => t.phones || []))].length).catch(() => {});
     console.log(`[ack] ${sessionId} acknowledged (informational — alerts continue until the user is safe).`);
     // Tell the circle someone is heading over. Purely informational: it does
     // NOT stop the alerts — only the user marking safe does. Sent once
@@ -2351,6 +2599,34 @@ app.post('/push/register', async (req, res) => {
     return res.json({ ok: true });
   }
   if (!twilioClient) return res.status(503).json({ error: 'Verification is unavailable right now.' });
+
+  // A still-fresh pending code for this same number? Don't text another one.
+  // (The app re-registers on every launch; without this, an unverified number
+  // meant a new code SMS on every cold start — spammy for the user, free SMS
+  // burn for us.)
+  const prior = redis ? await redisGet(`pushverify:${deviceToken}`) : pushVerifyMemory.get(deviceToken);
+  if (prior && prior.phone === phone && Date.now() - Number(prior.at || 0) < 10 * 60 * 1000) {
+    return res.json({ ok: true, pending: true, resent: false });
+  }
+  // Per-DESTINATION cooldown: /push/register is the only path that texts a
+  // number outside a stored circle, so without this an attacker could bomb an
+  // arbitrary victim's phone with code texts. Max 3 codes per number per hour,
+  // whoever asks.
+  const otpKey = `otpsent:${phone}`;
+  let otpCount;
+  if (redis) {
+    otpCount = await redis.incr(otpKey).catch(() => 1);
+    if (otpCount === 1) await redis.expire(otpKey, 60 * 60).catch(() => {});
+  } else {
+    otpCount = (otpSentMemory.get(otpKey) || 0) + 1;
+    otpSentMemory.set(otpKey, otpCount);
+    if (otpCount === 1) setTimeout(() => otpSentMemory.delete(otpKey), 60 * 60 * 1000);
+  }
+  if (otpCount > 3) {
+    console.warn('[push] OTP cooldown hit for a number — not resending.');
+    return res.status(429).json({ error: 'Too many codes sent to that number. Try again in an hour.' });
+  }
+
   const capped = await incrDailyCount(deviceToken, 1);
   if (capped > DAILY_CAP) return res.status(429).json({ error: 'Daily message limit reached for this device.' });
   const code = String(crypto.randomInt(100000, 1000000));
@@ -2377,6 +2653,8 @@ app.post('/push/register', async (req, res) => {
 // ── POST /push/verify ─────────────────────────────────────────────────────────
 // Completes /push/register: { phone, code }. Five attempts per pending code.
 const pushVerifyMemory = new Map();
+const otpSentMemory = new Map(); // per-number OTP cooldown (in-memory fallback)
+const verifyTriesMemory = new Map();
 app.post('/push/verify', async (req, res) => {
   const deviceToken = String(req.headers['x-mih-key'] || '');
   const phone = String(req.body?.phone || '').trim();
@@ -2385,15 +2663,28 @@ app.post('/push/verify', async (req, res) => {
   if (!pending || pending.phone !== phone) {
     return res.status(400).json({ error: 'No pending verification. Save your number again.' });
   }
-  if (pending.tries >= 5) return res.status(429).json({ error: 'Too many attempts. Save your number again.' });
+  // Atomic attempt counter (INCR), not read-modify-write on the pending blob:
+  // parallel guesses all read tries=0 and the 5-try ceiling never engaged.
+  let tries;
+  if (redis) {
+    tries = await redis.incr(`pushverify-tries:${deviceToken}`).catch(() => 1);
+    if (tries === 1) await redis.expire(`pushverify-tries:${deviceToken}`, 10 * 60).catch(() => {});
+  } else {
+    tries = (verifyTriesMemory.get(deviceToken) || 0) + 1;
+    verifyTriesMemory.set(deviceToken, tries);
+    if (tries === 1) setTimeout(() => verifyTriesMemory.delete(deviceToken), 10 * 60 * 1000);
+  }
+  if (tries > 5) return res.status(429).json({ error: 'Too many attempts. Save your number again.' });
   if (!/^\d{6}$/.test(code) || code !== pending.code) {
-    pending.tries += 1;
-    if (redis) await redisSet(`pushverify:${deviceToken}`, pending, 10 * 60);
-    else pushVerifyMemory.set(deviceToken, pending);
     return res.status(400).json({ error: 'Wrong code.' });
   }
-  if (redis) await redisDel(`pushverify:${deviceToken}`);
-  else pushVerifyMemory.delete(deviceToken);
+  if (redis) {
+    await redisDel(`pushverify:${deviceToken}`);
+    await redisDel(`pushverify-tries:${deviceToken}`);
+  } else {
+    pushVerifyMemory.delete(deviceToken);
+    verifyTriesMemory.delete(deviceToken);
+  }
   await pushTokenSet(phone, pending.expoToken);
   await ownPhoneSet(deviceToken, phone); // powers GET /circles/mine
   console.log('[push] number verified and registered for push delivery.');
@@ -2432,14 +2723,30 @@ async function deleteCircleFor(token) {
 }
 
 async function deleteSessionsOwnedBy(token) {
+  const dropSessionExtras = async sid => {
+    await redisDel(`${PUBLISHER_PREFIX}${sid}`);
+    publisherMemory.delete(sid);
+    await sessUploadDel(sid);
+    liveFrames.delete(sid);
+    liveAudio.delete(sid);
+  };
   if (redis) {
     for (const key of await redisScanAll(`${SESSION_PREFIX}*`)) {
       const s = await redisGet(key);
-      if (s && s.ownerToken === token) await redisDel(key);
+      if (s && s.ownerToken === token) {
+        const sid = key.slice(SESSION_PREFIX.length);
+        await redisDel(key);
+        if (s.shortId) await redisDel(`${SHORT_PREFIX}${s.shortId}`);
+        await dropSessionExtras(sid);
+      }
     }
   } else {
     for (const [sid, s] of sessionsMemory) {
-      if (s && s.ownerToken === token) sessionsMemory.delete(sid);
+      if (s && s.ownerToken === token) {
+        sessionsMemory.delete(sid);
+        if (s.shortId) shortsMemory.delete(s.shortId);
+        await dropSessionExtras(sid);
+      }
     }
   }
 }
@@ -2485,14 +2792,47 @@ async function deleteMediaOwnedBy(token) {
 // the token is invalid, so a repeat call is rejected 401 by the auth middleware.
 app.post('/account/delete', async (req, res) => {
   const token = String(req.headers['x-mih-key'] || '');
+  // Read these BEFORE deleting anything — they're needed to find related data.
+  const circlePhones = await getCircle(token);
+  const ownPhone = await ownPhoneGet(token);
+
   await deleteSessionsOwnedBy(token);
   await deleteCheckInsOwnedBy(token);
   await deleteMediaOwnedBy(token);
   // Gold history: remove entries + files.
   for (const e of await getHistory(token)) fs.unlink(path.join(uploadDir, e.id), () => {});
   if (redis) await redisDel(`${HISTORY_PREFIX}${token}`); else historyStore.delete(token);
+
+  // Personal data that used to be left behind (a privacy gap for an app whose
+  // Settings promises "erases everything"): the user's own number + its push
+  // binding, their display name, pending verification, intro marks, and their
+  // token's entries in other numbers' reverse indexes.
+  if (ownPhone) await pushTokenDel(ownPhone);
+  await ownPhoneDel(token);
+  if (redis) {
+    await redisDel(`ownername:${token}`);
+    await redisDel(`pushverify:${token}`);
+    await redisDel(`pushverify-tries:${token}`);
+    for (const key of await redisScanAll(`intro:${token}:*`)) await redisDel(key);
+  } else {
+    ownerNameMemory.delete(token);
+    pushVerifyMemory.delete(token);
+    verifyTriesMemory.delete(token);
+    for (const k of [...introMemory]) if (k.startsWith(`${token}:`)) introMemory.delete(k);
+  }
+  for (const p of circlePhones) {
+    const list = await memberOfGet(p);
+    const next = list.filter(e => e && e.t !== token);
+    if (next.length !== list.length) await memberOfSet(p, next);
+  }
+  if (ownPhone) {
+    const list = await memberOfGet(ownPhone);
+    if (list.length === 0 && redis) await redisDel(`memberof:${ownPhone}`);
+  }
+
   await deleteCircleFor(token);
   await deleteToken(token); // last — we needed it to find the above
+  tokenCache.delete(token);
   console.log('[/account/delete] Purged all data for a device.');
   res.json({ deleted: true });
 });
@@ -2625,12 +2965,17 @@ app.post('/circle/sync', async (req, res) => {
   if (!Array.isArray(phones)) {
     return res.status(400).json({ error: 'phones must be an array.' });
   }
-  if (phones.length) {
-    const phoneErr = validatePhones(phones);
-    if (phoneErr) return res.status(400).json({ error: phoneErr });
+  if (phones.length > 100) {
+    return res.status(400).json({ error: 'Too many numbers.' });
   }
+  // Filter invalid entries instead of rejecting the WHOLE array: one bad
+  // number used to freeze the server-side circle forever (every later sync
+  // 400'd silently, so people added after it never received any alert).
+  const valid = phones.filter(p => typeof p === 'string' && E164_RE.test(p));
+  const dropped = phones.length - valid.length;
+  if (dropped) console.warn(`[/circle/sync] Dropped ${dropped} invalid number(s); storing ${valid.length}.`);
   const token = String(req.headers['x-mih-key'] || '');
-  const unique = [...new Set(phones)];
+  const unique = [...new Set(valid)];
   const prev = await getCircle(token);
   await saveCircle(token, unique);
   const nm = cleanName(req.body?.name);
@@ -2658,8 +3003,14 @@ app.post('/circle/sync', async (req, res) => {
   // the add-contact consent checkbox: the recipient learns what Make It Home
   // is BEFORE any alert arrives, and gets STOP in the very first message.
   // Delivered hybrid like everything else (push if they have the app).
+  // Candidates are ALL current members who were never introduced — not just
+  // this sync's diff. (Diff-only + the 10-per-sync throttle meant members 11+
+  // of a big first sync were PERMANENTLY skipped: never reconsidered, so their
+  // first-ever Make It Home text would have been a panic alert.) The throttle
+  // stays — the remainder drains 10 per sync on subsequent launches.
   const toIntro = [];
-  for (const p of added.slice(0, 10)) {
+  for (const p of unique) {
+    if (toIntro.length >= 10) break;
     if (!(await introSeen(token, p))) toIntro.push(p);
   }
   if (toIntro.length) {
@@ -2676,12 +3027,21 @@ app.post('/circle/sync', async (req, res) => {
       const who =
         (nm || (await ownerNameGet(token)) || 'Someone you know').replace(/\s+/g, ' ').slice(0, 40);
       (async () => {
-        const r = await sendSmsToAll(
-          toIntro,
-          `Make It Home: ${who} added you to their safety circle. When they start a safety session, you'll get a link to watch over them.\nReply STOP to opt out.`,
-        );
-        for (const p of toIntro) introMark(token, p).catch(() => {});
-        console.log(`[intro] circle-add notice sent ${r.sent}/${toIntro.length}.`);
+        let okCount = 0;
+        for (const p of toIntro) {
+          // One send per number so the once-ever mark is only set when the
+          // message actually went out — a transient Twilio failure used to
+          // permanently suppress that person's intro.
+          const r = await sendSmsToAll(
+            [p],
+            `Make It Home: ${who} added you to their safety circle. When they start a safety session, you'll get a link to watch over them.\nReply STOP to opt out.`,
+          );
+          if (r.sent > 0) {
+            okCount++;
+            introMark(token, p).catch(() => {});
+          }
+        }
+        console.log(`[intro] circle-add notice sent ${okCount}/${toIntro.length}.`);
       })().catch(() => {});
     }
   }
@@ -2732,7 +3092,9 @@ app.post('/register', async (req, res) => {
 // In production, a missing Redis is a real fault (check-in timers won't survive
 // restarts), so surface it as 503 for monitors. In dev, in-memory is fine → 200.
 app.get('/health', (req, res) => {
-  const redisUp = !!redis;
+  // The client object now always exists (it retries forever), so report the
+  // actual connection state, not mere configuration.
+  const redisUp = !!redis && redis.status === 'ready';
   if (process.env.NODE_ENV === 'production' && !redisUp) {
     return res.status(503).json({ ok: false, redis: false });
   }

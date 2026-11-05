@@ -19,6 +19,7 @@ import * as Contacts from 'expo-contacts';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 import { toE164 } from '@/utils/phoneNumber';
+import { getMyPhone } from '@/utils/push';
 import { syncCircle } from '@/utils/serverUrl';
 import { hTap, hSuccess } from '@/utils/haptics';
 import { confirmDestructive } from '@/utils/confirm';
@@ -63,7 +64,13 @@ export default function CircleScreen() {
     if (!raw) return [];
     try {
       const p = JSON.parse(raw);
-      return Array.isArray(p) ? p : [];
+      if (!Array.isArray(p)) return [];
+      // Shape-check each entry: a legacy/corrupt element (missing name/phone)
+      // used to crash THIS screen's render (avatarColor over undefined) — the
+      // one place the user could have fixed the data.
+      return p
+        .filter((c: any) => c && typeof c.name === 'string' && c.name && typeof c.phone === 'string' && c.phone)
+        .map((c: any) => ({ ...c, id: typeof c.id === 'string' && c.id ? c.id : `${c.phone}` }));
     } catch {
       return [];
     }
@@ -126,7 +133,7 @@ export default function CircleScreen() {
     setMode('form');
   };
 
-  const saveContact = () => {
+  const saveContact = async () => {
     const n = name.trim();
     const rawP = phone.trim();
     if (!n || !rawP) return;
@@ -142,6 +149,16 @@ export default function CircleScreen() {
     // every alert (and show twice in the list).
     if (circle.some(c => c.phone === e164 && c.id !== editId)) {
       Alert.alert('Already in your circle', `${e164} is already one of your safety contacts.`);
+      return;
+    }
+    // Your own number can't watch over you: every alert would just text/push
+    // the phone that's in danger (and burn one of the capped daily messages).
+    const myPhone = await getMyPhone().catch(() => null);
+    if (myPhone && myPhone === e164) {
+      Alert.alert(
+        "That's your own number",
+        'Add the people who would come for you — alerts to your own phone can’t help you.',
+      );
       return;
     }
     if (editId) {

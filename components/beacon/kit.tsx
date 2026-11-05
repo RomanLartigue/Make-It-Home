@@ -14,6 +14,7 @@ import {
   StyleProp,
   TextStyle,
 } from 'react-native';
+import { useRouter } from 'expo-router';
 import { Beacon, RADIUS } from '@/constants/beacon';
 import { hTap } from '@/utils/haptics';
 
@@ -142,6 +143,8 @@ export function PillButton({
     <Pressable
       onPress={withTap(onPress)}
       disabled={disabled}
+      accessibilityRole="button"
+      accessibilityState={{ disabled }}
       style={({ pressed }) => [
         styles.pill,
         { backgroundColor: bg, borderColor: border },
@@ -155,12 +158,25 @@ export function PillButton({
   );
 }
 
-/** Detail-screen header with a back chevron and title. */
+/** Detail-screen header with a back chevron and title.
+ * The back press is history-safe: a deep link (makeithome://escalation etc.)
+ * can cold-start straight onto a detail screen, where router.back() is a
+ * no-op and there is no tab bar — the user was simply stuck. With no history
+ * we go to the Home tabs instead. */
 export function DetailHeader({ title, onBack }: { title: string; onBack?: () => void }) {
+  const router = useRouter();
+  const safeBack = () => {
+    if (router.canGoBack()) {
+      if (onBack) onBack();
+      else router.back();
+    } else {
+      router.replace('/(tabs)');
+    }
+  };
   return (
     <View style={styles.detailHead}>
       {onBack && (
-        <Pressable onPress={withTap(onBack)} style={styles.backBtn} hitSlop={8}>
+        <Pressable onPress={withTap(safeBack)} style={styles.backBtn} hitSlop={8}>
           <Text style={styles.backChevron}>‹</Text>
         </Pressable>
       )}

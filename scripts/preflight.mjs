@@ -62,8 +62,11 @@ pkg.main === 'index.js'
 
 // ── 5. Every non-relative import resolves ────────────────────────────────────
 head('5. Imports resolve (a missing package = standalone launch crash)');
-const SRC_DIRS = ['app', 'utils', 'constants', 'components', 'hooks'];
-const files = [];
+// tasks/ and the root entry file are scanned too: a package imported ONLY
+// there (e.g. by the background-location task) used to pass preflight and
+// still crash the standalone launch — exactly the class this check exists for.
+const SRC_DIRS = ['app', 'utils', 'constants', 'components', 'hooks', 'tasks'];
+const files = existsSync('index.js') ? ['index.js'] : [];
 const walk = (d) => {
   if (!existsSync(d)) return;
   for (const name of readdirSync(d)) {

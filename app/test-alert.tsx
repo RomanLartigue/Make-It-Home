@@ -20,6 +20,7 @@ export default function TestAlertScreen() {
   const [phones, setPhones] = useState<string[]>([]);
   const [status, setStatus] = useState<Status>('idle');
   const [result, setResult] = useState<{ sent: number; failed: number } | null>(null);
+  const [errText, setErrText] = useState<string | null>(null);
 
   useEffect(() => {
     AsyncStorage.getItem(CIRCLE_KEY).then(raw => {
@@ -46,14 +47,27 @@ export default function TestAlertScreen() {
         body: JSON.stringify({ phones, name }),
       });
       if (res.ok) {
-        setResult(await res.json().catch(() => ({ sent: phones.length, failed: 0 })));
+        // No fabricated counts on an unreadable body — null just renders the
+        // generic "Your circle got a test text" line.
+        setResult(await res.json().catch(() => null));
         setStatus('sent');
         hSuccess();
       } else {
+        // The server WAS reached and refused/failed — say what it said. The
+        // old blanket "check your connection" sent users chasing their Wi-Fi
+        // when the real problem was dead numbers in their circle (the exact
+        // thing this screen exists to catch).
+        const msg = (await res.json().catch(() => null))?.error;
+        setErrText(
+          msg === 'Could not reach any contact.'
+            ? 'No one in your circle could be reached. Check the numbers — someone may have replied STOP or a number may be wrong.'
+            : msg || `The server refused the test (HTTP ${res.status}). Try again in a moment.`,
+        );
         setStatus('error');
         hError();
       }
     } catch {
+      setErrText('Couldn’t reach the server — check your connection and try again.');
       setStatus('error');
       hError();
     }
@@ -110,7 +124,7 @@ export default function TestAlertScreen() {
             <View style={{ flex: 1 }} />
 
             {status === 'error' && (
-              <Text style={styles.errText}>Couldn’t reach the server — check your connection and try again.</Text>
+              <Text style={styles.errText}>{errText || 'Couldn’t reach the server — check your connection and try again.'}</Text>
             )}
             {status === 'sending' ? (
               <View style={styles.sending}>

@@ -41,16 +41,25 @@ export default function OnboardingScreen() {
     });
   };
 
+  // finish() is reachable from two places at once ("Allow location" schedules a
+  // 600ms-delayed finish while "Not now" stays tappable) — without this guard a
+  // double run meant duplicate registrations → two verification-code texts.
+  const finishedRef = useRef(false);
   const finish = async () => {
+    if (finishedRef.current) return;
+    finishedRef.current = true;
     if (name.trim()) await setUserName(name.trim());
+    const e164 = toE164(phone.trim());
+    await AsyncStorage.setItem(ONBOARDED_KEY, 'true');
+    router.replace('/(tabs)');
     // Registering the number makes THIS phone reachable by push: whenever
     // someone's safety circle contains it, sliding their beacon reaches this
     // device as a free notification instead of a text. Best-effort — a
     // skipped or failed registration just means texts, never a blocked user.
-    const e164 = toE164(phone.trim());
-    if (e164) setMyPhone(e164).catch(() => {});
-    await AsyncStorage.setItem(ONBOARDED_KEY, 'true');
-    router.replace('/(tabs)');
+    // Deferred past the navigation: the permission dialog and the
+    // verification-code prompt could fail to present mid-transition on iOS
+    // (the code SMS then arrived with no prompt explaining it).
+    if (e164) setTimeout(() => { setMyPhone(e164).catch(() => {}); }, 1200);
   };
 
   const continueFromName = () => {
@@ -143,7 +152,8 @@ export default function OnboardingScreen() {
             <PillButton
               title="Continue"
               onPress={continueFromName}
-              style={{ marginTop: 14, opacity: name.trim() ? 1 : 0.5 }}
+              disabled={!name.trim()}
+              style={{ marginTop: 14 }}
             />
           </View>
         )}

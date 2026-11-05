@@ -7,9 +7,13 @@ export default function Index() {
   const [target, setTarget] = useState<'/(tabs)' | '/onboarding' | null>(null);
 
   useEffect(() => {
-    AsyncStorage.getItem('@makeithome_onboarded').then(done => {
-      setTarget(done === 'true' ? '/(tabs)' : '/onboarding');
-    });
+    AsyncStorage.getItem('@makeithome_onboarded')
+      .then(done => {
+        setTarget(done === 'true' ? '/(tabs)' : '/onboarding');
+      })
+      // A failed storage read must not strand the app on the blank holding
+      // screen forever — worst case the user sees onboarding again.
+      .catch(() => setTarget('/onboarding'));
   }, []);
 
   // Hold a blank screen while we check — avoids any flash

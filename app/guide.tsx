@@ -31,7 +31,7 @@ const FEATURES: { icon: keyof typeof Ionicons.glyphMap; title: string; body: str
     icon: 'videocam-outline',
     title: 'Live video',
     body:
-      'Going live streams video and your location to your circle for the length you chose. Nothing is stored in the cloud — if you or anyone in your circle wants a copy, just screen-record the live page.',
+      'Going live streams video and your location to your circle for the length you chose. Nothing is recorded or kept — live data passes through our servers only to power the live view and expires automatically. If you or anyone in your circle wants a copy, just screen-record the live page.',
   },
   {
     icon: 'flask-outline',
