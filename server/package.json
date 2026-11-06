@@ -4,7 +4,9 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "nodemon index.js"
+    "dev": "nodemon index.js",
+    "swarm": "node test/swarm.js",
+    "swarm:full": "node test/swarm.js --full"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1121.0",

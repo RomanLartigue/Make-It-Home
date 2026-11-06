@@ -43,3 +43,7 @@ app-example
 # generated native folders
 /ios
 /android
+
+# swarm test artifacts (generated every run)
+server/test/fake-sms-log.jsonl
+server/test/server-output.log
